@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+test-results/
+playwright-report/
+blob-report/
+client/screenshots/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example

@@ -1,0 +1,6 @@
+artifacts-canvas
+Copyright 2026 Daniel Ibáñez
+
+This product includes software developed by third parties under permissive licences
+(MIT): Yjs, y-websocket, y-protocols, lib0, isomorphic.js, perfect-freehand and
+html-to-image. See client/package-lock.json for the exact versions.

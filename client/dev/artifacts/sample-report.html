@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Nightly regression — 2026-11-08</title>
+<style>
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;color:#1d1d1f;background:#fff}
+  .wrap{padding:36px 48px;font-size:14px;line-height:1.55}
+  h1{margin:0 0 4px;font-size:24px}
+  h2{font-size:18px;margin:32px 0 10px}
+  .sub{color:#6b7280;margin-bottom:22px}
+  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px}
+  .kpi{border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px}
+  .kpi .v{font-size:26px;font-weight:650}
+  .kpi .l{color:#6b7280;font-size:12px}
+  .kpi.bad .v{color:#e03131}
+  .chart{border:1px solid #e5e7eb;border-radius:8px;padding:14px;margin-bottom:22px}
+  .bars{display:flex;align-items:flex-end;gap:10px;height:150px;padding-top:8px}
+  .bars div{flex:1;background:#93c5fd;border-radius:3px 3px 0 0}
+  .bars div.hot{background:#f87171}
+  .axis{display:flex;gap:10px;color:#6b7280;font-size:11px;margin-top:4px}
+  .axis span{flex:1;text-align:center}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid #e5e7eb}
+  th{color:#6b7280;font-weight:600}
+  .fail{color:#e03131;font-weight:600}
+  .log{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:#f8f9fa;border:1px solid #e5e7eb;border-radius:6px;padding:10px 12px;white-space:pre-wrap}
+  .card{border:1px solid #e5e7eb;border-radius:8px;padding:12px 14px;margin-bottom:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Nightly regression — 2026-11-08</h1>
+  <div class="sub">artifacts.example.com / runs / nightly / 2026-11-08 · publicado por demo · caduca 2026-12-08 · <a href="#details">ver detalles</a></div>
+  <div class="kpis">
+    <div class="kpi"><div class="v">1 842</div><div class="l">tests ejecutados</div></div>
+    <div class="kpi bad" id="kpi-failed"><div class="v">37</div><div class="l">fallidos</div></div>
+    <div class="kpi"><div class="v">2h 41m</div><div class="l">duración</div></div>
+    <div class="kpi"><div class="v">97,9 %</div><div class="l">pass rate</div></div>
+  </div>
+  <div class="chart">
+    <b>Fallos por suite (últimas 10 noches)</b>
+    <div class="bars">
+      <div style="height:22%"></div><div style="height:18%"></div><div style="height:25%"></div><div style="height:20%"></div>
+      <div style="height:24%"></div><div style="height:19%"></div><div style="height:28%"></div><div class="hot" style="height:71%"></div>
+      <div class="hot" style="height:88%"></div><div class="hot" style="height:64%"></div>
+    </div>
+    <div class="axis"><span>30/10</span><span>31/10</span><span>01/11</span><span>02/11</span><span>03/11</span><span>04/11</span><span>05/11</span><span>06/11</span><span>07/11</span><span>08/11</span></div>
+  </div>
+  <table>
+    <tr><th>Suite</th><th>Tests</th><th>Fallidos</th><th>Nodo</th><th>Primer fallo</th></tr>
+    <tr id="row-billing"><td>billing-core</td><td>412</td><td class="fail">19</td><td>ci-node-7f2</td><td>06/11</td></tr>
+    <tr><td>catalog-sync</td><td>288</td><td class="fail">11</td><td>ci-node-7f2</td><td>06/11</td></tr>
+    <tr><td>usage-rating</td><td>356</td><td class="fail">5</td><td>ci-node-a91</td><td>07/11</td></tr>
+    <tr><td>provisioning</td><td>501</td><td class="fail">2</td><td>ci-node-a91</td><td>08/11</td></tr>
+    <tr><td>ui-smoke</td><td>285</td><td>0</td><td>ci-node-3c4</td><td>—</td></tr>
+  </table>
+
+  <h2 id="details">Detalle de fallos</h2>
+  <div class="card" id="target"><b>billing-core · InvoiceRoundingTest.testMultiCurrency</b><div class="log">AssertionError: expected 104.31 but was 104.30
+  at InvoiceRoundingTest.testMultiCurrency(InvoiceRoundingTest.java:88)
+  node: ci-node-7f2 · first seen 06/11</div></div>
+  <div class="card"><b>billing-core · TaxEngineTest.testReverseCharge</b><div class="log">TimeoutException: tax-engine did not answer in 30 s
+  node: ci-node-7f2 · first seen 06/11</div></div>
+  <div class="card"><b>catalog-sync · CatalogImportTest.testLargeFeed</b><div class="log">OutOfMemoryError: Java heap space
+  node: ci-node-7f2 · first seen 06/11</div></div>
+  <div class="card"><b>usage-rating · RatingWindowTest.testDstBoundary</b><div class="log">expected 24 buckets but got 25
+  node: ci-node-a91 · first seen 07/11</div></div>
+  <div class="card"><b>provisioning · ProvisionRetryTest.testBackoff</b><div class="log">flaky: passed 2 of 3 retries
+  node: ci-node-a91 · first seen 08/11</div></div>
+
+  <h2>Notas del run</h2>
+  <p>Los fallos se concentran en el nodo <b>ci-node-7f2</b> desde el 06/11. Los tests de facturación y de catálogo comparten
+  ese nodo y su memoria; el resto de suites corren en nodos distintos y su tasa de fallos no ha cambiado.</p>
+  <p>Este informe es un ejemplo para el entorno de desarrollo del lienzo: es largo a propósito para probar que las
+  anotaciones se quedan sobre el mismo elemento al desplazar la página.</p>
+  <p style="height:600px"></p>
+  <p id="footer">Fin del informe.</p>
+</div>
+</body>
+</html>

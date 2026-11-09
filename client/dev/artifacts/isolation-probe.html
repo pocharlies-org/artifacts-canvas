@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Isolation probe</title></head>
+<body>
+<h1>Isolation probe</h1>
+<pre id="out"></pre>
+<script>
+// Tries to reach everything the wrapper page holds. Every probe must fail.
+(async function () {
+  var r = {};
+  function attempt(name, fn) { try { var v = fn(); r[name] = { ok: true, value: String(v).slice(0, 200) }; } catch (e) { r[name] = { ok: false, error: e && e.name }; } }
+  attempt('origin', function () { return self.origin; });
+  attempt('cookie', function () { return document.cookie; });
+  attempt('localStorage', function () { return localStorage.getItem('canvas-secret'); });
+  attempt('sessionStorage', function () { return sessionStorage.getItem('canvas-secret'); });
+  attempt('parentDocument', function () { return window.parent.document.cookie; });
+  attempt('parentLocalStorage', function () { return window.parent.localStorage.getItem('canvas-secret'); });
+  attempt('parentCanvas', function () { return typeof window.parent.__canvas; });
+  attempt('topLocation', function () { return window.top.location.href; });
+  try {
+    var res = await fetch('/_canvas/sample-report.html', { credentials: 'include' });
+    var txt = await res.text();
+    r.sameHostFetch = { ok: true, value: txt.slice(0, 50) };
+  } catch (e) { r.sameHostFetch = { ok: false, error: e && e.name }; }
+  try {
+    var db = indexedDB.open('probe');
+    r.indexedDB = { ok: true };
+  } catch (e) { r.indexedDB = { ok: false, error: e && e.name }; }
+  document.getElementById('out').textContent = JSON.stringify(r, null, 2);
+  window.parent.postMessage({ probe: r }, '*');
+})();
+</script>
+</body>
+</html>

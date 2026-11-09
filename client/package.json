@@ -1,0 +1,36 @@
+{
+  "name": "artifacts-canvas-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Collaborative annotation canvas that overlays an artifact page (client).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "VITE_CONFIG_NATIVE_IGNORE_WARNING=true vite",
+    "build": "tsc --noEmit -p . && VITE_CONFIG_NATIVE_IGNORE_WARNING=true vite build",
+    "typecheck": "tsc --noEmit -p .",
+    "test": "VITE_CONFIG_NATIVE_IGNORE_WARNING=true NODE_OPTIONS=--no-warnings vitest run",
+    "e2e": "playwright test",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "html-to-image": "^1.11.13",
+    "lib0": "^0.2.119",
+    "perfect-freehand": "^1.2.3",
+    "y-protocols": "^1.0.7",
+    "y-websocket": "^3.1.0",
+    "yjs": "^13.6.33"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.0",
+    "@types/node": "^26.6.6",
+    "@types/ws": "^8.18.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.6",
+    "vitest": "^5.1.0",
+    "ws": "^8.22.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
