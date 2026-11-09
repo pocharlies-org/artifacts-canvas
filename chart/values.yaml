@@ -1,0 +1,112 @@
+# artifacts-canvas Helm chart — all deployment-specific values live here.
+# Nothing in this file contains hostnames or credentials: supply them per environment.
+
+# --- Container image ---
+# Pin by digest in production (the chart renders `repository@digest` when digest is set).
+image:
+  repository: ghcr.io/pocharlies-org/artifacts-canvas-server
+  tag: "0.1.0"
+  digest: "" # e.g. sha256:<64 hex> — set this for immutable deploys
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# --- Core plugin contract (design §8) ---
+core:
+  # Internal authz endpoint of the artifacts core (never the public URL).
+  gateAuthzUrl: "http://artifacts-core:8081/_gate/plugin/authz"
+  # Internal base URL the canvas server fetches artifact HTML from (frame route).
+  artifactBaseUrl: "http://artifacts-core:8080"
+  # Namespace label selector of the core's namespace, for the NetworkPolicy.
+  namespace:
+    kubernetes.io/metadata.name: artifacts
+
+# --- Object storage (canvas documents) ---
+# The operator supplies the credentials secret (keys below); the core's bootstrap Job uses it
+# to create/attach the least-privilege S3 user `plugin-canvas` (Get/Put/Delete/GetTagging/
+# PutTagging on `_plugins/canvas/*`, ListBucket on the prefix). In the core's `plugins:` entry
+# this same secret is the optional `secretName` field (default `plugin-canvas-s3`).
+s3:
+  bucket: artifacts
+  region: us-east-1
+  # Set for MinIO / S3-compatible endpoints; leave empty for AWS.
+  endpoint: ""
+  forcePathStyle: true
+  prefix: _plugins/canvas
+  # Secret created by the core's provisioning (or ExternalSecrets), never by this chart.
+  # Never put credentials in values.
+  secretRef:
+    name: plugin-canvas-s3
+    accessKeyIdKey: access-key
+    secretAccessKeyKey: secret-key
+
+# --- Behaviour ---
+config:
+  authzTimeoutMs: 3000
+  # Upper bound on how long a revoked/expired visitor may keep a live room.
+  authzRecheckSeconds: 300
+  frameFetchTimeoutMs: 10000
+  saveDebounceMs: 2000
+  sweepIntervalSeconds: 3600
+  readyzCacheMs: 5000
+  logLevel: info
+
+# --- Abuse limits (anonymous gets the stricter set; enforced by the server) ---
+limits:
+  maxConnsPerRoom: 50
+  maxConnsPerRoomAnon: 10
+  maxConnsPerAnonVisitor: 2
+  msgRatePerSec: 120
+  msgBurst: 240
+  anonMsgRatePerSec: 30
+  anonMsgBurst: 60
+  maxDocBytes: 20971520 # 20 MiB
+  anonMaxDocBytes: 5242880 # 5 MiB
+  maxMessageBytes: 8388608 # 8 MiB
+  anonMaxMessageBytes: 2097152 # 2 MiB
+  maxImageBytes: 2097152
+  anonMaxImageBytes: 1048576
+  # Optional key-space allowlist, e.g. ["runs/", "pub/"]. Empty = any structurally valid key.
+  artifactPrefixes: []
+  anonAllowedPrefixes: ["pub/"]
+
+# --- Service ---
+service:
+  type: ClusterIP
+  port: 8080
+
+# --- NetworkPolicy ---
+# Ingress to the canvas pods is allowed only from the ingress controller's namespace and
+# the core's namespace (the core's gate is called by the canvas, but co-allowing the core
+# keeps the pair connected if the ingress rewrites source). Egress is unrestricted: the
+# server must reach the core and the object store.
+networkPolicy:
+  enabled: true
+  ingressNamespace:
+    kubernetes.io/metadata.name: ingress-nginx
+
+# Rooms are in-memory: with more than one replica, two pods would serve divergent rooms for
+# the same artifact unless the ingress does sticky routing per artifact key. Keep 1 until
+# sticky routing (or a shared backend) is designed.
+deployment:
+  replicas: 1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+
+serviceAccount:
+  create: true
+  name: "" # defaults to the fullname

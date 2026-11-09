@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "artifacts-canvas.fullname" . }}
+  labels:
+    {{- include "artifacts-canvas.labels" . | nindent 4 }}
+data:
+  # --- core plugin contract (docs: core repo docs/plugins.md) ---
+  GATE_AUTHZ_URL: {{ .Values.core.gateAuthzUrl | quote }}
+  ARTIFACT_BASE_URL: {{ .Values.core.artifactBaseUrl | quote }}
+  # --- object storage (credentials come from the secret, never from here) ---
+  S3_BUCKET: {{ .Values.s3.bucket | quote }}
+  S3_REGION: {{ .Values.s3.region | quote }}
+  S3_FORCE_PATH_STYLE: {{ .Values.s3.forcePathStyle | quote }}
+  CANVAS_PREFIX: {{ .Values.s3.prefix | quote }}
+  {{- if .Values.s3.endpoint }}
+  S3_ENDPOINT: {{ .Values.s3.endpoint | quote }}
+  {{- end }}
+  # --- behaviour ---
+  PORT: {{ int64 .Values.service.port | quote }}
+  AUTHZ_TIMEOUT_MS: {{ int64 .Values.config.authzTimeoutMs | quote }}
+  AUTHZ_RECHECK_SECONDS: {{ int64 .Values.config.authzRecheckSeconds | quote }}
+  FRAME_FETCH_TIMEOUT_MS: {{ int64 .Values.config.frameFetchTimeoutMs | quote }}
+  SAVE_DEBOUNCE_MS: {{ int64 .Values.config.saveDebounceMs | quote }}
+  SWEEP_INTERVAL_SECONDS: {{ int64 .Values.config.sweepIntervalSeconds | quote }}
+  READYZ_CACHE_MS: {{ int64 .Values.config.readyzCacheMs | quote }}
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  # --- abuse limits (anonymous gets the stricter set) ---
+  MAX_CONNS_PER_ROOM: {{ int64 .Values.limits.maxConnsPerRoom | quote }}
+  MAX_CONNS_PER_ROOM_ANON: {{ int64 .Values.limits.maxConnsPerRoomAnon | quote }}
+  MAX_CONNS_PER_ANON_VISITOR: {{ int64 .Values.limits.maxConnsPerAnonVisitor | quote }}
+  MSG_RATE_PER_SEC: {{ int64 .Values.limits.msgRatePerSec | quote }}
+  MSG_BURST: {{ int64 .Values.limits.msgBurst | quote }}
+  ANON_MSG_RATE_PER_SEC: {{ int64 .Values.limits.anonMsgRatePerSec | quote }}
+  ANON_MSG_BURST: {{ int64 .Values.limits.anonMsgBurst | quote }}
+  # int64: helm would otherwise render large byte counts in scientific notation.
+  MAX_DOC_BYTES: {{ int64 .Values.limits.maxDocBytes | quote }}
+  ANON_MAX_DOC_BYTES: {{ int64 .Values.limits.anonMaxDocBytes | quote }}
+  MAX_MESSAGE_BYTES: {{ int64 .Values.limits.maxMessageBytes | quote }}
+  ANON_MAX_MESSAGE_BYTES: {{ int64 .Values.limits.anonMaxMessageBytes | quote }}
+  MAX_IMAGE_BYTES: {{ int64 .Values.limits.maxImageBytes | quote }}
+  ANON_MAX_IMAGE_BYTES: {{ int64 .Values.limits.anonMaxImageBytes | quote }}
+  {{- if .Values.limits.artifactPrefixes }}
+  ARTIFACT_PREFIXES: {{ join "," .Values.limits.artifactPrefixes | quote }}
+  {{- end }}
+  {{- if .Values.limits.anonAllowedPrefixes }}
+  ANON_ALLOWED_PREFIXES: {{ join "," .Values.limits.anonAllowedPrefixes | quote }}
+  {{- end }}

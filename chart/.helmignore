@@ -1,0 +1,4 @@
+*.tgz
+.git/
+.idea/
+.vscode/
