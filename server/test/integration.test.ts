@@ -1,0 +1,454 @@
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import * as Y from 'yjs';
+import * as encoding from 'lib0/encoding';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { loadConfig, type Config } from '../src/config.js';
+import { createApp, type App } from '../src/app.js';
+import { MemoryCanvasObjectStore } from '../src/store.js';
+import { canvasObjectKey } from '../src/paths.js';
+import { startFakeCore, allowUser, allowAnon, type FakeCore } from './helpers/fakecore.js';
+import { TestClient, expectClose, waitFor } from './helpers/yclient.js';
+
+let core: FakeCore;
+let staticDir: string;
+let store: MemoryCanvasObjectStore;
+let portSeq = 39100;
+
+function makeCfg(overrides: Record<string, string> = {}): Config {
+  return loadConfig({
+    GATE_AUTHZ_URL: core.authzUrl,
+    ARTIFACT_BASE_URL: core.artifactBaseUrl,
+    S3_BUCKET: 'canvas-test',
+    STATIC_DIR: staticDir,
+    LOG_LEVEL: 'silent',
+    AUTHZ_RECHECK_SECONDS: '1',
+    SAVE_DEBOUNCE_MS: '50',
+    READYZ_CACHE_MS: '10',
+    PORT: String(++portSeq),
+    ...overrides,
+  });
+}
+
+function wsUrl(cfg: Config, key: string, anon?: string): string {
+  const enc = key.split('/').map(encodeURIComponent).join('/');
+  return `ws://127.0.0.1:${cfg.port}/_canvas/_/ws/${enc}${anon ? `?anon=${anon}` : ''}`;
+}
+
+async function http(cfg: Config, p: string, cookie?: string): Promise<Response> {
+  return fetch(`http://127.0.0.1:${cfg.port}${p}`, { redirect: 'manual', headers: cookie ? { cookie } : {} });
+}
+
+async function startApp(overrides: Record<string, string> = {}): Promise<App> {
+  const cfg = makeCfg(overrides);
+  const app = createApp({ config: cfg, store, logger: cfg.logLevel === 'silent' ? silentLogger : createLogger(cfg.logLevel) });
+  await app.listen();
+  apps.push(app);
+  return app;
+}
+
+import { createLogger } from '../src/logging.js';
+const silentLogger = createLogger('silent');
+const apps: App[] = [];
+
+/** A shape as the real client model stores them: a Y.Map inside the shapes root. */
+function shape(fields: Record<string, unknown> = { type: 'rect' }): Y.Map<unknown> {
+  const m = new Y.Map<unknown>();
+  for (const [k, v] of Object.entries(fields)) m.set(k, v);
+  return m;
+}
+
+beforeAll(async () => {
+  core = await startFakeCore();
+  staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'canvas-static-'));
+  fs.writeFileSync(
+    path.join(staticDir, 'index.html'),
+    '<!doctype html><html><head><title>canvas</title></head><body><div id="root"></div></body></html>',
+  );
+  fs.writeFileSync(path.join(staticDir, 'reporter.js'), "console.log('reporter loaded');");
+  fs.mkdirSync(path.join(staticDir, 'assets'), { recursive: true });
+  fs.writeFileSync(path.join(staticDir, 'assets', 'app-abc123.js'), 'export const x = 1;');
+});
+
+afterAll(async () => {
+  for (const a of apps) await a.close().catch(() => undefined);
+  await core.close();
+  fs.rmSync(staticDir, { recursive: true, force: true });
+});
+
+beforeEach(() => {
+  store = new MemoryCanvasObjectStore();
+  core.rules.clear();
+  core.rulesByCookie.clear();
+  core.artifacts.clear();
+  core.broken = null;
+  core.hang = false;
+});
+
+afterEach(async () => {
+  for (const a of apps.splice(0)) await a.close().catch(() => undefined);
+});
+
+describe('real client protocol: two y-websocket clients through the server', () => {
+  it('converge, IDENTITY (100) first, attribution stamped with the verified id', async () => {
+    core.rules.set('runs/report.html', allowUser('ana@corp', 'Ana López'));
+    const app = await startApp();
+    const cfgUrl = (key: string) => `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/${key}`;
+    const c1 = new TestClient(cfgUrl('runs/report.html'));
+    const c2 = new TestClient(cfgUrl('runs/report.html'));
+    await c1.connect();
+    await c2.connect();
+
+    // IDENTITY must be the first message on every connection.
+    expect(c1.messageTypes[0]).toBe(100);
+    expect(c1.identity).toMatchObject({ id: 'ana@corp', name: 'Ana López', anonymous: false, attribution: 'server' });
+
+    // c2 draws a shape; c1 must see it.
+    c2.doc.transact(() => {
+      const shape = new Y.Map<unknown>();
+      shape.set('type', 'rect');
+      c2.doc.getMap('shapes').set('s1', shape);
+    });
+    await waitFor(() => c1.doc.getMap('shapes').has('s1'), 3000, 'shapes on c1');
+
+    // Attribution is stamped server-side with the verified identity (protocol §5).
+    await waitFor(() => c1.doc.getMap('attribution').has('s1'), 3000, 'attribution on c1');
+    const attr = c1.doc.getMap('attribution').get('s1') as Record<string, unknown>;
+    expect(attr.createdBy).toBe('ana@corp');
+    // The users root records the participant.
+    expect(c1.doc.getMap('users').get('ana@corp')).toMatchObject({ name: 'Ana López' });
+    // history has at least the create entry
+    await waitFor(() => c1.doc.getArray('history').length > 0, 3000, 'history on c1');
+
+    // awareness user is the verified identity, not what the client claims
+    c2.setAwareness({ cursor: { x: 5, y: 5 }, user: { id: 'evil', name: 'Evil' } });
+    await waitFor(() => {
+      const st = c1.awareness.getStates().get(c2.doc.clientID);
+      return st?.user != null;
+    }, 3000, 'awareness');
+    expect(c1.awareness.getStates().get(c2.doc.clientID)?.user).toMatchObject({ id: 'ana@corp', name: 'Ana López' });
+  });
+
+  it('forged write to attribution closes 4403 and is NOT applied', async () => {
+    core.rules.set('runs/f.html', allowUser('ana@corp', 'Ana'));
+    const app = await startApp();
+    const url = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/f.html`;
+    const honest = new TestClient(url);
+    const attacker = new TestClient(url);
+    await honest.connect();
+    await attacker.connect();
+
+    attacker.doc.transact(() => {
+      attacker.doc.getMap('attribution').set('forged', 'pwned');
+    });
+    await expectClose(attacker, 4403);
+    // the room never applied it
+    await new Promise((r) => setTimeout(r, 100));
+    expect(honest.doc.getMap('attribution').has('forged')).toBe(false);
+    const stored = store.objects.get(canvasObjectKey('_plugins/canvas', 'runs/f.html'));
+    if (stored) {
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, stored.body);
+      expect(doc.getMap('attribution').has('forged')).toBe(false);
+    }
+  });
+
+  it('forged write to users and history also closes 4403', async () => {
+    core.rules.set('runs/f2.html', allowUser('ana@corp', 'Ana'));
+    const app = await startApp();
+    const url = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/f2.html`;
+    for (const root of ['users', 'history'] as const) {
+      const c = new TestClient(url);
+      await c.connect();
+      c.doc.transact(() => {
+        c.doc.getMap(root).set('forged', 'x');
+      });
+      await expectClose(c, 4403);
+    }
+  });
+});
+
+describe('authz enforcement', () => {
+  it('denied visitor is refused with 4403 while an allowed one joins', async () => {
+    core.rulesByCookie.set('good|runs/x.html', allowUser('ana@corp', 'Ana'));
+    core.rulesByCookie.set('bad|runs/x.html', { allowed: false, reason: 'forbidden' });
+    const app = await startApp();
+    const url = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/x.html`;
+    const good = new TestClient(url, 'good');
+    await good.connect();
+    expect(good.identity?.id).toBe('ana@corp');
+    const bad = new TestClient(url, 'bad');
+    await bad.connect().catch(() => undefined);
+    await expectClose(bad, 4403);
+  });
+
+  it('revocation mid-session: NOTICE revoked + close 4403 within the re-check interval', async () => {
+    core.rules.set('runs/live.html', allowUser('ana@corp', 'Ana'));
+    const app = await startApp({ AUTHZ_RECHECK_SECONDS: '1' });
+    const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/live.html`);
+    await c.connect();
+    core.rules.set('runs/live.html', { allowed: false, reason: 'forbidden' });
+    await expectClose(c, 4403, 6000);
+    expect(c.notices.some((n) => n.kind === 'revoked')).toBe(true);
+  });
+
+  it('expired mid-session: NOTICE expired + close 4410 and the object is deleted', async () => {
+    core.rules.set('runs/exp.html', allowUser('ana@corp', 'Ana'));
+    const app = await startApp({ AUTHZ_RECHECK_SECONDS: '1' });
+    const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/exp.html`);
+    await c.connect();
+    c.doc.transact(() => c.doc.getMap('shapes').set('s', shape()));
+    await waitFor(() => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/exp.html')));
+    core.rules.set('runs/exp.html', { allowed: false, reason: 'expired' });
+    await expectClose(c, 4410, 6000);
+    expect(c.notices.some((n) => n.kind === 'expired')).toBe(true);
+    await waitFor(() => !store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/exp.html')));
+  });
+
+  it('gone artifact on connect: close 4404 and the object is deleted', async () => {
+    const objKey = canvasObjectKey('_plugins/canvas', 'runs/gone.html');
+    store.objects.set(objKey, { body: new Uint8Array([1]) });
+    // no rule -> fake core answers object-missing (gate: allowed-but-HEAD-404)
+    const app = await startApp();
+    const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/gone.html`);
+    await c.connect().catch(() => undefined);
+    await expectClose(c, 4404);
+    expect(store.objects.has(objKey)).toBe(false);
+  });
+
+  it('expired artifact on connect: close 4410 and the object is deleted', async () => {
+    const objKey = canvasObjectKey('_plugins/canvas', 'runs/exp2.html');
+    store.objects.set(objKey, { body: new Uint8Array([1]) });
+    core.rules.set('runs/exp2.html', { allowed: false, reason: 'expired' });
+    const app = await startApp();
+    const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/exp2.html`);
+    await c.connect().catch(() => undefined);
+    await expectClose(c, 4410);
+    expect(c.notices.some((n) => n.kind === 'expired')).toBe(true);
+    expect(store.objects.has(objKey)).toBe(false);
+  });
+
+  it('core down: fail closed (4403)', async () => {
+    core.broken = { status: 500, body: 'boom' };
+    const app = await startApp();
+    const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/x.html`);
+    await c.connect().catch(() => undefined);
+    await expectClose(c, 4403);
+  });
+
+  it('anonymous pub/ visitor gets the anon:NNNN pseudonym', async () => {
+    core.rules.set('pub/doc.html', allowAnon());
+    const app = await startApp();
+    const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/pub/doc.html?anon=4321`);
+    await c.connect();
+    expect(c.identity).toMatchObject({ id: 'anon:4321', name: 'Anónimo 4321', anonymous: true });
+  });
+});
+
+describe('persistence', () => {
+  it('document survives a server restart', async () => {
+    core.rules.set('runs/persist.html', allowUser('ana@corp', 'Ana'));
+    const app1 = await startApp();
+    const c1 = new TestClient(`ws://127.0.0.1:${(app1.server.address() as { port: number }).port}/_canvas/_/ws/runs/persist.html`);
+    await c1.connect();
+    c1.doc.transact(() => {
+      c1.doc.getMap('shapes').set('kept', shape({ type: 'rect', x: 1 }));
+    });
+    await waitFor(() => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/persist.html')));
+    await app1.close(); // flushes on shutdown
+
+    const app2 = await startApp();
+    const c2 = new TestClient(`ws://127.0.0.1:${(app2.server.address() as { port: number }).port}/_canvas/_/ws/runs/persist.html`);
+    await c2.connect();
+    await waitFor(() => c2.doc.getMap('shapes').has('kept'));
+    expect(c2.doc.getMap('shapes').get('kept')).toBeTruthy();
+  });
+
+  it('ttl tag of the artifact is copied onto the canvas object', async () => {
+    core.rules.set('runs/ttl.html', allowUser('ana@corp', 'Ana', { artifact: { ttl: 7 } }));
+    const app = await startApp();
+    const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/ttl.html`);
+    await c.connect();
+    c.doc.transact(() => c.doc.getMap('shapes').set('s', shape()));
+    await waitFor(() => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/ttl.html')));
+    expect(store.objects.get(canvasObjectKey('_plugins/canvas', 'runs/ttl.html'))?.tagging).toBe('ttl=7');
+  });
+
+  it('sweep deletes canvas objects whose artifact is gone', async () => {
+    store.objects.set(canvasObjectKey('_plugins/canvas', 'runs/dead.html'), { body: new Uint8Array([1]) });
+    store.objects.set(canvasObjectKey('_plugins/canvas', 'runs/alive.html'), { body: new Uint8Array([1]) });
+    core.rules.set('runs/alive.html', allowUser('ana@corp', 'Ana'));
+    const app = await startApp();
+    const res = await app.manager.sweep();
+    expect(res).toMatchObject({ scanned: 2, deleted: 1 });
+    expect(store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/dead.html'))).toBe(false);
+    expect(store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/alive.html'))).toBe(true);
+  });
+});
+
+describe('abuse limits', () => {
+  it('rate-limited connection is closed with 4429 after a NOTICE', async () => {
+    core.rules.set('pub/rl.html', allowAnon());
+    const app = await startApp({ ANON_MSG_RATE_PER_SEC: '2', ANON_MSG_BURST: '3' });
+    const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/pub/rl.html?anon=1111`);
+    await c.connect(); // consumes 1 token
+    const emptyAwareness = new Uint8Array([1, 0]); // type AWARENESS, count 0
+    for (let i = 0; i < 5; i++) c.sendRaw(emptyAwareness);
+    await expectClose(c, 4429);
+    expect(c.notices.some((n) => n.kind === 'rate-limited')).toBe(true);
+  });
+
+  it('oversized document closes the writer with 4413', async () => {
+    core.rules.set('runs/big.html', allowUser('ana@corp', 'Ana'));
+    const app = await startApp({ MAX_DOC_BYTES: '600', ANON_MAX_DOC_BYTES: '400' });
+    const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/big.html`);
+    await c.connect();
+    c.doc.transact(() => {
+      c.doc.getMap('shapes').set('big', shape({ type: 'draw', points: 'x'.repeat(100_000) }));
+    });
+    await expectClose(c, 4413);
+    expect(c.notices.some((n) => n.kind === 'too-large')).toBe(true);
+  });
+
+  it('room capacity refuses extra connections', async () => {
+    core.rules.set('runs/cap.html', allowUser('ana@corp', 'Ana'));
+    const app = await startApp({ MAX_CONNS_PER_ROOM: '1', MAX_CONNS_PER_ROOM_ANON: '1' });
+    const url = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/cap.html`;
+    const c1 = new TestClient(url);
+    await c1.connect();
+    const c2 = new TestClient(url);
+    await c2.connect();
+    await expectClose(c2, 1013);
+  });
+
+  it('path traversal and reserved namespaces are refused before authz', async () => {
+    const app = await startApp();
+    const base = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/`;
+    for (const bad of ['_gate/x', '_plugins/canvas/other.ydoc', '.acl.json', '..%2f..%2fetc/passwd']) {
+      const c = new TestClient(base + bad);
+      await c.connect().then(
+        () => expectClose(c, 4403, 2000),
+        () => undefined, // upgrade rejected outright (HTTP error) is also a refusal
+      );
+    }
+    expect(core.calls.filter((x) => x.key.startsWith('_gate') || x.key.startsWith('_plugins')).length).toBe(0);
+  });
+});
+
+describe('http routes', () => {
+  it('health, readiness and metrics', async () => {
+    const app = await startApp();
+    const cfg = makeCfg();
+    void cfg;
+    const port = (app.server.address() as { port: number }).port;
+    const h = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json();
+    expect(h).toEqual({ ok: true });
+    const r = await fetch(`http://127.0.0.1:${port}/readyz`);
+    expect(r.status).toBe(200);
+    const m = await (await fetch(`http://127.0.0.1:${port}/metrics`)).text();
+    expect(m).toContain('canvas_rooms_active');
+    store.readyNow = false;
+    await new Promise((res) => setTimeout(res, 10));
+    const r2 = await fetch(`http://127.0.0.1:${port}/readyz`);
+    expect(r2.status).toBe(503);
+  });
+
+  it('wrapper page injects the config and recommended headers', async () => {
+    core.rules.set('runs/w.html', allowUser('ana@corp', 'Ana'));
+    const app = await startApp();
+    const port = (app.server.address() as { port: number }).port;
+    const res = await fetch(`http://127.0.0.1:${port}/_canvas/runs/w.html`, { headers: { cookie: 'sid=1' } });
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('id="artifacts-canvas-config"');
+    expect(html).toContain('"artifactPath":"runs/w.html"');
+    expect(res.headers.get('content-security-policy')).toContain("frame-ancestors 'self'");
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+  });
+
+  it('wrapper denies with the gate semantics (403, no existence leak)', async () => {
+    const app = await startApp();
+    const port = (app.server.address() as { port: number }).port;
+    const res = await fetch(`http://127.0.0.1:${port}/_canvas/runs/secret.html`);
+    expect(res.status).toBe(404); // fake core says object-missing for unknown keys -> gone semantics
+  });
+
+  it('frame serves the artifact with the reporter injected and sandbox CSP', async () => {
+    core.rules.set('pub/a.html', allowAnon());
+    core.artifacts.set(
+      'pub/a.html',
+      '<!doctype html><html><head><title>art</title></head><body>hi</body></html>',
+    );
+    const app = await startApp();
+    const port = (app.server.address() as { port: number }).port;
+    const res = await fetch(`http://127.0.0.1:${port}/_canvas/_/frame/pub/a.html`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-security-policy')).toBe('sandbox allow-scripts');
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    const html = await res.text();
+    expect(html).toContain("<head><script>console.log('reporter loaded');</script>");
+    expect(html).toContain('<title>art</title>');
+  });
+
+  it('frame forwards the visitor cookie to the core and refuses redirects', async () => {
+    core.rules.set('pub/b.html', allowAnon());
+    core.artifacts.set('pub/b.html', '<html><head></head></html>');
+    const app = await startApp();
+    const port = (app.server.address() as { port: number }).port;
+    await fetch(`http://127.0.0.1:${port}/_canvas/_/frame/pub/b.html`, { headers: { cookie: 'sid=99' } });
+    // the artifact fetch itself doesn't go through authz; check the authz call carried the cookie
+    expect(core.calls.some((c) => c.cookie === 'sid=99')).toBe(true);
+  });
+
+  it('static assets are cached immutably without authz', async () => {
+    const app = await startApp();
+    const port = (app.server.address() as { port: number }).port;
+    const callsBefore = core.calls.length;
+    const res = await fetch(`http://127.0.0.1:${port}/_canvas/_/assets/app-abc123.js`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toContain('immutable');
+    const rep = await fetch(`http://127.0.0.1:${port}/_canvas/_/reporter.js`);
+    expect(rep.status).toBe(200);
+    expect(core.calls.length).toBe(callsBefore); // no authz for static
+  });
+
+  it('core link shape /_canvas/<bucket>/<key> resolves to the same key (authz path, S3 key, room)', async () => {
+    core.rules.set('runs/bucketed.html', allowUser('ana@corp', 'Ana'));
+    core.artifacts.set('runs/bucketed.html', '<html><head></head></html>');
+    const app = await startApp();
+    const port = (app.server.address() as { port: number }).port;
+
+    // Wrapper: bucket stripped, injected config carries the canonical (bucket-less) key.
+    const res = await fetch(`http://127.0.0.1:${port}/_canvas/canvas-test/runs/bucketed.html`, {
+      headers: { cookie: 'sid=1' },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('"artifactPath":"runs/bucketed.html"');
+
+    // WS: same room, and the gate saw the canonical key in the /artifacts/<key> path.
+    const ws = new TestClient(`ws://127.0.0.1:${port}/_canvas/_/ws/canvas-test/runs/bucketed.html`);
+    await ws.connect();
+    expect(ws.identity?.id).toBe('ana@corp');
+    const call = core.calls.find((c) => c.key === 'runs/bucketed.html');
+    expect(call?.artifact).toBe('/artifacts/runs/bucketed.html');
+    expect(core.calls.some((c) => c.key === 'canvas-test/runs/bucketed.html')).toBe(false);
+
+    // And the object lands under the canonical key, not the bucket-prefixed one.
+    ws.doc.transact(() => ws.doc.getMap('shapes').set('s', shape()));
+    await waitFor(() => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/bucketed.html')));
+    expect([...store.objects.keys()]).toEqual([canvasObjectKey('_plugins/canvas', 'runs/bucketed.html')]);
+  });
+
+  it('stripped-prefix routes work too (ingress without prefix preservation)', async () => {
+    core.rules.set('runs/s.html', allowUser('ana@corp', 'Ana'));
+    const app = await startApp();
+    const port = (app.server.address() as { port: number }).port;
+    const res = await fetch(`http://127.0.0.1:${port}/runs/s.html`, { headers: { cookie: 'sid=1' } });
+    expect(res.status).toBe(200);
+    const ws = new TestClient(`ws://127.0.0.1:${port}/ws/runs/s.html`);
+    await ws.connect();
+    expect(ws.identity?.id).toBe('ana@corp');
+  });
+});

@@ -1,0 +1,37 @@
+artifacts-canvas {{ .Chart.AppVersion }} installed as {{ include "artifacts-canvas.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+Two steps remain to make it reachable (both live in the artifacts CORE chart, not here):
+
+1. Register the plugin route with the core chart's `plugins:` list (helm/artifacts/values.yaml).
+   The core renders an IngressRoute for the prefix and labels it
+   `artifacts.pocharlies.org/plugin: canvas`; it is a plain pass-through — websockets are
+   this server's business, not Traefik upgrade tricks:
+
+    plugins:
+      - name: canvas
+        pathPrefix: /_canvas/
+        service: {{ include "artifacts-canvas.fullname" . }}   # the Service created by this chart
+        port: {{ .Values.service.port }}
+        namespace: {{ .Release.Namespace }}
+
+   The browser then reaches the canvas at <read_base>/_canvas/<bucket>/<key>; the core's
+   discovery links already use that shape (ARTIFACTS_PLUGINS="canvas=/_canvas/;...").
+   This server accepts both that shape and the bucket-less client shape /_canvas/<key>;
+   both resolve to the same artifact key, authz path /artifacts/<key>, canvas object
+   {{ .Values.s3.prefix }}/<key>.ydoc and room name.
+
+2. Provide the storage credentials. The operator supplies the secret `{{ .Values.s3.secretRef.name }}`
+   (keys {{ .Values.s3.secretRef.accessKeyIdKey }} / {{ .Values.s3.secretRef.secretAccessKeyKey }}) —
+   the core's bootstrap Job uses it to create/attach the least-privilege S3 user `plugin-canvas`
+   (Get/Put/Delete/GetTagging/PutTagging on {{ .Values.s3.prefix }}/*, ListBucket on the prefix).
+   Make that secret available in this namespace (ExternalSecrets or an operator copy); this
+   Deployment reads it from here and nothing else holds storage keys. In the core's `plugins:`
+   entry this is the optional `secretName` field (defaults to plugin-canvas-s3).
+
+Verify:  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "artifacts-canvas.fullname" . }} 8080
+         curl -s localhost:8080/healthz   -> {"ok":true}
+         curl -s localhost:8080/readyz    -> {"ready":true}  (object store reachable)
+         curl -s localhost:8080/metrics   -> Prometheus exposition
+
+AuthZ runs against the core's internal gate (GATE_AUTHZ_URL={{ .Values.core.gateAuthzUrl }});
+revocations take effect within AUTHZ_RECHECK_SECONDS={{ .Values.config.authzRecheckSeconds }}s.

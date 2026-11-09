@@ -1,0 +1,8 @@
+apiVersion: v2
+name: artifacts-canvas
+description: Collaborative annotation canvas for artifacts (y-websocket rooms, core-gate authz, S3 persistence)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+annotations:
+  licenses: Apache-2.0
