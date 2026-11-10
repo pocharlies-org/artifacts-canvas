@@ -10,7 +10,7 @@ import { checkClientUpdate } from '@pocharlies/artifacts-canvas-shared/stamper';
 import { materializeContent } from '@pocharlies/artifacts-canvas-shared/ledger';
 import { readShape } from '../src/model/doc';
 import { shapeMarkup } from '../src/render/shapeSvg';
-import { layoutText, measureWidth } from '../src/render/text';
+import { clearMeasureCache, layoutText, measureWidth } from '../src/render/text';
 import { peers } from '../src/collab/presence';
 
 const env = { get: () => undefined, asset: () => undefined };
@@ -39,9 +39,17 @@ describe('fv4 H3: text wrapping is not cubic', () => {
     const { room, update } = remoteShape({ id: 's', type: 'geo', geo: 'rectangle', x: 0, y: 0, w: 20, h: 20, size: 'xl' }, 'a ' + 'W'.repeat(6000));
     Y.applyUpdate(room, update);
     const shape = readShape(room.getMap('shapes').get('s'), 's')!;
-    const t0 = performance.now();
-    const svg = shapeMarkup(shape, env as never);
-    const ms = performance.now() - t0;
+    // warm the JIT on other text (a cold first call on a slow host took 53 ms), then measure
+    // with an empty width cache
+    shapeMarkup({ ...shape, text: 'a ' + 'V'.repeat(6000) } as never, env as never);
+    let ms = Infinity;
+    let svg = '';
+    for (let i = 0; i < 3; i++) {
+      clearMeasureCache();
+      const t0 = performance.now();
+      svg = shapeMarkup(shape, env as never);
+      ms = Math.min(ms, performance.now() - t0);
+    }
     expect(svg).toContain('<text');
     expect(ms).toBeLessThan(50); // before: 19 476 ms for this input (1 002 chars: 206 ms)
   });
