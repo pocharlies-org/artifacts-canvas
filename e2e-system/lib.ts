@@ -122,7 +122,7 @@ export async function newContext(browser: Browser, viewport = { width: 1440, hei
  * Returns the status of the final document response.
  */
 export async function openWithLogin(page: Page, url: string, user: UserName): Promise<number> {
-  const first = await page.goto(url);
+  const first = await gotoRetrying(page, url);
   if (!/\/dex\//.test(page.url())) return first?.status() ?? 0;
   const { email, password } = USERS[user];
   await page.locator('input[name="login"]').fill(email);
@@ -144,6 +144,23 @@ export async function openWithLogin(page: Page, url: string, user: UserName): Pr
   await page.waitForURL((u) => u.href.split('?')[0] === url.split('?')[0], { timeout: 20_000 });
   await page.waitForLoadState('load');
   return res.status();
+}
+
+/**
+ * `page.goto` that retries a navigation the network dropped: right after `docker restart` the
+ * Docker bridge can briefly change under Chromium (net::ERR_NETWORK_CHANGED, seen once in
+ * three fv4 runs of test d) or the port can refuse for a moment. Anything else is rethrown.
+ */
+export async function gotoRetrying(page: Page, url: string, attempts = 5): Promise<Awaited<ReturnType<Page['goto']>>> {
+  for (let i = 1; ; i++) {
+    try {
+      return await page.goto(url);
+    } catch (err) {
+      const transient = /ERR_NETWORK_CHANGED|ERR_CONNECTION_REFUSED|ERR_CONNECTION_RESET|ERR_EMPTY_RESPONSE|NS_ERROR_NET_RESET/.test(String(err));
+      if (!transient || i >= attempts) throw err;
+      await new Promise((r) => setTimeout(r, 500 * i));
+    }
+  }
 }
 
 /** Wait until the canvas editor is live against the real server. */
