@@ -388,6 +388,58 @@ describe('persistence: two objects, both expire together', () => {
   });
 });
 
+describe('room loading races (found on the full system: duplicated history after a restart)', () => {
+  const cfg = loadConfig({ GATE_AUTHZ_URL: 'http://core/_gate/plugin/authz', ARTIFACT_BASE_URL: 'http://core', S3_BUCKET: 'b', SAVE_DEBOUNCE_MS: '10' });
+  class SlowStore extends MemoryCanvasObjectStore {
+    gate: Promise<void> = Promise.resolve();
+    fail = false;
+    override async get(k: string) {
+      await this.gate;
+      if (this.fail) throw new Error('s3 down');
+      return super.get(k);
+    }
+  }
+  const mk = (store: MemoryCanvasObjectStore) => new RoomManager({ cfg, store, authz: {} as AuthzClient, log: createLogger('silent'), metrics: new Metrics() });
+
+  it('a second joiner waits for the first load: nobody ever sees (or writes into) an unloaded room', async () => {
+    const store = new SlowStore();
+    const ledger = materializeLedger(new Y.Doc());
+    ledger.getArray('history').push([{ t: 1, by: 'user:alice', verb: 'create', shapeId: 's1', shapeType: 'geo' }]);
+    store.objects.set(canvasLedgerKey(cfg.canvasPrefix, 'runs/r.html'), { body: Y.encodeStateAsUpdate(ledger) });
+    let release!: () => void;
+    store.gate = new Promise((r) => (release = r));
+    const m = mk(store);
+    const first = m.getOrCreate('runs/r.html', null);
+    let secondDone = false;
+    const second = m.getOrCreate('runs/r.html', null).then((r) => {
+      secondDone = true;
+      return r;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(secondDone).toBe(false); // used to resolve at once, with the room still empty
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    expect(a).toBe(b);
+    expect(b.ledger.getArray('history').length).toBe(1);
+  });
+
+  it('a failed load leaves no empty room behind; the next join loads again', async () => {
+    const store = new SlowStore();
+    store.fail = true;
+    const m = mk(store);
+    await expect(m.getOrCreate('runs/f.html', null)).rejects.toThrow(/s3 down/);
+    expect(m.get('runs/f.html')).toBeUndefined();
+    store.fail = false;
+    await expect(m.getOrCreate('runs/f.html', null)).resolves.toBeTruthy();
+  });
+
+  it('after shutdown() no room is joined or created (a reconnect goes to the next process)', async () => {
+    const m = mk(new MemoryCanvasObjectStore());
+    await m.shutdown('shutdown');
+    await expect(m.getOrCreate('runs/s.html', null)).rejects.toThrow(/shutting down/);
+  });
+});
+
 describe('migration of a stored single-document canvas', () => {
   function legacyObject(): Uint8Array {
     // the pre-split server: shapes AND attribution/users/history in one document

@@ -22,6 +22,10 @@ export interface ManagerDeps {
  */
 export class RoomManager {
   readonly rooms = new Map<string, Room>();
+  /** load of each room, awaited by EVERY joiner (not only the first one) */
+  private readonly loads = new WeakMap<Room, Promise<void>>();
+  /** set by shutdown(): no room is joined or created any more */
+  closing = false;
 
   constructor(private readonly deps: ManagerDeps) {}
 
@@ -29,21 +33,41 @@ export class RoomManager {
     return this.rooms.get(name);
   }
 
-  /** Get or create a room, loading its document from storage on first use. */
+  /**
+   * Get or create a room, loading its documents from storage on first use. A second joiner
+   * arriving while the first load is still running waits for the same load: a connection
+   * must never reach a room before its stored state is in (its step-2 answer would be
+   * applied to an empty room and stamped into an empty ledger, which the stored ledger then
+   * merges into — duplicated history). A failed load leaves no room behind (the next join
+   * retries instead of finding an empty room that would overwrite the stored one).
+   */
   async getOrCreate(name: string, ttl: number | null | undefined): Promise<Room> {
+    if (this.closing) throw new Error('shutting down');
     let room = this.rooms.get(name);
     if (!room) {
-      room = new Room(name, {
+      const fresh = new Room(name, {
         cfg: this.deps.cfg,
         store: this.deps.store,
         log: this.deps.log,
         metrics: this.deps.metrics,
         onEmpty: (n) => this.rooms.delete(n),
       });
-      this.rooms.set(name, room);
+      room = fresh;
+      this.rooms.set(name, fresh);
       this.deps.metrics.rooms.set(this.rooms.size);
-      await room.load();
+      this.loads.set(
+        fresh,
+        fresh.load().catch((err) => {
+          if (this.rooms.get(name) === fresh) {
+            this.rooms.delete(name);
+            this.deps.metrics.rooms.set(this.rooms.size);
+          }
+          throw err;
+        }),
+      );
     }
+    await this.loads.get(room);
+    if (this.closing) throw new Error('shutting down');
     room.touchTtl(ttl);
     return room;
   }
@@ -123,8 +147,13 @@ export class RoomManager {
     return { scanned, deleted };
   }
 
-  /** Shutdown: tell everyone to reconnect elsewhere, flush every room. */
+  /**
+   * Shutdown: refuse new joins (a client reconnecting into this process while it flushes
+   * would push its state into a room that is about to vanish), tell everyone to reconnect
+   * elsewhere, flush every room.
+   */
   async shutdown(notice: NoticeKind): Promise<void> {
+    this.closing = true;
     const all = [...this.rooms.values()];
     for (const room of all) {
       for (const c of room.conns.values()) {

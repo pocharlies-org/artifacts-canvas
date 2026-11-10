@@ -192,7 +192,8 @@ interface Identity {
   stock y-websocket client answers it with a step 2 holding everything the room lacks (shapes
   drawn while the socket was down, or while the server restarted), which the server treats as a
   plain client update. Without it, a reconnected client's next edit depended on clocks the room
-  never received and was refused as `pending`.
+  never received and was refused as `pending`. A process that is shutting down joins nobody
+  (close `4503`), so a reconnect always lands on the next process.
 - **Client step 1** (state vector): the server answers with step 2 of the content for that vector.
 - **Client step 2** and **client update** carry the same payload, `varUint8Array(update)`
   (y-protocols `writeSyncStep2` = `varUint8Array(encodeStateAsUpdate(doc, sv))` — there is **no**
@@ -402,7 +403,8 @@ Two S3/MinIO objects per artifact (default prefix `_plugins/canvas`), both with 
 (Not `<key>.ledger.ydoc`: that is also the content object of an artifact named `<key>.ledger`.
 Content objects always end in `.ydoc`, ledgers in `.ledger`, so the families never collide.)
 The room loads both on first join (`Y.applyUpdate`, origin `'load'` — never stamped, never
-re-broadcast; the ledger first), saves debounced (`SAVE_DEBOUNCE_MS`) and flushes on last leave
+re-broadcast; the ledger first; every connection that arrives during the load waits for it, and a
+failed load leaves no room behind), saves debounced (`SAVE_DEBOUNCE_MS`) and flushes on last leave
 and on shutdown; each save writes the ledger, then the content. Saves are serialized.
 Credentials are scoped by the core to `_plugins/canvas/` (Get/Put/Delete/List on the prefix
 only).

@@ -200,6 +200,12 @@ export class WsServer {
     try {
       room = await manager.getOrCreate(artifactKey, ttl);
     } catch (err) {
+      if (manager.closing) {
+        // restarting: the client reconnects (4503) to the next process
+        sendWs(ws, encodeNotice({ kind: 'shutdown' }));
+        ws.close(CLOSE.serverRestart, 'server restart');
+        return;
+      }
       log.error({ err: String(err), room: artifactKey }, 'room load failed');
       ws.close(1011, 'storage error');
       return;
