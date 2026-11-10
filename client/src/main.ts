@@ -12,7 +12,9 @@ import type { Identity } from './model/types';
 const cfg = resolveConfig(location, document, import.meta.env.DEV);
 setLang(cfg.lang);
 
+// the room's two documents: content (this tab writes it) and ledger (server-stamped, read-only)
 const ydoc = new Y.Doc();
+const ledger = new Y.Doc();
 const anon = anonPseudonym(safeStorage());
 const params: Record<string, string> = { anon };
 if (cfg.dev && cfg.devUser) params.devUser = cfg.devUser;
@@ -24,15 +26,15 @@ const devIdentity: Identity | null = cfg.dev
     : { id: `anon:${anon}`, name: `Anónimo ${anon}`, anonymous: true, attribution: 'client' }
   : null;
 
-const conn = new Connection(ydoc, { wsUrl: cfg.wsUrl, room: cfg.room, params, devIdentity });
+const conn = new Connection(ydoc, { wsUrl: cfg.wsUrl, room: cfg.room, params, devIdentity }, ledger);
 const app = document.getElementById('app')!;
-const editor = new Editor(cfg, app, ydoc, conn);
+const editor = new Editor(cfg, app, ydoc, conn, ledger);
 buildChrome(editor, app);
 // the bundled hand font: lay text out again once it replaces the fallback
 void loadHandFont(() => editor.renderer.invalidateAll());
 
 // Handle for tests and debugging; it has the same powers as the page itself.
-(window as unknown as { __canvas: unknown }).__canvas = { editor, ydoc, conn, Y };
+(window as unknown as { __canvas: unknown }).__canvas = { editor, ydoc, ledger, conn, Y };
 
 function safeStorage(): Storage | null {
   try {

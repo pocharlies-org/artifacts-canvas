@@ -84,10 +84,24 @@ export function canvasObjectKey(prefix: string, artifactKey: string): string {
   return `${prefix}/${artifactKey}.ydoc`;
 }
 
-/** Inverse of canvasObjectKey; null when the object key is not a canvas document. */
+/**
+ * The ledger object of an artifact's canvas (protocol §8): `<content object>.ledger`, i.e.
+ * `<prefix>/<key>.ydoc.ledger`. Not `<key>.ledger.ydoc`: that is also the CONTENT object of
+ * an artifact named `<key>.ledger`, so one room's ledger could overwrite another room's
+ * content. Content objects always end in `.ydoc` and ledgers in `.ledger`, so the two
+ * families never collide.
+ */
+export const LEDGER_SUFFIX = '.ydoc.ledger';
+export function canvasLedgerKey(prefix: string, artifactKey: string): string {
+  return `${prefix}/${artifactKey}${LEDGER_SUFFIX}`;
+}
+
+/** Inverse of canvasObjectKey / canvasLedgerKey; null when the object key is neither. */
 export function artifactKeyFromObject(prefix: string, objectKey: string): string | null {
   const p = `${prefix.replace(/\/+$/, '')}/`;
-  if (!objectKey.startsWith(p) || !objectKey.endsWith('.ydoc')) return null;
-  const key = objectKey.slice(p.length, -'.ydoc'.length);
+  if (!objectKey.startsWith(p)) return null;
+  const suffix = objectKey.endsWith(LEDGER_SUFFIX) ? LEDGER_SUFFIX : objectKey.endsWith('.ydoc') ? '.ydoc' : null;
+  if (!suffix) return null;
+  const key = objectKey.slice(p.length, -suffix.length);
   return validateArtifactKey(key).ok ? key : null;
 }

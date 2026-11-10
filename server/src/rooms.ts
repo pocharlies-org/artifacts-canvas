@@ -4,7 +4,7 @@ import type { Logger } from './logging.js';
 import type { Metrics } from './metrics.js';
 import { Room, sendWs } from './room.js';
 import type { CanvasObjectStore } from './store.js';
-import { canvasObjectKey } from './paths.js';
+import { artifactKeyFromObject, canvasLedgerKey, canvasObjectKey } from './paths.js';
 import type { AuthzClient } from './authz.js';
 import type { NoticeKind } from './types.js';
 
@@ -75,7 +75,9 @@ export class RoomManager {
       this.deps.metrics.rooms.set(this.rooms.size);
     }
     try {
+      // both objects of the room (content + ledger, protocol §8)
       await this.deps.store.delete(canvasObjectKey(this.deps.cfg.canvasPrefix, name));
+      await this.deps.store.delete(canvasLedgerKey(this.deps.cfg.canvasPrefix, name));
       this.deps.metrics.deletes.inc({ reason: kind });
       this.deps.log.info({ room: name, kind }, 'canvas object deleted with artifact');
     } catch (err) {
@@ -101,10 +103,13 @@ export class RoomManager {
       log.error({ err: String(err) }, 'sweep list failed');
       return { scanned, deleted };
     }
+    // content (`.ydoc`) and ledger (`.ydoc.ledger`) objects: one authz per artifact
+    const artifactKeys = new Set<string>();
     for (const key of keys) {
-      if (!key.endsWith('.ydoc')) continue;
-      const artifactKey = key.slice(prefix.length, -'.ydoc'.length);
-      if (!artifactKey) continue;
+      const artifactKey = artifactKeyFromObject(cfg.canvasPrefix, key);
+      if (artifactKey) artifactKeys.add(artifactKey);
+    }
+    for (const artifactKey of artifactKeys) {
       scanned++;
       const res = await authz.authorize('', artifactKey);
       const gone = cfg.goneReasons.has(res.reason);

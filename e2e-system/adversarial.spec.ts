@@ -1,6 +1,7 @@
 /**
  * FULL-SYSTEM adversarial cases (regressions of the independent verification), against the
- * same live compose stack as system.spec.ts: forged stamper-root writes, cross-origin
+ * same live compose stack as system.spec.ts: forged ledger-root writes (attribution, users,
+ * history live in the server-only LEDGER document; a client can only reach the content one), cross-origin
  * WebSockets, the expired-artifact existence leak, the public metrics route, an anonymous
  * visitor locking a room by filling it, and client-chosen anonymous ids.
  */
@@ -32,7 +33,10 @@ const wsUrl = (key: string, q = '') => `${WSB}/_canvas/_/ws/artifacts/${key}${q}
 
 /** Raw y-websocket client: sends the browser Origin unless told otherwise. */
 class Raw {
+  /** the room's content document (shapes, assets, meta) */
   doc = new Y.Doc();
+  /** the room's ledger document (attribution, users, history), from LEDGER (102) messages */
+  ledger = new Y.Doc();
   ws!: WebSocket;
   ident: { id: string; name: string; anonymous: boolean } | null = null;
   code: number | null = null;
@@ -61,7 +65,8 @@ class Raw {
         if (t === 0) {
           const st = decoding.readVarUint(dec);
           if (st !== 0) { Y.applyUpdate(this.doc, decoding.readVarUint8Array(dec), 'server'); this.synced = true; }
-        } else if (t === 100) this.ident = JSON.parse(decoding.readVarString(dec));
+        } else if (t === 102) Y.applyUpdate(this.ledger, decoding.readVarUint8Array(dec), 'server');
+        else if (t === 100) this.ident = JSON.parse(decoding.readVarString(dec));
         else if (t === 101) this.notices.push(JSON.parse(decoding.readVarString(dec)).kind);
       });
       this.doc.on('update', (u: Uint8Array, o: unknown) => {
@@ -117,11 +122,11 @@ test('1. forged stamper-root writes (history append/insert, attribution/users ov
     expect(honest.ident?.id).toBe(USERS.user1.email);
     const sid = `adv-${label.replace(/\W/g, '')}`;
     geo(honest.doc, sid);
-    await until(() => !!honest.doc.getMap('attribution').get(sid) && honest.doc.getArray('history').length > 0);
+    await until(() => !!honest.ledger.getMap('attribution').get(sid) && honest.ledger.getArray('history').length > 0);
     const before = {
-      attr: honest.doc.getMap('attribution').toJSON(),
-      users: honest.doc.getMap('users').toJSON(),
-      history: honest.doc.getArray('history').toJSON(),
+      attr: honest.ledger.getMap('attribution').toJSON(),
+      users: honest.ledger.getMap('users').toJSON(),
+      history: honest.ledger.getArray('history').toJSON(),
     };
     const variants: [string, (d: Y.Doc) => void][] = [
       ['history append after the last item', (d) => d.getArray('history').push([{ t: Date.now(), by: USERS.user1.email, verb: 'delete', shapeId: 'zz', shapeType: 'geo' }])],
@@ -134,6 +139,10 @@ test('1. forged stamper-root writes (history append/insert, attribution/users ov
     for (const [vname, fn] of variants) {
       const a = await joined(wsUrl(key, q), attacker);
       expect(a.synced, `${label}: ${vname} attacker joined`).toBe(true);
+      // the attacker merges the (broadcast) ledger into its content document, so its forged
+      // items carry real ledger origins (an append after the last history line has no parent)
+      await until(() => a.ledger.getArray('history').length > 0);
+      Y.applyUpdate(a.doc, Y.encodeStateAsUpdate(a.ledger), 'server');
       fn(a.doc);
       const code = await Promise.race([a.closed, sleep(3000).then(() => null)]);
       a.close();
@@ -141,9 +150,10 @@ test('1. forged stamper-root writes (history append/insert, attribution/users ov
     }
     await sleep(500);
     const fresh = await joined(wsUrl(key), { cookie: cookies.user1! });
-    expect(fresh.doc.getMap('attribution').toJSON()).toEqual(before.attr);
-    expect(fresh.doc.getMap('users').toJSON()).toEqual(before.users);
-    expect(fresh.doc.getArray('history').toJSON()).toEqual(before.history);
+    await until(() => fresh.ledger.getArray('history').length >= before.history.length);
+    expect(fresh.ledger.getMap('attribution').toJSON()).toEqual(before.attr);
+    expect(fresh.ledger.getMap('users').toJSON()).toEqual(before.users);
+    expect(fresh.ledger.getArray('history').toJSON()).toEqual(before.history);
     console.log(`[adv] ${label}: 6 forged writes -> 4403 each, stamper roots unchanged (history ${before.history.length} lines)`);
     fresh.close();
     honest.close();
@@ -171,8 +181,9 @@ test('3. expired artifact: a stranger gets the same 403/4403 as for a live one; 
   await sleep(1500);
   h.close();
   const obj = `artifacts/_plugins/canvas/${X.key}.ydoc`;
-  await until(() => mcBytes(obj) !== null, 10_000);
+  await until(() => mcBytes(obj) !== null && mcBytes(`${obj}.ledger`) !== null, 10_000);
   expect(mcBytes(obj)).not.toBeNull();
+  expect(mcBytes(`${obj}.ledger`)).not.toBeNull();
   const status = async (url: string, ck?: string) =>
     (await fetch(url, { headers: ck ? { cookie: ck } : {}, redirect: 'manual' })).status;
   const live = {
@@ -211,8 +222,9 @@ test('3. expired artifact: a stranger gets the same 403/4403 as for a live one; 
   await w1.open();
   await until(() => w1.code !== null, 5000);
   expect(w1.code).toBe(4410);
-  await until(() => mcBytes(obj) === null, 10_000);
+  await until(() => mcBytes(obj) === null && mcBytes(`${obj}.ledger`) === null, 10_000);
   expect(mcBytes(obj)).toBeNull();
+  expect(mcBytes(`${obj}.ledger`)).toBeNull(); // the ledger object dies with it
 });
 
 test('4. metrics are not public: 404 on the route, served only on the internal port', async () => {

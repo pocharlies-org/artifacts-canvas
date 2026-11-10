@@ -9,13 +9,16 @@ import type { Identity } from '../../src/types.js';
 /**
  * Minimal y-websocket client for tests: speaks the stock wire protocol (varUint type +
  * payload) exactly like the browser client, plus captures of the canvas-specific
- * messages (IDENTITY 100, NOTICE 101) and the close code.
+ * messages (IDENTITY 100, NOTICE 101, LEDGER 102 into `ledger`) and the close code.
  */
 /** Origin every test client sends unless told otherwise (tests set ALLOWED_ORIGINS to it). */
 export const TEST_ORIGIN = 'http://canvas.test';
 
 export class TestClient {
+  /** the room's content document (shapes, assets, meta) */
   readonly doc = new Y.Doc();
+  /** the room's ledger document (attribution, users, history, writers), from MSG_LEDGER */
+  readonly ledger = new Y.Doc();
   readonly awareness = new awarenessProtocol.Awareness(this.doc);
   ws!: WebSocket;
   identities: Identity[] = [];
@@ -29,6 +32,8 @@ export class TestClient {
 
   /** Set-Cookie of the 101 response (anonymous pseudonym cookie). */
   setCookie: string | null = null;
+  /** answer the server's sync step 1 with a step 2, like the stock y-websocket client */
+  answerStep1 = true;
 
   constructor(
     private readonly url: string,
@@ -100,7 +105,17 @@ export class TestClient {
         Y.applyUpdate(this.doc, decoding.readVarUint8Array(dec), 'server');
       } else if (syncType === syncProtocol.messageYjsUpdate) {
         Y.applyUpdate(this.doc, decoding.readVarUint8Array(dec), 'server');
+      } else if (syncType === syncProtocol.messageYjsSyncStep1 && this.answerStep1) {
+        // what y-websocket does: answer the server's state vector with what it lacks
+        const e = encoding.createEncoder();
+        encoding.writeVarUint(e, 0);
+        syncProtocol.writeSyncStep2(e, this.doc, decoding.readVarUint8Array(dec));
+        this.ws.send(encoding.toUint8Array(e));
       }
+      return;
+    }
+    if (type === 102) {
+      Y.applyUpdate(this.ledger, decoding.readVarUint8Array(dec), 'server');
       return;
     }
     if (type === 1) {

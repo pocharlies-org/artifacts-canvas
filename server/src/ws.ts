@@ -21,12 +21,14 @@ import { Room, sendWs, type Conn } from './room.js';
 import {
   CLOSE,
   MSG_AWARENESS,
+  MSG_LEDGER,
   MSG_QUERY_AWARENESS,
   MSG_SYNC,
   encodeIdentity,
+  encodeLedger,
   encodeNotice,
 } from '@pocharlies/artifacts-canvas-shared/protocol';
-import { checkClientUpdate, type UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { applyGuarded, checkClientUpdate, encodeIntegratedState, type UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
 
 export const WS_ROUTE = '/_canvas/_/ws/';
 /** Same route when the ingress controller strips the plugin prefix. */
@@ -230,16 +232,22 @@ export class WsServer {
     metrics.connections.inc({ anonymous: identity.anonymous ? 'true' : 'false' });
     log.info({ room: artifactKey, user: identity.id, anon: identity.anonymous }, 'ws joined');
 
-    // IDENTITY MUST be the first message (protocol §4).
+    // IDENTITY MUST be the first message (protocol §4.1).
     sendWs(ws, encodeIdentity(identity));
+    // The ledger (read-only for clients) before the content, so shapes arrive with authors.
+    sendWs(ws, encodeLedger(encodeIntegratedState(room.ledger)));
+    // The content: the full state (step 2), then the server's state vector (step 1) so the
+    // client answers with a step 2 holding what the room lacks — the edits it made while
+    // disconnected. That answer is a plain client update and goes through the guard; the
+    // content document holds no server-only root a client could echo back.
     const e = encoding.createEncoder();
     encoding.writeVarUint(e, MSG_SYNC);
-    // Push the room state directly (step2). The server is the source of truth (it just
-    // loaded the doc from the object store), so there is nothing to request from the
-    // client — and a step1 here would make clients answer with a step2 that echoes the
-    // stamper roots back, which the §5.3 guard must (and now does) reject.
     syncProtocol.writeSyncStep2(e, room.doc);
     sendWs(ws, encoding.toUint8Array(e));
+    const e1 = encoding.createEncoder();
+    encoding.writeVarUint(e1, MSG_SYNC);
+    syncProtocol.writeSyncStep1(e1, room.doc);
+    sendWs(ws, encoding.toUint8Array(e1));
     const states = room.awareness.getStates();
     if (states.size) {
       const a = encoding.createEncoder();
@@ -312,33 +320,25 @@ export class WsServer {
         sendWs(conn.ws, encoding.toUint8Array(e));
         return;
       }
-      if (syncType === syncProtocol.messageYjsSyncStep2) {
-        // A step2 payload is [state vector][update]. The state vector is
-        // varUint(count) + count×(varUint clientId, varUint clock); skip it so the
-        // guard and the apply below see the plain update (a step2 must not be able to
-        // smuggle a stamper-root write past forbiddenRootWriteSafe).
-        const n = decoding.readVarUint(dec);
-        for (let i = 0; i < n; i++) {
-          decoding.readVarUint(dec);
-          decoding.readVarUint(dec);
-        }
-      } else if (syncType !== syncProtocol.messageYjsUpdate) {
+      // step 2 and update carry the same payload: varUint8Array(update) (y-protocols/sync:
+      // writeSyncStep2 = varUint8Array(encodeStateAsUpdate(doc, sv)), no state vector)
+      if (syncType !== syncProtocol.messageYjsSyncStep2 && syncType !== syncProtocol.messageYjsUpdate) {
         conn.ws.close(1003, 'unknown sync type');
         return;
       }
       const update = decoding.readVarUint8Array(dec);
       if (conn.identity.readOnly) return;
-      // Protocol §5.3: a client write to attribution/users/history closes the connection
-      // and the update is NOT applied.
+      // Protocol §5.3: a write the content guard refuses closes the connection and the
+      // update is NOT applied.
       const check = checkClientUpdateSafe(room, conn, update);
       const bad = check.bad;
       if (bad) {
-        this.deps.log.warn({ room: room.name, user: conn.identity.id, root: bad }, 'forged stamper-root write');
+        this.deps.log.warn({ room: room.name, user: conn.identity.id, root: bad }, 'forbidden content write');
         conn.ws.close(CLOSE.forbidden, `write to ${bad} not allowed`);
         this.deps.metrics.wsRejected.inc({ reason: 'forbidden_write' });
         return;
       }
-      // Document size cap (protocol §7), per connection: an update that would grow the room
+      // Document size cap (protocol §10), per connection: an update that would grow the room
       // past THIS connection's cap is refused and only this connection is closed. The room
       // stays open for everyone else (an anonymous visitor cannot lock the room).
       const limit = conn.identity.anonymous ? cfg.anonMaxDocBytes : cfg.maxDocBytes;
@@ -355,26 +355,44 @@ export class WsServer {
           }
         }
       }
-      Y.applyUpdate(room.doc, update, conn);
-      room.approxBytes += update.byteLength;
-      // The room must never hold pending state (a parked struct can later be released into
-      // a server-only root). The guard refuses every update that would leave some; if one
-      // still did, close the sender and drop what was parked (never persisted, never sent).
-      if (room.hasPending()) {
-        this.deps.log.error({ room: room.name, user: conn.identity.id }, 'update left pending state: sender closed, pending dropped');
+      // Apply with the connection as origin (the stamper attributes it to this identity).
+      // applyGuarded ALWAYS drops whatever Yjs could not integrate, also when it throws
+      // mid-way. A clean apply marks the room dirty through the document's update event;
+      // anything else marks it here (what did integrate before a throw was broadcast).
+      let outcome: ReturnType<typeof applyGuarded> | null = null;
+      try {
+        outcome = applyGuarded(room.doc, update, conn);
+      } finally {
+        room.approxBytes += update.byteLength;
+        if (!outcome || outcome.threw || outcome.droppedPending) room.markDirty();
+      }
+      if (outcome.threw || outcome.droppedPending) {
+        this.deps.log.error(
+          { room: room.name, user: conn.identity.id, threw: outcome.threw, droppedPending: outcome.droppedPending },
+          'accepted update did not integrate cleanly: sender closed, pending dropped',
+        );
+        if (outcome.droppedPending) this.deps.metrics.pendingDropped.inc({ where: 'apply' });
         conn.ws.close(CLOSE.forbidden, 'write not allowed');
-        this.deps.metrics.wsRejected.inc({ reason: 'pending_after_apply' });
-        void room.recoverFromPending();
+        this.deps.metrics.wsRejected.inc({ reason: outcome.threw ? 'apply_threw' : 'pending_after_apply' });
         return;
       }
       room.claimWriters(check.writers, conn.identity.id);
+      return;
+    }
+    if (type === MSG_LEDGER) {
+      // The ledger is server-only: a client never writes it, in any form.
+      this.deps.log.warn({ room: room.name, user: conn.identity.id }, 'client message on the ledger channel');
+      conn.ws.close(CLOSE.forbidden, 'ledger is read-only');
+      this.deps.metrics.wsRejected.inc({ reason: 'ledger_write' });
       return;
     }
     if (type === MSG_AWARENESS) {
       const update = decoding.readVarUint8Array(dec);
       // Protocol §5.4: the `user` field is forced to the verified identity; states for
       // clientIds owned by other connections are dropped.
-      const fixed = sanitizeAwarenessUpdate(update, conn.clientIds, room.awareness, conn.identity);
+      const fixed = sanitizeAwarenessUpdate(update, conn.clientIds, room.awareness, conn.identity, (id) =>
+        room.mayClaimAwareness(id, conn.identity.id),
+      );
       if (fixed) awarenessProtocol.applyAwarenessUpdate(room.awareness, fixed, conn);
       return;
     }
@@ -426,13 +444,18 @@ function checkClientUpdateSafe(room: Room, conn: Conn, update: Uint8Array): Upda
   }
 }
 
-/** Size of the room state after `update`, measured on a scratch copy (the room is untouched). */
+/**
+ * Size of the room state after `update`, measured on a scratch copy (the room is untouched).
+ * An update that cannot even be applied to the copy counts as unbounded.
+ */
 function sizeAfter(doc: Y.Doc, update: Uint8Array): number {
   const scratch = new Y.Doc({ gc: doc.gc });
   try {
     Y.applyUpdate(scratch, Y.encodeStateAsUpdate(doc));
     Y.applyUpdate(scratch, update);
     return Y.encodeStateAsUpdate(scratch).byteLength;
+  } catch {
+    return Number.POSITIVE_INFINITY;
   } finally {
     scratch.destroy();
   }

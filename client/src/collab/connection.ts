@@ -3,7 +3,7 @@ import { WebsocketProvider } from 'y-websocket';
 import type * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
 import type { Awareness } from 'y-protocols/awareness';
-import { MSG_IDENTITY, MSG_NOTICE, parseIdentity, type Notice } from './protocol';
+import { MSG_IDENTITY, MSG_LEDGER, MSG_NOTICE, parseIdentity, type Notice } from './protocol';
 import type { Identity } from '../model/types';
 import { personColor } from '../model/colors';
 
@@ -19,9 +19,18 @@ export interface ConnectionOptions {
   identityTimeoutMs?: number;
 }
 
-/** y-websocket connection plus the IDENTITY / NOTICE extensions of docs/protocol.md. */
+/** Transaction origin of ledger updates received from the server. */
+export const LEDGER_ORIGIN = 'artifacts-canvas:ledger';
+
+/**
+ * y-websocket connection (content document) plus the IDENTITY / NOTICE / LEDGER extensions
+ * of docs/protocol.md. The ledger document is only ever applied FROM the server: nothing
+ * observes it to send, so a local change to it (a dev-mode local stamper) never leaves the
+ * tab, and the server would close a client that sent one anyway.
+ */
 export class Connection {
   readonly provider: WebsocketProvider;
+  readonly ledger: Y.Doc;
   readonly awareness: Awareness;
   identity: Identity | null = null;
   status: Status = 'connecting';
@@ -31,7 +40,9 @@ export class Connection {
   private statusListeners = new Set<(s: Status) => void>();
   private devTimer: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(readonly doc: Y.Doc, opts: ConnectionOptions) {
+  constructor(readonly doc: Y.Doc, opts: ConnectionOptions, ledger: Y.Doc = new Y.Doc()) {
+    if (ledger === doc) throw new Error('Connection: the ledger must be a separate Y.Doc');
+    this.ledger = ledger;
     this.provider = new WebsocketProvider(opts.wsUrl, opts.room, doc, {
       params: opts.params,
       // One identity per tab: never share updates through BroadcastChannel.
@@ -44,6 +55,13 @@ export class Connection {
       const id = parseIdentity(decoding.readVarString(dec));
       if (!id) return;
       this.setIdentity(id);
+    };
+    this.provider.messageHandlers[MSG_LEDGER] = (_enc: encoding.Encoder, dec: decoding.Decoder) => {
+      try {
+        Y.applyUpdate(this.ledger, decoding.readVarUint8Array(dec), LEDGER_ORIGIN);
+      } catch {
+        /* ignore a malformed ledger message (the content is unaffected) */
+      }
     };
     this.provider.messageHandlers[MSG_NOTICE] = (_enc: encoding.Encoder, dec: decoding.Decoder) => {
       try {

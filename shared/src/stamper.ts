@@ -1,21 +1,27 @@
 import * as Y from 'yjs';
-import { ROOT } from './model.js';
+import * as decoding from 'lib0/decoding';
+import { CONTENT_ROOTS, MAX_POINTS, ROOT, keyOk } from './model.js';
 import { assetValueOk, metaValueOk, pointsOk, shapeFieldProblem, shapeRecordProblem, SHAPE_TYPES } from './model.js';
 import type { Attribution, GeoKind, HistoryEntry, HistoryVerb, ShapeFieldKind, ShapeType, UserInfo } from './model.js';
 
 /**
  * Attribution stamper.
  *
- * Watches transactions on a document and, for every transaction whose origin belongs to a
- * known user, writes into the root types `attribution`, `users` and `history`:
+ * Watches the transactions of the CONTENT document and, for every transaction whose origin
+ * belongs to a known user, writes into the LEDGER document (a separate Y.Doc, see
+ * model.ts) — roots `attribution`, `users` and `history`:
  *   - a new shape            -> attribution {createdBy, createdAt, updatedBy, updatedAt} + history "create"
  *   - a changed shape        -> attribution.updatedBy/updatedAt + history "move"/"resize"/... (rate-limited)
- *   - a deleted shape        -> history "delete" (attribution entry removed)
+ *   - a deleted shape        -> history "delete" (the attribution entry is kept for an undo)
  *
- * It runs on the SERVER (the reference dev server in client/dev uses it) so attribution cannot be
+ * The shape ids and verbs come only from the content transaction itself (`tr.changed`, the
+ * deletions it made) and the author only from its origin (the connection that sent it), so
+ * nothing a client writes can name an author: clients never write the ledger at all.
+ *
+ * It runs on the SERVER (the reference dev room in client/dev too) so attribution cannot be
  * forged: the server knows which connection sent each update. When the server announces
  * `attribution: 'client'` (e.g. a plain y-websocket relay in development) the client runs it
- * itself for its own transactions.
+ * itself for its own transactions, into a ledger local to that tab.
  *
  * Writes use the origin STAMP_ORIGIN, which is never tracked by any UndoManager.
  */
@@ -47,15 +53,15 @@ const GEOMETRY_VERBS: Record<string, HistoryVerb> = {
 /** Precedence when one transaction changes several things. */
 const VERB_RANK: HistoryVerb[] = ['create', 'delete', 'edit', 'resize', 'rotate', 'move', 'style', 'group', 'lock', 'order'];
 
-export function stampTransaction(doc: Y.Doc, tr: Y.Transaction, opts: StamperOptions, memo: StamperMemo) {
+export function stampTransaction(content: Y.Doc, ledger: Y.Doc, tr: Y.Transaction, opts: StamperOptions, memo: StamperMemo) {
   if (tr.origin === STAMP_ORIGIN) return;
   const who = opts.userOf(tr.origin, tr);
   if (!who) return;
   const now = (opts.now ?? Date.now)();
-  const shapes = doc.getMap<Y.Map<unknown>>(ROOT.shapes);
-  const attribution = doc.getMap<Attribution>(ROOT.attribution);
-  const users = doc.getMap<UserInfo>(ROOT.users);
-  const history = doc.getArray<HistoryEntry>(ROOT.history);
+  const shapes = content.getMap<Y.Map<unknown>>(ROOT.shapes);
+  const attribution = ledger.getMap<Attribution>(ROOT.attribution);
+  const users = ledger.getMap<UserInfo>(ROOT.users);
+  const history = ledger.getArray<HistoryEntry>(ROOT.history);
 
   // shape id -> verbs touched in this transaction
   const touched = new Map<string, Set<HistoryVerb>>();
@@ -101,7 +107,7 @@ export function stampTransaction(doc: Y.Doc, tr: Y.Transaction, opts: StamperOpt
     if (info) deletedInfo.set(id, info);
   }
 
-  doc.transact(() => {
+  ledger.transact(() => {
     const cur = users.get(who.id);
     if (!cur || cur.name !== who.info.name || cur.anonymous !== who.info.anonymous || cur.color !== who.info.color) {
       users.set(who.id, { ...who.info });
@@ -211,30 +217,36 @@ function deletedShapeInfo(tr: Y.Transaction, shapes: Y.Map<Y.Map<unknown>>, id: 
   }
 }
 
-/** Attach the stamper to a document. Returns a detach function. */
-export function attachStamper(doc: Y.Doc, opts: StamperOptions): () => void {
+/**
+ * Attach the stamper: observe `content`, write `ledger`. Returns a detach function. The two
+ * documents must be different (a ledger inside the content document is exactly the shared
+ * trust domain this design removes).
+ */
+export function attachStamper(content: Y.Doc, ledger: Y.Doc, opts: StamperOptions): () => void {
+  if (content === ledger) throw new Error('attachStamper: the ledger must be a separate Y.Doc');
   const memo: StamperMemo = { last: new Map(), touch: new Map() };
-  const handler = (tr: Y.Transaction) => stampTransaction(doc, tr, opts, memo);
-  doc.on('afterTransaction', handler);
-  return () => doc.off('afterTransaction', handler);
+  const handler = (tr: Y.Transaction) => stampTransaction(content, ledger, tr, opts, memo);
+  content.on('afterTransaction', handler);
+  return () => content.off('afterTransaction', handler);
 }
 
 /**
- * Root types a client may write. Everything else — the stamper-owned roots `attribution`,
- * `users` and `history`, and any root name the schema does not define — is server-only.
- * An allow-list, so a future server-only root is protected without touching the guard.
+ * Root types a client may write in the content document. Anything else (a legacy ledger
+ * root left in an old document, any root the schema does not define) is refused: an
+ * allow-list.
  */
-export const CLIENT_WRITABLE_ROOTS: ReadonlySet<string> = new Set<string>([ROOT.shapes, ROOT.assets, ROOT.meta]);
+export const CLIENT_WRITABLE_ROOTS: ReadonlySet<string> = new Set<string>(CONTENT_ROOTS);
 
 export interface GuardOptions {
   /**
-   * Client id the server's stamper writes with. A client may never send a struct as this
-   * client. Defaults to `doc.clientID` (the room document is the stamper's document).
+   * Client id the server writes the content document with (it never does today: the
+   * stamper writes the ledger). A client may never send a struct as this client. Defaults
+   * to `doc.clientID`.
    */
   serverClient?: number;
   /**
    * Called for every client id the update adds new clocks to; return false when that id is
-   * someone else's (another connection writes with it). Omitted = every id is allowed.
+   * someone else's (another principal writes with it). Omitted = every id is allowed.
    */
   mayWriteClient?: (client: number) => boolean;
 }
@@ -247,29 +259,37 @@ export interface UpdateCheck {
 }
 
 /**
- * Server-side guard (protocol §5.3). Returns null when a client may apply `update` to the
- * room `doc`, else the name of the offending root or a reason:
- *   - `attribution` / `users` / `history` / any unknown root: a write outside the allow-list;
+ * Server-side guard of the CONTENT document (protocol §5.3). Returns null when a client may
+ * apply `update` to the room's content `doc`, else the offending root or a reason.
+ *
+ * It no longer protects attribution: the ledger (attribution/users/history) is a different
+ * Y.Doc that no client update ever reaches, so nothing this guard misses can forge or erase
+ * it. Its job is schema/size safety of the content and pending-state hygiene:
+ *   - any root other than `shapes`, `assets`, `meta`: a write outside the allow-list;
  *   - `pending`: the update would not integrate completely (a clock gap, a dependency the
- *     room does not have, a delete of clocks nobody wrote yet). Yjs would park the rest as
- *     pending state and release it later into whatever root its dependencies resolve to —
- *     e.g. right after a future stamper item — so the room must NEVER hold pending state;
- *   - `server-client`: a struct carrying the server stamper's client id;
- *   - `foreign-client`: new clocks for a client id another connection writes with;
- *   - `overlap` / `malformed`: a struct that only partly overlaps the room state, or an
- *     impossible same-client dependency;
+ *     room does not have — for a known struct too, Yjs resolves its origins before it skips
+ *     it —, a delete of clocks nobody wrote yet). The room never holds pending state;
+ *   - `malformed`: a zero-length struct or delete range (Yjs integrates a zero-length item
+ *     over a live map entry and then cannot encode the document), an impossible same-client
+ *     dependency;
+ *   - `server-client`: a struct carrying the server's own client id;
+ *   - `foreign-client`: new clocks for a client id another principal writes with;
+ *   - `overlap`: a struct that only partly overlaps the room state;
  *   - `shapes-schema` / `assets-schema` / `meta-schema`: a value the document schema does not
- *     allow (only Y.Map shapes with a valid `type`, numeric geometry, string assets, ...);
+ *     allow (docs/protocol.md §6: Y.Map shapes with a valid `type` that never goes away,
+ *     style enums from the allow-lists, numeric geometry, capped point lists, no forbidden
+ *     keys, string assets, plain JSON meta, ...);
  *   - `room-pending`: the room itself holds pending state (it must be cleaned first).
  * `doc` is never modified.
  *
- * Fast path: every NEW struct (the room already has the rest; Yjs skips it) is resolved to
- * its parent type. Yjs encodes `parent` only for items without neighbours; an item with a
- * left/right origin travels with `parent === null` and inherits parent and key from that
- * origin, so origins are followed through the room (for clocks it already has) and the
- * update itself. Anything the fast path cannot resolve (origin cycles, very long chains)
- * goes to the slow path: the update is applied to a scratch copy of the room, which must
- * integrate completely, change only client roots, and leave every touched value valid.
+ * Fast path: every struct is checked for length and dependencies; every NEW struct is
+ * resolved to its parent type. Yjs encodes `parent` only for items without neighbours; an
+ * item with a left/right origin travels with `parent === null` and inherits parent and key
+ * from that origin, so origins are followed through the room (for clocks it already has)
+ * and the update itself. Anything the fast path cannot resolve (origin cycles, very long
+ * chains, an ambiguous `type` replacement) goes to the slow path: the update is applied to a
+ * scratch copy of the room, which must integrate completely, change only client roots, and
+ * leave every touched value valid.
  */
 export function forbiddenRootWrite(doc: Y.Doc, update: Uint8Array, opts: GuardOptions = {}): string | null {
   return checkClientUpdate(doc, update, opts).bad;
@@ -300,6 +320,33 @@ export function dropPending(doc: Y.Doc): boolean {
   return had;
 }
 
+/** What happened when an accepted update was applied (see applyGuarded). */
+export interface ApplyOutcome {
+  /** Yjs threw while integrating (whatever it integrated before the throw stays). */
+  threw: string | null;
+  /** pending structs/deletes were left and have been dropped */
+  droppedPending: boolean;
+}
+
+/**
+ * Apply an update the guard accepted, with the connection as transaction origin, and
+ * ALWAYS restore the "no pending state" invariant afterwards — also when Yjs throws in the
+ * middle of the integration (a throw used to skip the safety net and leave the room pending
+ * for good, refusing every later writer as `room-pending`). The caller closes the sender
+ * when `threw` or `droppedPending` and marks the room dirty in any case.
+ */
+export function applyGuarded(doc: Y.Doc, update: Uint8Array, origin: unknown): ApplyOutcome {
+  const out: ApplyOutcome = { threw: null, droppedPending: false };
+  try {
+    Y.applyUpdate(doc, update, origin);
+  } catch (err) {
+    out.threw = String(err);
+  } finally {
+    out.droppedPending = dropPending(doc);
+  }
+  return out;
+}
+
 /** The document state as an update WITHOUT the pending structs/deletes Yjs would merge in. */
 export function encodeIntegratedState(doc: Y.Doc): Uint8Array {
   const ps = doc.store.pendingStructs;
@@ -319,6 +366,7 @@ const UNRESOLVED = Symbol('unresolved');
 const MISSING = Symbol('missing');
 /** A struct that Yjs integrates as garbage (a neighbour or the parent is GC): it writes nothing. */
 const GC_ROOT = Symbol('gc');
+const IN_PROGRESS = Symbol('in-progress');
 
 /** Where an item lives: its root, the map keys from the root down to it, and its parent type. */
 interface Loc {
@@ -327,6 +375,8 @@ interface Loc {
   keys: (string | null)[];
   /** identity of the parent type: `root:<name>` or the id of the item that created it */
   parent: string;
+  /** id of the item that created the parent type (absent for a root) */
+  parentId?: Y.ID;
 }
 type LocOf = Loc | typeof GC_ROOT | typeof UNRESOLVED | typeof MISSING;
 
@@ -339,28 +389,42 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): { bad: s
   const serverClient = opts.serverClient ?? doc.clientID;
   const decoded = Y.decodeUpdate(update);
   const writers: number[] = [];
+  // One struct block per client. Yjs keeps only the LAST block of a client that appears in
+  // several (and an empty block wipes the earlier ones), while decodeUpdate lists all of
+  // them: what this check sees would not be what Yjs integrates.
+  const blocks = decoding.readVarUint(decoding.createDecoder(update));
+  if (blocks !== new Set((decoded.structs as Y.Item[]).map((s) => s.id.client)).size) return { bad: 'malformed', writers };
 
-  // NEW structs (Item / GC) per client, in clock order; fully known ones are skipped by Yjs.
+  // NEW structs (Item / GC) per client, in clock order; fully known ones are skipped by Yjs
+  // after it resolved their dependencies (kept apart for the dependency check).
   const fresh = new Map<number, (Y.Item | Y.GC)[]>();
   const items: Y.Item[] = [];
+  const known: Y.Item[] = [];
   const next = new Map<number, number>(); // expected next clock per client
   let pending = false;
   for (const s of decoded.structs as (Y.Item | Y.GC | Y.Skip)[]) {
     const client = s.id.client;
     if (client === serverClient) return { bad: 'server-client', writers };
-    const known = Y.getState(doc.store, client);
+    // a zero-length struct: Yjs integrates it even "at" a known clock (offset 0) — over a
+    // live map entry it deletes that entry, and the document then fails to encode
+    if (!(s.length > 0)) return { bad: 'malformed', writers };
+    const roomClock = Y.getState(doc.store, client);
     const end = s.id.clock + s.length;
     const expected = next.get(client);
     if (expected !== undefined && s.id.clock !== expected) pending = true; // not contiguous
     next.set(client, end);
     if (s instanceof Y.Skip) {
-      if (end > known) pending = true; // a hole in the new clocks
+      if (end > roomClock) pending = true; // a hole in the new clocks
       continue;
     }
-    if (end <= known) continue; // the room has it: Yjs skips it
+    if (end <= roomClock) {
+      // the room has it: Yjs skips it, but only after resolving its origins/parent
+      if (s instanceof Y.Item) known.push(s);
+      continue;
+    }
     // the first new clock must be exactly the room's next clock for this client
-    if (s.id.clock < known) return { bad: 'overlap', writers };
-    if (s.id.clock > known && expected === undefined) pending = true; // a gap before it
+    if (s.id.clock < roomClock) return { bad: 'overlap', writers };
+    if (s.id.clock > roomClock && expected === undefined) pending = true; // a gap before it
     let arr = fresh.get(client);
     if (!arr) {
       fresh.set(client, (arr = []));
@@ -386,6 +450,36 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): { bad: s
     return null;
   };
 
+  // Dependencies: Yjs only integrates (or skips) a struct once its origins/parent exist;
+  // a same-client dependency it does not even check, and resolving a missing one throws.
+  const depsOf = (s: Y.Item) => [s.origin, s.rightOrigin, s.parent && typeof s.parent === 'object' && 'client' in s.parent ? (s.parent as Y.ID) : null];
+  for (const s of items) {
+    for (const dep of depsOf(s)) {
+      if (!dep) continue;
+      if (dep.client === s.id.client) {
+        if (dep.clock >= s.id.clock) return { bad: 'malformed', writers };
+        continue; // earlier clock of the same client: the room or this update has it (contiguity)
+      }
+      if (dep.clock < Y.getState(doc.store, dep.client)) continue;
+      if (!findFresh(dep)) pending = true;
+    }
+  }
+  for (const s of known) {
+    for (const dep of depsOf(s)) {
+      if (!dep) continue;
+      // same client: Yjs does not wait for it and resolving a later clock throws
+      if (dep.client === s.id.client && dep.clock >= s.id.clock) return { bad: 'malformed', writers };
+      if (dep.clock < Y.getState(doc.store, dep.client) || findFresh(dep)) continue;
+      if (dep.client === s.id.client) return { bad: 'malformed', writers };
+      pending = true;
+    }
+  }
+  // Integration order: Yjs integrates each client's structs in clock order, every one once
+  // its cross-client dependencies are in. Dependencies that all exist can still form a
+  // cycle across clients (A:0 after B:1, B:0 after A:0) that never integrates: simulate it.
+  if (!pending && !integrates(doc, decoded.structs as (Y.Item | Y.GC | Y.Skip)[], depsOf)) pending = true;
+  if (pending) return { bad: 'pending', writers };
+
   const roomMemo = new Map<Y.Item, Loc | typeof UNRESOLVED>();
   const locOfRoomItem = (item: Y.Item): Loc | typeof UNRESOLVED => {
     const hit = roomMemo.get(item);
@@ -404,7 +498,9 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): { bad: s
       const name = rootNameOfType(parent, doc);
       if (name !== null) {
         const own = item.parent as Y.AbstractType<unknown>;
-        r = { root: name, keys, parent: own._item ? idKey(own._item.id) : `root:${name}` };
+        r = own._item
+          ? { root: name, keys, parent: idKey(own._item.id), parentId: own._item.id }
+          : { root: name, keys, parent: `root:${name}` };
       }
       break;
     }
@@ -412,7 +508,8 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): { bad: s
     return r;
   };
 
-  const updMemo = new Map<Y.Item, LocOf>();
+  /** memo of every resolved item; IN_PROGRESS while resolving it (an origin cycle) */
+  const updMemo = new Map<Y.Item, LocOf | typeof IN_PROGRESS>();
   /** Location of whatever lives at `id`: the room for clocks it has, else the update. */
   const locOfId = (id: Y.ID, depth: number): LocOf => {
     if (id.clock < Y.getState(doc.store, id.client)) {
@@ -451,8 +548,10 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): { bad: s
   };
   const locOfItem = (s: Y.Item, depth: number): LocOf => {
     const hit = updMemo.get(s);
+    if (hit === IN_PROGRESS) return UNRESOLVED; // an origin cycle: let the slow path decide
     if (hit !== undefined) return hit;
-    if (depth > 64) return UNRESOLVED; // deep origin chains or cycles: let the slow path decide
+    if (depth > 64) return UNRESOLVED; // deep origin chains: let the slow path decide
+    updMemo.set(s, IN_PROGRESS);
     let r: LocOf;
     const p = s.parent as unknown;
     const left = s.origin ? locOfId(s.origin, depth) : null;
@@ -464,30 +563,35 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): { bad: s
     else if (p && typeof p === 'object' && 'client' in (p as object)) {
       const pid = p as Y.ID;
       const pl = typeLocOfId(pid, depth);
-      r = typeof pl === 'symbol' ? pl : { root: pl.root, keys: [...pl.keys, s.parentSub], parent: idKey(pid) };
+      r = typeof pl === 'symbol' ? pl : { root: pl.root, keys: [...pl.keys, s.parentSub], parent: idKey(pid), parentId: pid };
     } else if (left) r = left; // parent omitted: parent and key of the left origin...
     else if (right) r = right; // ...else of the right origin
     else r = UNRESOLVED; // no parent and no origin: malformed
-    if (r !== UNRESOLVED) updMemo.set(s, r);
+    // memoised either way (an UNRESOLVED left uncached made origin/rightOrigin cycles
+    // exponential: 2^depth calls)
+    updMemo.set(s, r);
     return r;
   };
 
-  // Dependencies: Yjs only integrates a struct once its origins/parent exist.
-  for (const s of items) {
-    for (const dep of [s.origin, s.rightOrigin, (s.parent && typeof s.parent === 'object' && 'client' in s.parent ? (s.parent as Y.ID) : null)]) {
-      if (!dep) continue;
-      if (dep.client === s.id.client) {
-        if (dep.clock >= s.id.clock) return { bad: 'malformed', writers };
-        continue; // earlier clock of the same client: the room or this update has it (contiguity)
-      }
-      if (dep.clock < Y.getState(doc.store, dep.client)) continue;
-      if (!findFresh(dep)) pending = true;
+  /** Current length of a room Y.Array created by the item at `id` (0 when it is new). */
+  const roomArrayLength = (id: Y.ID | undefined): number => {
+    if (!id || id.clock >= Y.getState(doc.store, id.client)) return 0;
+    try {
+      const st = Y.getItem(doc.store, id) as Y.Item | Y.GC;
+      const t = st instanceof Y.Item && st.content instanceof Y.ContentType ? st.content.type : null;
+      return t instanceof Y.Array ? t.length : 0;
+    } catch {
+      return 0;
     }
-  }
+  };
 
   let unresolved = false;
   const newShapeMaps: Y.Item[] = [];
   const typeParents = new Set<string>();
+  /** shape maps (parent key) whose `type` a ContentDeleted item at that key overwrites */
+  const typeErased = new Map<string, Y.ID | undefined>();
+  /** new numbers per `points` Y.Array (parent key) */
+  const pointsAdded = new Map<string, { id: Y.ID | undefined; n: number }>();
   for (const s of items) {
     const loc = locOfItem(s, 0);
     if (loc === MISSING) {
@@ -500,23 +604,42 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): { bad: s
     }
     if (loc === GC_ROOT) continue;
     if (!CLIENT_WRITABLE_ROOTS.has(loc.root)) return { bad: loc.root, writers };
-    if (s.content instanceof Y.ContentDeleted) continue;
+    if (s.content instanceof Y.ContentDeleted) {
+      // a deleted item at a map key replaces (= deletes) the value there: same rules as a
+      // delete — the key must be one a client may use, and a live shape keeps its `type`
+      if (loc.keys.some((k) => k !== null && !keyOk(k))) return { bad: `${loc.root}-schema`, writers };
+      if (loc.root === ROOT.shapes && loc.keys.length === 2 && loc.keys[1] === 'type') typeErased.set(loc.parent, loc.parentId);
+      continue;
+    }
     const problem = schemaProblem(loc, s.content);
     if (problem) return { bad: problem, writers };
     if (loc.root === ROOT.shapes && loc.keys.length === 1) newShapeMaps.push(s);
-    if (loc.root === ROOT.shapes && loc.keys.length === 2 && loc.keys[1] === 'type') typeParents.add(loc.parent);
+    if (loc.root === ROOT.shapes && loc.keys.length === 2 && loc.keys[1] === 'type') {
+      // a new `type` value replaces the old one; deleted in the same update, it leaves none
+      if (Y.isDeleted(decoded.ds, s.id)) typeErased.set(loc.parent, loc.parentId);
+      else typeParents.add(loc.parent);
+    }
+    if (loc.root === ROOT.shapes && loc.keys.length === 3 && loc.keys[1] === 'points') {
+      const cur = pointsAdded.get(loc.parent) ?? { id: loc.parentId, n: 0 };
+      cur.n += s.length;
+      pointsAdded.set(loc.parent, cur);
+    }
   }
   if (pending) return { bad: 'pending', writers };
+  for (const { id, n } of pointsAdded.values()) {
+    if (roomArrayLength(id) + n > MAX_POINTS) return { bad: 'shapes-schema', writers };
+  }
 
   const dsHas = (id: Y.ID) => Y.isDeleted(decoded.ds, id);
   for (const [client, ranges] of decoded.ds.clients) {
-    const known = Y.getState(doc.store, client);
+    const roomClock = Y.getState(doc.store, client);
     for (const r of ranges) {
+      // a zero-length range deletes nothing but makes Yjs throw while it re-encodes it
+      if (!(r.len > 0)) return { bad: 'malformed', writers };
       for (let clock = r.clock; clock < r.clock + r.len; ) {
-        if (clock >= known) {
+        if (clock >= roomClock) {
           // a delete of something the room does not have yet: only fine if the update
-          // itself inserts it (checked above); otherwise it would wait as a pending
-          // delete for a future (stamper) item
+          // itself inserts it (checked above); otherwise it would wait as a pending delete
           const it = findFresh(Y.createID(client, clock));
           if (!it) return { bad: 'pending', writers };
           clock = it.id.clock + it.length;
@@ -546,11 +669,74 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): { bad: s
       }
     }
   }
+  // a `type` overwritten by a deleted item: refused unless the shape itself goes away in this
+  // update; with a live replacement in the same update the winner depends on the order the
+  // items integrate in, so the slow path looks at the result
+  for (const [parent, mapId] of typeErased) {
+    if (mapId && dsHas(mapId)) continue;
+    const freshMap = mapId ? findFresh(mapId) : null;
+    if (freshMap instanceof Y.Item && freshMap.content instanceof Y.ContentDeleted) continue;
+    if (typeParents.has(parent)) {
+      unresolved = true;
+      continue;
+    }
+    return { bad: 'shapes-schema', writers };
+  }
   // a new shape is a Y.Map with a valid `type` from its first update
   for (const m of newShapeMaps) {
     if (!dsHas(m.id) && !typeParents.has(idKey(m.id))) return { bad: 'shapes-schema', writers };
   }
   return { bad: unresolved ? UNRESOLVED : null, writers };
+}
+
+/**
+ * Would every struct of the update integrate? Per client in clock order (known structs
+ * first: Yjs resolves their dependencies too before it skips them), each once its
+ * cross-client dependencies exist in the room or were integrated earlier in this pass.
+ */
+function integrates(
+  doc: Y.Doc,
+  structs: (Y.Item | Y.GC | Y.Skip)[],
+  depsOf: (s: Y.Item) => (Y.ID | null)[],
+): boolean {
+  const seq = new Map<number, (Y.Item | Y.GC)[]>();
+  for (const s of structs) {
+    if (s instanceof Y.Skip) continue;
+    let a = seq.get(s.id.client);
+    if (!a) seq.set(s.id.client, (a = []));
+    a.push(s);
+  }
+  const reached = new Map<number, number>(); // client -> end clock integrated so far
+  const idx = new Map<number, number>();
+  for (const [client, a] of seq) {
+    idx.set(client, 0);
+    reached.set(client, Math.min(a[0].id.clock, Y.getState(doc.store, client)));
+  }
+  const ready = (s: Y.Item | Y.GC) => {
+    if (!(s instanceof Y.Item)) return true;
+    for (const dep of depsOf(s)) {
+      if (!dep || dep.client === s.id.client) continue;
+      if (dep.clock < Y.getState(doc.store, dep.client)) continue;
+      if (dep.clock < (reached.get(dep.client) ?? 0)) continue;
+      return false;
+    }
+    return true;
+  };
+  let progress = true;
+  while (progress) {
+    progress = false;
+    for (const [client, a] of seq) {
+      let i = idx.get(client)!;
+      while (i < a.length && ready(a[i])) {
+        reached.set(client, Math.max(reached.get(client)!, a[i].id.clock + a[i].length));
+        i++;
+        progress = true;
+      }
+      idx.set(client, i);
+    }
+  }
+  for (const [client, a] of seq) if (idx.get(client)! < a.length) return false;
+  return true;
 }
 
 function fieldKindOf(v: unknown): ShapeFieldKind {
@@ -571,11 +757,11 @@ function schemaProblem(loc: Loc, content: ItemContent): string | null {
   if (root === ROOT.shapes) {
     const bad = 'shapes-schema';
     if (keys.length === 1) {
-      return keys[0] !== null && content instanceof Y.ContentType && content.type instanceof Y.Map ? null : bad;
+      return keyOk(keys[0]) && content instanceof Y.ContentType && content.type instanceof Y.Map ? null : bad;
     }
     if (keys.length === 2) {
       const field = keys[1];
-      if (field === null) return bad;
+      if (field === null || !keyOk(keys[0])) return bad;
       if (content instanceof Y.ContentType) {
         const kind = fieldKindOf(content.type);
         // a new nested type is empty: its elements arrive as items of their own (checked below)
@@ -593,10 +779,10 @@ function schemaProblem(loc: Loc, content: ItemContent): string | null {
     return bad;
   }
   if (root === ROOT.assets) {
-    return keys.length === 1 && keys[0] !== null && vals && vals.every(assetValueOk) ? null : 'assets-schema';
+    return keys.length === 1 && keyOk(keys[0]) && vals && vals.length > 0 && vals.every(assetValueOk) ? null : 'assets-schema';
   }
   if (root === ROOT.meta) {
-    return keys.length === 1 && keys[0] !== null && vals && vals.every(metaValueOk) ? null : 'meta-schema';
+    return keys.length === 1 && keyOk(keys[0]) && vals && vals.length > 0 && vals.every(metaValueOk) ? null : 'meta-schema';
   }
   return null;
 }
@@ -605,6 +791,7 @@ function schemaProblem(loc: Loc, content: ItemContent): string | null {
 export function shapeValueProblem(shapes: Y.Map<unknown>, id: string, requireTerminals = false): string | null {
   const v = shapes.get(id);
   if (v === undefined) return null;
+  if (!keyOk(id)) return 'shapes-schema';
   if (!(v instanceof Y.Map)) return 'shapes-schema';
   const fields = new Map<string, [unknown, ShapeFieldKind]>();
   for (const [k, fv] of (v as Y.Map<unknown>).entries()) {
@@ -625,9 +812,6 @@ function scratchCheck(doc: Y.Doc, update: Uint8Array): string | null {
   const shapes = scratch.getMap<unknown>(ROOT.shapes);
   const assets = scratch.getMap<unknown>(ROOT.assets);
   const meta = scratch.getMap<unknown>(ROOT.meta);
-  scratch.getMap(ROOT.attribution);
-  scratch.getMap(ROOT.users);
-  scratch.getArray(ROOT.history);
   Y.applyUpdate(scratch, encodeIntegratedState(doc));
   let bad: string | null = null;
   const touchedShapes = new Set<string>();
@@ -647,7 +831,7 @@ function scratchCheck(doc: Y.Doc, update: Uint8Array): string | null {
       } else if (t === (assets as unknown) || t === (meta as unknown)) {
         const m = t as unknown as Y.Map<unknown>;
         for (const k of keys) {
-          if (k === null) {
+          if (k === null || !keyOk(k)) {
             bad = bad ?? `${root}-schema`;
             continue;
           }
@@ -667,11 +851,15 @@ function scratchCheck(doc: Y.Doc, update: Uint8Array): string | null {
     }
   };
   scratch.on('afterTransaction', onTr);
+  let threw = false;
   try {
     Y.applyUpdate(scratch, update);
+  } catch {
+    threw = true;
   } finally {
     scratch.off('afterTransaction', onTr);
   }
+  if (!bad && threw) bad = 'malformed';
   if (!bad) {
     for (const id of touchedShapes) {
       const p = shapeValueProblem(shapes, id);

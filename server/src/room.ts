@@ -6,12 +6,12 @@ import type { WebSocket } from 'ws';
 import type { Config } from './config.js';
 import type { Logger } from './logging.js';
 import type { Metrics } from './metrics.js';
-import { canvasObjectKey } from './paths.js';
+import { canvasLedgerKey, canvasObjectKey } from './paths.js';
 import type { CanvasObjectStore } from './store.js';
 import type { Identity } from './types.js';
 import { attachStamper, dropPending, encodeIntegratedState, hasPending } from '@pocharlies/artifacts-canvas-shared/stamper';
-import { ROOT } from '@pocharlies/artifacts-canvas-shared/model';
-import { MSG_SYNC } from '@pocharlies/artifacts-canvas-shared/protocol';
+import { bindWriters, materializeContent, materializeLedger, migrateLegacyRoots, writerOf } from '@pocharlies/artifacts-canvas-shared/ledger';
+import { MSG_SYNC, encodeLedger } from '@pocharlies/artifacts-canvas-shared/protocol';
 import type { TokenBucket } from './limits.js';
 
 /** A live WebSocket connection in a room. Used as the Yjs transaction origin. */
@@ -43,24 +43,23 @@ export interface RoomDeps {
 }
 
 /**
- * One room per artifact key (design §6.2). The document lives in memory while anyone is
- * connected and is persisted to object storage with a debounce plus on last-leave
- * (protocol §7). Attribution is stamped server-side (protocol §5) via the shared stamper.
+ * One room per artifact key (design §6.2), made of TWO documents (protocol §5-§6):
+ *   doc     the CONTENT document (shapes, assets, meta): the only one clients write, through
+ *           the guard, each update applied with its connection as transaction origin;
+ *   ledger  the LEDGER document (attribution, users, history, writers): written only by the
+ *           shared stamper, which observes `doc`; clients receive it on MSG_LEDGER and the
+ *           server never applies a client byte to it.
+ * Both live in memory while anyone is connected and are persisted to object storage (two
+ * objects) with a debounce plus on last-leave (protocol §8).
  */
 export class Room {
-  readonly doc = new Y.Doc();
+  readonly doc = materializeContent(new Y.Doc());
+  readonly ledger = materializeLedger(new Y.Doc());
   readonly awareness = new awarenessProtocol.Awareness(this.doc);
   readonly conns = new Map<WebSocket, Conn>();
   /** rough doc size estimate; refreshed exactly when it crosses the limit or on save */
   approxBytes = 0;
   ttlTag: string | null = null;
-  /**
-   * Yjs client id -> the principal (identity id) that writes with it. A client id is bound
-   * to the first principal that adds clocks to it and nobody else may extend it while the
-   * room is loaded (a forged struct at someone else's next clock would make Yjs drop that
-   * person's real edit as "already known").
-   */
-  private readonly writers = new Map<number, string>();
   private saveTimer?: ReturnType<typeof setTimeout>;
   private dirty = false;
   private saving: Promise<void> = Promise.resolve();
@@ -71,19 +70,9 @@ export class Room {
   ) {
     this.awareness.setLocalState(null);
 
-    // Materialise the root types before any update is applied. yjs 13.6 registers a root
-    // referenced by an incoming update as a placeholder AbstractType, and `doc.getMap(name)`
-    // then returns a *different* object than the one in `transaction.changed` — the stamper's
-    // identity checks would silently no-op on the transaction that creates the root.
-    this.doc.getMap(ROOT.shapes);
-    this.doc.getMap(ROOT.assets);
-    this.doc.getMap(ROOT.meta);
-    this.doc.getMap(ROOT.attribution);
-    this.doc.getMap(ROOT.users);
-    this.doc.getArray(ROOT.history);
-
-    // Protocol §5.2: stamp attribution/users/history for every client transaction.
-    attachStamper(this.doc, {
+    // Protocol §5.2: stamp attribution/users/history into the LEDGER for every client
+    // transaction on the CONTENT document.
+    attachStamper(this.doc, this.ledger, {
       userOf: (origin: unknown) => {
         const c = origin as Conn | undefined;
         if (!c || !c.identity) return null;
@@ -103,9 +92,14 @@ export class Room {
       encoding.writeVarUint(e, MSG_SYNC);
       writeUpdate(e, update);
       const msg = encoding.toUint8Array(e);
-      // Everyone but the sender. The stamper's follow-up transaction has a string origin,
-      // so it goes to everyone including the sender (docs/protocol.md §5.2).
+      // Everyone but the sender (it has the update already).
       for (const c of this.conns.values()) if (c !== origin) sendWs(c.ws, msg);
+      if (origin !== 'load') this.markDirty();
+    });
+    // The ledger goes to everyone, the sender included (it learns its own attribution here).
+    this.ledger.on('update', (update: Uint8Array, origin: unknown) => {
+      const msg = encodeLedger(update);
+      for (const c of this.conns.values()) sendWs(c.ws, msg);
       if (origin !== 'load') this.markDirty();
     });
 
@@ -131,6 +125,10 @@ export class Room {
     return canvasObjectKey(this.deps.cfg.canvasPrefix, this.name);
   }
 
+  get ledgerKey(): string {
+    return canvasLedgerKey(this.deps.cfg.canvasPrefix, this.name);
+  }
+
   /** Copy the artifact's ttl tag (design §6.3): first valid one wins. The core's gate returns
    *  ttl as an integer number of days (or null). */
   touchTtl(ttl: number | null | undefined): void {
@@ -142,7 +140,16 @@ export class Room {
   async load(): Promise<void> {
     const { store, metrics, log } = this.deps;
     try {
-      const data = await store.get(this.objectKey);
+      const [ledgerBytes, data] = await Promise.all([store.get(this.ledgerKey), store.get(this.objectKey)]);
+      // ledger first, so a migration below sees what the ledger already holds
+      if (ledgerBytes && ledgerBytes.byteLength > 0) {
+        Y.applyUpdate(this.ledger, ledgerBytes, 'load');
+        if (dropPending(this.ledger)) {
+          log.warn({ room: this.name }, 'stored ledger had pending structs: dropped');
+          metrics.pendingDropped.inc({ where: 'load' });
+          this.markDirty();
+        }
+      }
       if (data && data.byteLength > 0) {
         Y.applyUpdate(this.doc, data, 'load');
         this.approxBytes = data.byteLength;
@@ -153,6 +160,13 @@ export class Room {
           metrics.pendingDropped.inc({ where: 'load' });
           this.markDirty();
         }
+        // A document from before the content/ledger split: its attribution/users/history
+        // move to the ledger and leave the content document (both saved back).
+        if (migrateLegacyRoots(this.doc, this.ledger, 'migrate')) {
+          log.info({ room: this.name }, 'legacy canvas split into content + ledger');
+          metrics.migrations.inc();
+          this.markDirty();
+        }
       }
       metrics.loads.inc({ outcome: 'ok' });
     } catch (err) {
@@ -161,7 +175,8 @@ export class Room {
     }
   }
 
-  private markDirty(): void {
+  /** Something changed (or may have, after an apply that threw): save soon. */
+  markDirty(): void {
     this.dirty = true;
     if (!this.saveTimer) {
       this.saveTimer = setTimeout(() => {
@@ -171,24 +186,32 @@ export class Room {
     }
   }
 
-  /** Serialize saves; persist the whole doc as one object with the copied ttl tag. */
+  /**
+   * Serialize saves; persist the two documents as two objects with the copied ttl tag.
+   * The ledger goes first: a content object is never newer than its ledger.
+   */
   save(): Promise<void> {
     this.saving = this.saving.then(async () => {
       if (!this.dirty) return;
       const { store, metrics, log } = this.deps;
       const t0 = performance.now();
+      this.dirty = false;
       try {
         // never persist parked structs/deletes (encodeStateAsUpdate would merge them in)
-        if (dropPending(this.doc)) {
+        const droppedContent = dropPending(this.doc);
+        const droppedLedger = dropPending(this.ledger);
+        if (droppedContent || droppedLedger) {
           log.error({ room: this.name }, 'room had pending structs at save: dropped');
           metrics.pendingDropped.inc({ where: 'save' });
         }
+        const ledgerBytes = encodeIntegratedState(this.ledger);
         const bytes = encodeIntegratedState(this.doc);
         this.approxBytes = bytes.byteLength;
+        await store.put(this.ledgerKey, ledgerBytes, this.ttlTag ?? undefined);
         await store.put(this.objectKey, bytes, this.ttlTag ?? undefined);
-        this.dirty = false;
         metrics.saves.inc({ outcome: 'ok' });
       } catch (err) {
+        this.dirty = true;
         metrics.saves.inc({ outcome: 'error' });
         log.error({ err: String(err), room: this.name }, 'canvas save failed');
       } finally {
@@ -213,30 +236,32 @@ export class Room {
   }
 
   /**
-   * Back to the last good state after an update left pending state: the parked part was
-   * never integrated (no observer, client or save saw it), so dropping it IS the state
-   * before that update for everything a client or the object store has. Persisted now.
+   * May `principal` add clocks to Yjs client id `client` of the content document? A client
+   * id is bound (in the ledger, so the binding survives a reload and a restart) to the first
+   * principal that adds clocks to it, and nobody else may extend it: a forged struct at
+   * someone else's next clock would make Yjs drop that person's real edit as "already
+   * known". An id nobody wrote yet is refused when another principal's live connection
+   * announced it in awareness; an id that already has clocks is never decided by awareness.
    */
-  async recoverFromPending(): Promise<void> {
-    if (!dropPending(this.doc)) return;
-    this.deps.metrics.pendingDropped.inc({ where: 'apply' });
-    this.dirty = true;
-    await this.flush();
-  }
-
-  /** May `principal` add clocks to Yjs client id `client`? (see `writers`) */
   mayWrite(client: number, principal: string, conn: Conn): boolean {
-    if (client === this.doc.clientID) return false;
-    const owner = this.writers.get(client);
+    if (client === this.doc.clientID || client === this.ledger.clientID) return false;
+    const owner = writerOf(this.ledger, client);
     if (owner !== undefined) return owner === principal;
-    // not written yet: refuse an id that another live connection announced as its own
+    // clocks from before the bindings were persisted (legacy object): first writer binds it
+    if (Y.getState(this.doc.store, client) > 0) return true;
     for (const c of this.conns.values()) if (c !== conn && c.identity.id !== principal && c.clientIds.has(client)) return false;
     return true;
   }
 
-  /** Bind the client ids of an accepted update to its principal. */
+  /** May `principal` announce awareness state for `clientId`? Not for someone else's writer id. */
+  mayClaimAwareness(clientId: number, principal: string): boolean {
+    const owner = writerOf(this.ledger, clientId);
+    return owner === undefined || owner === principal;
+  }
+
+  /** Bind the client ids of an accepted update to its principal (persisted in the ledger). */
   claimWriters(clients: number[], principal: string): void {
-    for (const c of clients) if (!this.writers.has(c)) this.writers.set(c, principal);
+    bindWriters(this.ledger, clients, principal);
   }
 
   /** Live connections of one anonymous visitor (server-issued nonce). */

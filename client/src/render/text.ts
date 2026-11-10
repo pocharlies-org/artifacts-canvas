@@ -1,4 +1,5 @@
 import type { Font } from '../model/types';
+import { own } from '../model/colors';
 
 /** The bundled hand font (client/public/fonts, loaded by render/fonts.ts). */
 export const HAND_FAMILY = 'Shantell Sans';
@@ -37,7 +38,7 @@ export function measureWidth(text: string, font: Font, size: number): number {
   const c = measureCtx();
   let w: number;
   if (c) {
-    c.font = `${size}px ${FONT_FAMILY[font]}`;
+    c.font = `${size}px ${own(FONT_FAMILY, font, FONT_FAMILY.draw)}`;
     w = c.measureText(text).width;
   } else {
     w = text.length * size * (font === 'mono' ? 0.6 : 0.55);

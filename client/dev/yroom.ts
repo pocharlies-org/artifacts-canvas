@@ -3,8 +3,10 @@
  * It implements docs/protocol.md exactly, so the client can be developed and tested
  * against it, and the production service (server/) can compare behaviour:
  *   - IDENTITY (100) as the first message,
- *   - attribution stamped server-side (model/stamper.ts) per connection,
- *   - client writes to attribution/users/history rejected (connection closed 4403),
+ *   - two documents per room: the content (clients write, guarded) and the ledger
+ *     (attribution/users/history, stamped server-side per connection by model/stamper.ts,
+ *     sent read-only as LEDGER (102); a client 102 is closed 4403),
+ *   - sync step 1 on join, so edits made while disconnected are delivered,
  *   - awareness `user` field forced to the connection identity.
  * Rooms live in memory for the lifetime of the process.
  */
@@ -14,8 +16,9 @@ import * as decoding from 'lib0/decoding';
 import * as syncProtocol from 'y-protocols/sync';
 import * as awarenessProtocol from 'y-protocols/awareness';
 import type { WebSocket } from 'ws';
-import { attachStamper, dropPending, forbiddenRootWrite } from '../src/model/stamper';
-import { CLOSE, MSG_AWARENESS, MSG_QUERY_AWARENESS, MSG_SYNC, encodeIdentity } from '../src/collab/protocol';
+import { applyGuarded, attachStamper, forbiddenRootWrite } from '../src/model/stamper';
+import { CLOSE, MSG_AWARENESS, MSG_LEDGER, MSG_QUERY_AWARENESS, MSG_SYNC, encodeIdentity, encodeLedger } from '../src/collab/protocol';
+import { materializeContent, materializeLedger } from '@pocharlies/artifacts-canvas-shared/ledger';
 import { sanitizeAwarenessUpdate } from '@pocharlies/artifacts-canvas-shared/awareness';
 import { personColor } from '../src/model/colors';
 import type { Identity } from '../src/model/types';
@@ -27,13 +30,14 @@ interface Conn {
 }
 
 export class Room {
-  readonly doc = new Y.Doc();
+  readonly doc = materializeContent(new Y.Doc());
+  readonly ledger = materializeLedger(new Y.Doc());
   readonly awareness = new awarenessProtocol.Awareness(this.doc);
   readonly conns = new Map<WebSocket, Conn>();
 
   constructor(readonly name: string) {
     this.awareness.setLocalState(null);
-    attachStamper(this.doc, {
+    attachStamper(this.doc, this.ledger, {
       userOf: (origin) => {
         const c = origin as Conn | undefined;
         if (!c || !c.identity) return null;
@@ -45,8 +49,13 @@ export class Room {
       encoding.writeVarUint(e, MSG_SYNC);
       syncProtocol.writeUpdate(e, update);
       const msg = encoding.toUint8Array(e);
-      // everyone but the sender; the stamper's follow-up transaction goes to everyone
+      // everyone but the sender
       for (const c of this.conns.values()) if (c !== origin) send(c.ws, msg);
+    });
+    // the ledger goes to everyone, the sender included
+    this.ledger.on('update', (update: Uint8Array) => {
+      const msg = encodeLedger(update);
+      for (const c of this.conns.values()) send(c.ws, msg);
     });
     this.awareness.on('update', ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }, origin: unknown) => {
       const changed = [...added, ...updated, ...removed];
@@ -67,6 +76,7 @@ export class Room {
     const conn: Conn = { ws, identity, clientIds: new Set() };
     this.conns.set(ws, conn);
     send(ws, encodeIdentity(identity));
+    send(ws, encodeLedger(Y.encodeStateAsUpdate(this.ledger)));
     // sync step 1 from the server
     const e = encoding.createEncoder();
     encoding.writeVarUint(e, MSG_SYNC);
@@ -99,6 +109,10 @@ export class Room {
           send(conn.ws, encoding.toUint8Array(e));
           return;
         }
+        if (syncType !== syncProtocol.messageYjsSyncStep2 && syncType !== syncProtocol.messageYjsUpdate) {
+          conn.ws.close(1003, 'unknown sync type');
+          return;
+        }
         const update = decoding.readVarUint8Array(dec);
         if (conn.identity.readOnly) return;
         const bad = forbiddenRootWrite(this.doc, update);
@@ -106,9 +120,13 @@ export class Room {
           conn.ws.close(CLOSE.forbidden, `write to ${bad} not allowed`);
           return;
         }
-        Y.applyUpdate(this.doc, update, conn);
         // same invariant as the production server: the room never keeps pending state
-        if (dropPending(this.doc)) conn.ws.close(CLOSE.forbidden, 'write not allowed');
+        const out = applyGuarded(this.doc, update, conn);
+        if (out.threw || out.droppedPending) conn.ws.close(CLOSE.forbidden, 'write not allowed');
+        return;
+      }
+      if (type === MSG_LEDGER) {
+        conn.ws.close(CLOSE.forbidden, 'ledger is read-only');
         return;
       }
       if (type === MSG_AWARENESS) {

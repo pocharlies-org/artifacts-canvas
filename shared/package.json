@@ -27,6 +27,10 @@
     "./awareness": {
       "types": "./dist/awareness.d.ts",
       "import": "./dist/awareness.js"
+    },
+    "./ledger": {
+      "types": "./dist/ledger.d.ts",
+      "import": "./dist/ledger.js"
     }
   },
   "files": [

@@ -15,12 +15,14 @@ Miro-style, and the canvas keeps who drew what. It is the first plugin of
   *Presentar* (everyone follows the presenter) and *Seguir a* (follow one person).
 - **Attribution**: every shape records who created and last edited it, and when. Name tags, a hover card, an
   authors panel with counts and a per-person show/hide toggle, and a history timeline. Attribution is stamped by
-  the server from the verified identity, so it cannot be forged: a client that writes the attribution roots is
-  disconnected (4403) and the write is not applied.
+  the server from the verified identity into a separate **ledger** document that clients only receive, never
+  write (the drawings live in the content document, the only one a client update reaches), so it cannot be
+  forged: a client that writes a ledger root or sends anything on the ledger channel is disconnected (4403) and
+  the write is not applied.
 - **Isolation**: the artifact runs in a sandboxed, opaque-origin iframe (`sandbox="allow-scripts"`), unchanged; the
   drawings are anchored to its content and move with it.
-- **Persistence**: one Yjs document per artifact, stored as a single S3/MinIO object under `_plugins/canvas/`,
-  saved debounced and flushed on last leave. Canvas data never outlives the artifact (expiry + orphan sweep).
+- **Persistence**: two Yjs documents per artifact (content + ledger), stored as two S3/MinIO objects under
+  `_plugins/canvas/`, saved debounced and flushed on last leave. Canvas data never outlives the artifact (expiry + orphan sweep).
 - **Export** to PNG and PDF, current view or the whole artifact.
 - Spanish UI by default, English with `?lang=en` (or the server config).
 
@@ -128,10 +130,12 @@ npm run e2e:system      # ARTIFACTS_CORE_DIR defaults to ../artifacts
 It publishes with the core CLI and checks: two Dex users through the real login chain drawing together
 live (strokes before mouse-up, cursors labelled with their display names, server-stamped attribution); a user outside the
 ACL refused on the page, the frame and the WebSocket (4403); anonymous drawing on `pub/` as *Anónimo
-NNNN* and refused on `u/`; persistence in MinIO at `_plugins/canvas/<key>.ydoc` (with the artifact's `ttl`
+NNNN* and refused on `u/`; persistence in MinIO at `_plugins/canvas/<key>.ydoc` + `<key>.ydoc.ledger` (with the artifact's `ttl`
 tag) across a reload and a canvas container restart; revocation by editing `.acl.json` (the open session
 drops with 4403 within the re-check interval, 3 s + the 2 s ACL cache); the opaque-origin artifact iframe;
-the adversarial cases (a forged `history` append, `attribution`/`users` overwrites, a foreign or missing
+the adversarial cases (a forged `history` append, `attribution`/`users` overwrites, zero-length structs,
+a client LEDGER message, a pending-state DoS, bad style enums and `__proto__` fields, offline edits across a
+canvas restart, a client-id claim after a restart, the oauth2-proxy catch-all, a foreign or missing
 `Origin`, the expired-artifact leak to a stranger, `/metrics` on the public route, an anonymous visitor
 filling the document, a client-chosen anonymous id); and finally the core's own `deploy/compose/e2e.sh`,
 which must still pass with the plugin enabled.
@@ -210,7 +214,7 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `S3_REGION` | `us-east-1` | |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | (SDK default chain) | The `plugin-canvas` credentials. |
 | `S3_FORCE_PATH_STYLE` | `true` | Path-style addressing (needed by MinIO). |
-| `CANVAS_PREFIX` | `_plugins/canvas` | Prefix of the stored canvas objects (`<prefix>/<key>.ydoc`). |
+| `CANVAS_PREFIX` | `_plugins/canvas` | Prefix of the stored canvas objects (`<prefix>/<key>.ydoc` content, `<prefix>/<key>.ydoc.ledger` ledger). |
 | `AUTHZ_TIMEOUT_MS` | `3000` | Gate call timeout; anything late or wrong fails closed. |
 | `AUTHZ_RECHECK_SECONDS` | `300` | Re-check interval per connection; on a deny the client is dropped (4403). |
 | `FRAME_FETCH_TIMEOUT_MS` | `10000` | Artifact fetch for the frame route. |

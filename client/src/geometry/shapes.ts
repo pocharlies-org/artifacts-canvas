@@ -1,5 +1,6 @@
 import type { DrawShape, LineShape, Shape, Size, Terminal } from '../model/types';
 import { geoExtras, geoOutline } from './geo';
+import { own } from '../model/colors';
 import {
   type Box, type Pt, boxFromPoints, boxCorners, distToSegment, pointInPolygon, rotate,
   segmentDistance, segmentIntersection, boxesOverlap, boxContains, sub, len, add, mul,
@@ -14,7 +15,7 @@ export const NOTE_SIZE = 200;
 export const FRAME_LABEL = 22;
 
 export function freehandSize(s: DrawShape): number {
-  const base = STROKE_WIDTH[s.size] ?? 3.5;
+  const base = own(STROKE_WIDTH, s.size, 3.5);
   return s.highlight ? base * 4.5 + 6 : base * 1.7 + 1;
 }
 
@@ -153,7 +154,7 @@ export interface Outline {
 }
 
 export function worldOutline(s: Shape, ctx: GeomCtx): Outline {
-  const sw = STROKE_WIDTH[s.size] ?? 3.5;
+  const sw = own(STROKE_WIDTH, s.size, 3.5);
   switch (s.type) {
     case 'draw': {
       const pts = drawLocalPoints(s).map((p) => toWorld(s, p));

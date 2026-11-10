@@ -18,7 +18,7 @@ Two steps remain to make it reachable (both live in the artifacts CORE chart, no
    discovery links already use that shape (ARTIFACTS_PLUGINS="canvas=/_canvas/;...").
    This server accepts both that shape and the bucket-less client shape /_canvas/<key>;
    both resolve to the same artifact key, authz path /artifacts/<key>, canvas object
-   {{ .Values.s3.prefix }}/<key>.ydoc and room name.
+   {{ .Values.s3.prefix }}/<key>.ydoc (+ <key>.ydoc.ledger) and room name.
 
 2. Provide the storage credentials. The operator supplies the secret `{{ .Values.s3.secretRef.name }}`
    (keys {{ .Values.s3.secretRef.accessKeyIdKey }} / {{ .Values.s3.secretRef.secretAccessKeyKey }}) —

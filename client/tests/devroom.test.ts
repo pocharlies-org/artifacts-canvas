@@ -7,7 +7,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { devIdentity, getRoom } from '../dev/yroom';
 import { Connection } from '../src/collab/connection';
 import { CanvasDoc } from '../src/model/doc';
-import { MSG_IDENTITY } from '../src/collab/protocol';
+import { MSG_IDENTITY, encodeLedger } from '../src/collab/protocol';
 
 let server: http.Server;
 let url = '';
@@ -36,8 +36,9 @@ const until = async (fn: () => boolean, ms = 3000) => {
 
 function client(room: string, devUser: string) {
   const ydoc = new Y.Doc();
-  const conn = new Connection(ydoc, { wsUrl: url, room, params: { devUser }, devIdentity: null });
-  return { ydoc, conn, doc: new CanvasDoc(ydoc) };
+  const ledger = new Y.Doc();
+  const conn = new Connection(ydoc, { wsUrl: url, room, params: { devUser }, devIdentity: null }, ledger);
+  return { ydoc, ledger, conn, doc: new CanvasDoc(ydoc, ledger) };
 }
 
 describe('reference dev room (docs/protocol.md)', () => {
@@ -68,13 +69,45 @@ describe('reference dev room (docs/protocol.md)', () => {
     b.conn.destroy();
   });
 
-  it('closes a connection that forges attribution (4403) and leaves the room intact', async () => {
+  it('closes a connection that writes an `attribution` root into the content (4403); the ledger is untouched', async () => {
     const a = client('r2', 'Mallory');
     await until(() => a.conn.status === 'synced');
+    const ledgerBefore = Y.encodeStateVector(getRoom('r2').ledger);
     a.ydoc.getMap('attribution').set('x', { createdBy: 'dev:Someone Else', createdAt: 0, updatedBy: '', updatedAt: 0 });
     await until(() => a.conn.status === 'closed');
     expect(a.conn.closeCode).toBe(4403);
-    expect(getRoom('r2').doc.getMap('attribution').has('x')).toBe(false);
+    expect(getRoom('r2').ledger.getMap('attribution').has('x')).toBe(false);
+    expect(getRoom('r2').doc.share.has('attribution')).toBe(false);
+    expect(Y.encodeStateVector(getRoom('r2').ledger)).toEqual(ledgerBefore);
+    a.conn.destroy();
+  });
+
+  it('closes a connection that sends anything on the ledger channel (4403)', async () => {
+    const a = client('r2b', 'Mallory');
+    await until(() => a.conn.status === 'synced');
+    const forged = new Y.Doc();
+    forged.getMap('attribution').set('x', { createdBy: 'dev:Someone Else', createdAt: 0, updatedBy: '', updatedAt: 0 });
+    a.conn.provider.ws!.send(encodeLedger(Y.encodeStateAsUpdate(forged)) as Uint8Array<ArrayBuffer>);
+    await until(() => a.conn.status === 'closed');
+    expect(a.conn.closeCode).toBe(4403);
+    expect(getRoom('r2b').ledger.getMap('attribution').has('x')).toBe(false);
+    a.conn.destroy();
+  });
+
+  it('delivers edits made while disconnected (server sync step 1 on join)', async () => {
+    const a = client('r2c', 'Ana López');
+    await until(() => a.conn.status === 'synced');
+    a.doc.create({ type: 'geo', geo: 'rectangle', id: 'online' } as never);
+    await until(() => getRoom('r2c').doc.getMap('shapes').has('online'));
+    a.conn.provider.disconnect();
+    await until(() => !a.conn.provider.wsconnected);
+    a.doc.create({ type: 'geo', geo: 'rectangle', id: 'offline' } as never);
+    a.conn.provider.connect();
+    await until(() => getRoom('r2c').doc.getMap('shapes').has('offline'));
+    a.doc.create({ type: 'geo', geo: 'rectangle', id: 'after' } as never);
+    await until(() => getRoom('r2c').doc.getMap('shapes').has('after'));
+    expect(a.conn.status).not.toBe('closed');
+    expect(getRoom('r2c').ledger.getMap('attribution').get('offline')).toMatchObject({ createdBy: 'dev:Ana López' });
     a.conn.destroy();
   });
 

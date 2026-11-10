@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import * as encoding from 'lib0/encoding';
 import {
+  applyGuarded,
   attachStamper,
   checkClientUpdate,
   dropPending,
@@ -9,14 +10,17 @@ import {
   forbiddenRootWrite,
   hasPending,
 } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { materializeContent, materializeLedger } from '@pocharlies/artifacts-canvas-shared/ledger';
 
 /**
- * Regressions of the second independent verification (fv2): a room must NEVER hold pending
- * (parked) Yjs state. A struct parked behind a clock gap, or whose left origin is the
- * stamper's NEXT clock, is released later — after the guard — into history/attribution;
- * a parked delete set on future stamper clocks deletes the next history line. These tests
- * replay the verifier's PoC (pending2.mjs) and every variant against the guard, then apply
- * whatever the guard accepts, exactly like server/src/ws.ts.
+ * Regressions of the second independent verification (fv2), re-run against the two-document
+ * room: a room must NEVER hold pending (parked) Yjs state, and the LEDGER (attribution,
+ * users, history) is a separate Y.Doc no client update reaches. A struct parked behind a
+ * clock gap, or whose left origin is the stamper's NEXT ledger clock, could be released
+ * later into whatever its dependency resolves to; in the content document such an origin
+ * never even exists. These tests replay the verifier's PoC (pending2.mjs) and every variant
+ * against the guard, then apply whatever the guard accepts, exactly like server/src/ws.ts,
+ * and check the ledger only ever holds the stamper's own structs.
  */
 
 type Who = 'alice' | 'mallory';
@@ -25,19 +29,32 @@ const USERS: Record<Who, { id: string; info: { name: string; color: string; anon
   mallory: { id: 'anon:mallory', info: { name: 'Anónimo 6666', color: '#ff0000', anonymous: true } },
 };
 
+/** content document of a room -> its ledger */
+const LEDGERS = new WeakMap<Y.Doc, Y.Doc>();
+const ledgerOf = (room: Y.Doc): Y.Doc => LEDGERS.get(room)!;
+
+/** A room as the server keeps it: the content document (returned) and its ledger. */
 function serverRoom(): Y.Doc {
-  const room = new Y.Doc();
-  for (const r of ['shapes', 'assets', 'meta', 'attribution', 'users']) room.getMap(r);
-  room.getArray('history');
-  attachStamper(room, { userOf: (o) => USERS[o as Who] ?? null });
+  const room = materializeContent(new Y.Doc());
+  const ledger = materializeLedger(new Y.Doc());
+  LEDGERS.set(room, ledger);
+  attachStamper(room, ledger, { userOf: (o) => USERS[o as Who] ?? null });
   return room;
 }
 
-/** guard + apply, like ws.ts; returns the guard's answer */
+/** Every struct of the ledger was written by the ledger's own (stamper) client. */
+function ledgerIsStamperOnly(room: Y.Doc): boolean {
+  const l = ledgerOf(room);
+  return [...l.store.clients.keys()].every((c) => c === l.clientID);
+}
+
+/** guard + apply, like ws.ts; returns the guard's answer (or the apply's failure) */
 function send(room: Y.Doc, who: Who, u: Uint8Array): string | null {
   const bad = forbiddenRootWrite(room, u);
-  if (!bad) Y.applyUpdate(room, u, who);
-  return bad;
+  if (bad) return bad;
+  const out = applyGuarded(room, u, who);
+  expect(ledgerIsStamperOnly(room)).toBe(true);
+  return out.threw ? 'threw' : out.droppedPending ? 'dropped-pending' : null;
 }
 
 function newShape(client: number, id: string): Uint8Array {
@@ -63,16 +80,23 @@ function gapUpdate(client = 4242): Uint8Array {
   return Y.encodeStateAsUpdate(a, sv);
 }
 
-/** an item appended to history right after the stamper's future history line */
+/**
+ * An item appended to history right after the stamper's future history line (the attacker
+ * sees the ledger: it is broadcast to everyone). `attributionLinesFirst` < 0: right after
+ * the CURRENT last history line instead.
+ */
 function afterFutureHistory(room: Y.Doc, attributionLinesFirst: number): Uint8Array {
   const sim = new Y.Doc();
-  Y.applyUpdate(sim, Y.encodeStateAsUpdate(room));
-  sim.clientID = room.clientID;
-  sim.transact(() => {
-    for (let i = 0; i < attributionLinesFirst; i++) sim.getMap('attribution').set(`__sim${i}`, {});
-    sim.getArray('history').push([{}]);
-  });
+  Y.applyUpdate(sim, Y.encodeStateAsUpdate(ledgerOf(room)));
+  sim.clientID = ledgerOf(room).clientID;
+  if (attributionLinesFirst >= 0) {
+    sim.transact(() => {
+      for (let i = 0; i < attributionLinesFirst; i++) sim.getMap('attribution').set(`__sim${i}`, {});
+      sim.getArray('history').push([{}]);
+    });
+  }
   const ev = new Y.Doc();
+  Y.applyUpdate(ev, Y.encodeStateAsUpdate(room));
   Y.applyUpdate(ev, Y.encodeStateAsUpdate(sim));
   ev.clientID = 777;
   const sv = Y.encodeStateVector(ev);
@@ -93,7 +117,7 @@ function deleteRange(client: number, clock: number, len: number): Uint8Array {
   return encoding.toUint8Array(enc);
 }
 
-const historyIds = (room: Y.Doc) => (room.getArray('history').toJSON() as { shapeId: string }[]).map((e) => e.shapeId);
+const historyIds = (room: Y.Doc) => (ledgerOf(room).getArray('history').toJSON() as { shapeId: string }[]).map((e) => e.shapeId);
 
 describe('pending state never enters the room (fv2 finding 1)', () => {
   it('PoC pending2.mjs: gap write + item after the stamper next clock + victim edit + empty update forge nothing', () => {
@@ -107,8 +131,17 @@ describe('pending state never enters the room (fv2 finding 1)', () => {
     expect(send(room, 'mallory', Y.encodeStateAsUpdate(new Y.Doc()))).toBeNull();
     expect(historyIds(room)).toEqual(['s1', 's2']);
     const reloaded = new Y.Doc();
-    Y.applyUpdate(reloaded, Y.encodeStateAsUpdate(room));
-    expect(historyIds(reloaded)).toEqual(['s1', 's2']);
+    Y.applyUpdate(reloaded, Y.encodeStateAsUpdate(ledgerOf(room)));
+    expect((reloaded.getArray('history').toJSON() as { shapeId: string }[]).map((e) => e.shapeId)).toEqual(['s1', 's2']);
+  });
+
+  it('an origin on the CURRENT last history line (a ledger struct) is unknown to the content document: pending, ledger unchanged', () => {
+    const room = serverRoom();
+    send(room, 'alice', newShape(1001, 's1'));
+    const sv = Y.encodeStateVector(ledgerOf(room));
+    expect(send(room, 'mallory', afterFutureHistory(room, -1))).toBe('pending');
+    expect(Y.encodeStateVector(ledgerOf(room))).toEqual(sv);
+    expect(historyIds(room)).toEqual(['s1']);
   });
 
   it('the item after the future history line alone (no gap first) is refused as pending', () => {
@@ -133,7 +166,7 @@ describe('pending state never enters the room (fv2 finding 1)', () => {
     send(room, 'alice', newShape(1002, 'd2'));
     send(room, 'mallory', Y.encodeStateAsUpdate(new Y.Doc()));
     expect(historyIds(room)).toEqual(['d1', 'd2']);
-    expect(Object.keys(room.getMap('attribution').toJSON()).sort()).toEqual(['d1', 'd2']);
+    expect(Object.keys(ledgerOf(room).getMap('attribution').toJSON()).sort()).toEqual(['d1', 'd2']);
   });
 
   it('a hole inside the update (merged updates with a Skip) is refused', () => {
@@ -389,8 +422,8 @@ describe('document schema of the client roots (fv2 finding 2)', () => {
     c.getMap('shapes').set('evil-num', 42 as never);
     c.getMap('shapes').set('no-type', new Y.Map());
     expect(() => Y.applyUpdate(room, Y.encodeStateAsUpdate(c), 'alice')).not.toThrow();
-    expect(room.getMap('attribution').size).toBe(0);
-    expect(room.getArray('history').length).toBe(0);
+    expect(ledgerOf(room).getMap('attribution').size).toBe(0);
+    expect(ledgerOf(room).getArray('history').length).toBe(0);
     send(room, 'alice', newShape(1001, 'good'));
     expect(historyIds(room)).toEqual(['good']);
   });

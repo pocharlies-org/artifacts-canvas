@@ -63,6 +63,11 @@ export class Metrics {
     labelNames: ['where'],
     registers: [this.registry],
   });
+  readonly migrations = new Counter({
+    name: 'canvas_legacy_migrations_total',
+    help: 'Stored single-document canvases split into content + ledger on load',
+    registers: [this.registry],
+  });
   readonly deletes = new Counter({
     name: 'canvas_deletes_total',
     help: 'Canvas objects deleted (expiry / sweep)',

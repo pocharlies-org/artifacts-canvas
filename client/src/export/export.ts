@@ -14,8 +14,15 @@ const BG = '#e9ebef';
 /** Markup of the annotations inside `rect` (world units). */
 export function annotationsBody(ed: Editor, rect: Box): string {
   const env = ed.renderer.env;
-  const shapes = ed.annotationsVisible ? ed.visibleShapes().filter((s) => boxesOverlap(shapeBounds(s, env), rect)) : [];
-  return shapes.map((s) => shapeElement(s, env)).join('');
+  const safe = <T>(f: () => T, fallback: T): T => {
+    try {
+      return f();
+    } catch {
+      return fallback; // one bad shape never breaks the export
+    }
+  };
+  const shapes = ed.annotationsVisible ? ed.visibleShapes().filter((s) => safe(() => boxesOverlap(shapeBounds(s, env), rect), false)) : [];
+  return shapes.map((s) => safe(() => shapeElement(s, env), '')).join('');
 }
 
 /**

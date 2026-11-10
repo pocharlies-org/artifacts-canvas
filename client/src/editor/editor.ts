@@ -1,4 +1,4 @@
-import type * as Y from 'yjs';
+import * as Y from 'yjs';
 import { CanvasDoc, newId } from '../model/doc';
 import { attachStamper } from '../model/stamper';
 import { DEFAULT_STYLE, STYLE_KEYS, type Identity, type Shape, type Style, type GeoKind } from '../model/types';
@@ -17,6 +17,7 @@ import type { CanvasConfig } from '../config';
 import { TOOLS, nudgeSelection as TOOLS_NUDGE, type ToolId, type Tool, type PointerInfo } from '../tools/tools';
 import { Overlay } from '../render/overlay';
 import { t } from '../i18n';
+import { own } from '../model/colors';
 
 export type Topic = 'camera' | 'selection' | 'tool' | 'style' | 'presence' | 'doc' | 'status' | 'identity' | 'visibility' | 'follow' | 'history' | 'notice';
 
@@ -72,9 +73,10 @@ export class Editor {
   private stamperDetach: (() => void) | null = null;
   private initialCameraSet = false;
 
-  constructor(cfg: CanvasConfig, root: HTMLElement, ydoc: Y.Doc, conn: Connection | null) {
+  constructor(cfg: CanvasConfig, root: HTMLElement, ydoc: Y.Doc, conn: Connection | null, ledger?: Y.Doc) {
     this.cfg = cfg;
-    this.doc = new CanvasDoc(ydoc);
+    // content = ydoc (this tab writes it); ledger = attribution/users/history, from the server
+    this.doc = new CanvasDoc(ydoc, ledger ?? conn?.ledger ?? new Y.Doc());
     this.conn = conn;
     this.pageWidth = cfg.pageWidth;
     this.pageHeight = 900;
@@ -181,9 +183,10 @@ export class Editor {
       this.stamperDetach = null;
     }
     if (id.attribution === 'client') {
-      // No stamping server (development relay): stamp my own transactions locally.
+      // No stamping server (development relay): stamp my own transactions into a ledger
+      // local to this tab (it is never sent: the ledger has no outgoing channel).
       const mine = { id: id.id, info: { name: id.name, anonymous: id.anonymous, color: id.color } };
-      this.stamperDetach = attachStamper(this.doc.doc, {
+      this.stamperDetach = attachStamper(this.doc.doc, this.doc.ledger, {
         userOf: (origin) => (origin === this.doc.origin || origin === this.doc.undoManager || origin === 'asset' ? mine : null),
       });
     }
@@ -611,10 +614,10 @@ export class Editor {
     let align = 'left';
     let dy = 0;
     if (s.type === 'text') {
-      fontSize = FONT_SIZE[s.size];
+      fontSize = own(FONT_SIZE, s.size, 24);
       w = Math.max(s.w + 40, 120);
     } else if (s.type === 'note') {
-      fontSize = NOTE_FONT_SIZE[s.size];
+      fontSize = own(NOTE_FONT_SIZE, s.size, 18);
       pad = 14;
     } else if (s.type === 'geo') {
       fontSize = 18;
@@ -653,11 +656,11 @@ export class Editor {
     }
     const patch: Record<string, unknown> = { text };
     if (s.type === 'text') {
-      const lay = layoutText(text || ' ', s.font, FONT_SIZE[s.size], s.fixedWidth ? s.w : null);
+      const lay = layoutText(text || ' ', s.font, own(FONT_SIZE, s.size, 24), s.fixedWidth ? s.w : null);
       if (!s.fixedWidth) patch.w = Math.max(10, Math.ceil(lay.width) + 2);
       patch.h = Math.ceil(lay.height);
     } else if (s.type === 'note') {
-      const lay = layoutText(text || ' ', s.font, NOTE_FONT_SIZE[s.size], s.w - 28);
+      const lay = layoutText(text || ' ', s.font, own(NOTE_FONT_SIZE, s.size, 18), s.w - 28);
       patch.h = Math.max(NOTE_SIZE, Math.ceil(lay.height + 28));
     }
     this.doc.update(id, patch);
@@ -1050,5 +1053,5 @@ function downscale(img: HTMLImageElement, maxSide: number, type: string, q = 0.9
 }
 
 function getComputedFontFamily(f: Style['font']): string {
-  return FONT_FAMILY[f];
+  return own(FONT_FAMILY, f, FONT_FAMILY.draw);
 }

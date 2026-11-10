@@ -1,5 +1,5 @@
 import { getStroke } from 'perfect-freehand';
-import { COLORS, noteFill, rgba, strokeColor, tint } from '../model/colors';
+import { COLORS, colorName, noteFill, own, rgba, strokeColor, tint } from '../model/colors';
 import type { ColorName, DrawShape, LineShape, Shape, Style } from '../model/types';
 import { geoExtras, geoOutline } from '../geometry/geo';
 import {
@@ -86,14 +86,14 @@ export function dashArray(style: Style, sw: number): string {
 }
 
 export function fillFor(style: Style): string {
-  const c = COLORS[style.color] ?? COLORS.black;
+  const c = own(COLORS, style.color, COLORS.black);
   switch (style.fill) {
     case 'semi':
       return style.color === 'white' ? 'rgba(255,255,255,0.6)' : rgba(c, 0.1);
     case 'solid':
       return style.color === 'white' ? '#ffffff' : style.color === 'black' ? '#495057' : tint(c, 0.45);
     case 'pattern':
-      return `url(#hatch-${style.color})`;
+      return `url(#hatch-${colorName(style.color)})`;
     default:
       return 'none';
   }
@@ -125,7 +125,7 @@ function strokeLine(pts: Pt[], closed: boolean, s: Shape, sw: number, fill = 'no
 function textBlock(text: string, s: Shape, x: number, y: number, maxW: number, size: number, anchor: 'start' | 'middle', color: string): { svg: string; h: number } {
   if (!text) return { svg: '', h: 0 };
   const lay = layoutText(text, s.font, size, maxW);
-  const family = escapeXml(FONT_FAMILY[s.font]);
+  const family = escapeXml(own(FONT_FAMILY, s.font, FONT_FAMILY.draw));
   let out = `<text x="${n(x)}" y="${n(y)}" font-family="${family}" font-size="${n(size)}" fill="${color}" text-anchor="${anchor}" dominant-baseline="hanging" xml:space="preserve">`;
   lay.lines.forEach((line, i) => {
     out += `<tspan x="${n(x)}" dy="${i === 0 ? 0 : n(lay.lineHeight)}">${escapeXml(line) || ' '}</tspan>`;
@@ -147,7 +147,7 @@ function arrowHead(tip: Pt, from: Pt, size: number, color: string): string {
 
 function lineMarkup(s: LineShape, ctx: GeomCtx): string {
   const g = lineGeometry(s, ctx);
-  const sw = STROKE_WIDTH[s.size] ?? 3.5;
+  const sw = own(STROKE_WIDTH, s.size, 3.5);
   const color = strokeColor(s.color);
   let out = '';
   // wide transparent stroke: easier hovering, invisible in export
@@ -196,7 +196,7 @@ function drawMarkup(s: DrawShape): string {
 
 /** Inner SVG markup of one shape, in its local coordinates (see shapeTransform). */
 export function shapeMarkup(s: Shape, env: RenderEnv): string {
-  const sw = STROKE_WIDTH[s.size] ?? 3.5;
+  const sw = own(STROKE_WIDTH, s.size, 3.5);
   switch (s.type) {
     case 'draw':
       return drawMarkup(s);
@@ -208,7 +208,7 @@ export function shapeMarkup(s: Shape, env: RenderEnv): string {
       let out = strokeLine(poly, true, s, sw, fillFor(s));
       for (const extra of geoExtras(s.geo, s.w, s.h)) out += strokeLine(extra, false, s, sw);
       if (s.text) {
-        const size = LABEL_FONT_SIZE[s.size] ?? 18;
+        const size = own(LABEL_FONT_SIZE, s.size, 18);
         const lay = layoutText(s.text, s.font, size, Math.max(20, s.w - 16));
         const y = s.h / 2 - lay.height / 2;
         out += textBlock(s.text, s, s.w / 2, y, Math.max(20, s.w - 16), size, 'middle', strokeColor(s.color === 'white' ? 'black' : s.color)).svg;
@@ -216,13 +216,13 @@ export function shapeMarkup(s: Shape, env: RenderEnv): string {
       return out;
     }
     case 'note': {
-      const size = NOTE_FONT_SIZE[s.size] ?? 18;
+      const size = own(NOTE_FONT_SIZE, s.size, 18);
       let out = `<rect x="0" y="0" width="${n(s.w)}" height="${n(s.h)}" rx="2" fill="${noteFill(s.color)}" filter="url(#note-shadow)"/>`;
       out += textBlock(s.text, s, 14, 14, s.w - 28, size, 'start', '#1d1d1f').svg;
       return out;
     }
     case 'text': {
-      const size = FONT_SIZE[s.size] ?? 24;
+      const size = own(FONT_SIZE, s.size, 24);
       return textBlock(s.text, s, 0, 0, s.fixedWidth ? s.w : 100000, size, 'start', strokeColor(s.color)).svg;
     }
     case 'frame': {

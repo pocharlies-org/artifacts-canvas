@@ -188,7 +188,7 @@ test('c. anonymous draws on a pub/ canvas as "Anónimo NNNN"; anonymous is refus
   expect((await pa.request.get(`${BASE}/_canvas/_/frame/artifacts/${priv.key}`, { maxRedirects: 0 })).status()).toBe(403);
 });
 
-test('d. drawings persist in MinIO (_plugins/canvas/<key>.ydoc): reload and canvas restart', async ({ browser }) => {
+test('d. drawings persist in MinIO (_plugins/canvas/<key>.ydoc + .ydoc.ledger): reload and canvas restart', async ({ browser }) => {
   const objectPath = `artifacts/_plugins/canvas/${priv.key}.ydoc`;
   await waitFor(() => mc(`mc stat "local/${objectPath}" >/dev/null`).code === 0, 10_000, 'canvas object in MinIO');
   const stat = mc(`mc stat --json "local/${objectPath}"`);
@@ -198,6 +198,17 @@ test('d. drawings persist in MinIO (_plugins/canvas/<key>.ydoc): reload and canv
   // the object carries the artifact's ttl tag (dies with the artifact)
   const tags = mc(`mc tag list --json "local/${objectPath}"`);
   expect(JSON.parse(tags.out).tagset).toMatchObject({ ttl: '7' });
+  // and so does its ledger (attribution, users, history): `<key>.ydoc.ledger`, same tag;
+  // the content object holds no ledger root
+  const ledgerPath = `${objectPath}.ledger`;
+  await waitFor(() => mc(`mc stat "local/${ledgerPath}" >/dev/null`).code === 0, 10_000, 'ledger object in MinIO');
+  expect(JSON.parse(mc(`mc tag list --json "local/${ledgerPath}"`).out).tagset).toMatchObject({ ttl: '7' });
+  const ledgerDoc = new Y.Doc();
+  Y.applyUpdate(ledgerDoc, new Uint8Array(mcBytes(ledgerPath)!));
+  expect(ledgerDoc.getMap('attribution').size).toBeGreaterThan(0);
+  const contentDoc = new Y.Doc();
+  Y.applyUpdate(contentDoc, new Uint8Array(mcBytes(objectPath)!));
+  expect([...contentDoc.share.keys()].filter((k) => !['shapes', 'assets', 'meta'].includes(k))).toEqual([]);
 
   await p1.reload();
   await editorReady(p1);

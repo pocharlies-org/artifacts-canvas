@@ -253,16 +253,17 @@ export function sendForgedRootWrite(ws: WebSocket, root: 'attribution' | 'users'
   ws.send(encoding.toUint8Array(enc));
 }
 
-/** Same forged write, smuggled inside a SyncStep2 payload (state-vector-prefixed). */
+/**
+ * Same forged write, smuggled inside a SyncStep2 — the answer a client gives to the server's
+ * step 1 on join (y-protocols: messageYjsSyncStep2 + varUint8Array(update), no state vector).
+ */
 export function sendForgedRootWriteAsStep2(ws: WebSocket, root: 'attribution' | 'users' | 'history', entryKey: string, value: unknown): void {
   const forge = new Y.Doc();
   forge.getMap(root).set(entryKey, value);
   const enc = encoding.createEncoder();
   encoding.writeVarUint(enc, 0); // messageSync
   encoding.writeVarUint(enc, 1); // messageYjsSyncStep2
-  encoding.writeVarUint(enc, 0); // empty state vector
-  const update = Y.encodeStateAsUpdate(forge);
-  encoding.writeVarUint8Array(enc, update);
+  encoding.writeVarUint8Array(enc, Y.encodeStateAsUpdate(forge));
   ws.send(encoding.toUint8Array(enc));
 }
 

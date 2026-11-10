@@ -196,11 +196,26 @@ direction ("me vale así"), but a builder may change one with a stated reason.
   8081-style listener, never public) or it imports the same `decide()`. Never a re-implementation.
 - Authorization is checked when the WebSocket connects and again **every few minutes or on ACL change**, so a
   revoked user or an expired artifact drops out of an open room.
+- **Two trust domains per room (builder's decision after three verifications, 2026-11-10).** Clients write raw Yjs
+  updates, so a single Y.Doc that held both the drawings and the server-stamped attribution forced the server's
+  write guard to out-think every Yjs integration path; three independent verifications in a row bypassed it
+  (items without a parent, parked pending structs, zero-length structs) to forge or erase attribution. Each room is
+  therefore **two documents**:
+  - the **content** document (`shapes`, `assets`, `meta`) — the only one a client writes. The server still guards it,
+    but only for schema/size safety and pending-state hygiene;
+  - the **ledger** document (`attribution`, `users`, `history`, `writers`) — written only by the server's stamper,
+    which observes each content transaction (applied with the sending connection as origin) and attributes what it
+    changed to that connection's verified identity. Clients receive the ledger read-only on its own message type;
+    the server never applies a client byte to it and closes any client that sends one (protocol §4, §5).
+  Attribution integrity no longer depends on the guard being complete: whatever a guard bug lets into the content
+  document, it cannot name an author or touch an existing ledger entry.
 
 ### 6.3 Storage next to the artifact (designer's call)
 
 - The canvas state is a binary file next to the artifact in the same bucket, under a prefix the gate never serves,
-  for example `_canvas/<artifact key>.ydoc`, or `<dir>/.canvas/<file>` excluded like `.acl.json`.
+  for example `_canvas/<artifact key>.ydoc`, or `<dir>/.canvas/<file>` excluded like `.acl.json`. Built:
+  `_plugins/canvas/<artifact key>.ydoc` (content) plus `_plugins/canvas/<artifact key>.ydoc.ledger` (ledger, §6.2),
+  same `ttl` tag, both deleted together; a stored single-document canvas from before the split is migrated on load.
 - Written by the canvas service with its own least-privilege MinIO user: Get/Put on that prefix only.
 - **Expiry follows the artifact.** The canvas object copies the artifact's `ttl` tag. When the ACL has `expires`, or
   the artifact is gone (HEAD fails), the service refuses the room and deletes the canvas. A periodic sweep removes

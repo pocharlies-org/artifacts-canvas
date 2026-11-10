@@ -22,7 +22,9 @@ interface UpdateEntry {
  * apply, so neither can be spoofed by another connection):
  *   1. drop states for awareness clientIds this connection has not claimed and that
  *      already belong to another connection (a client may only move its own state),
- *   2. overwrite the `user` field of every kept state with the connection's verified
+ *   2. drop states for clientIds `mayClaim` refuses (the server: a Yjs client id the ledger
+ *      binds to another principal — awareness alone never takes over an id with clocks),
+ *   3. overwrite the `user` field of every kept state with the connection's verified
  *      identity — live cursors and labels cannot lie.
  *
  * Wire format (y-protocols/awareness): varUint count, then per client
@@ -34,6 +36,7 @@ export function sanitizeAwarenessUpdate(
   claimedClientIds: ReadonlySet<number>,
   roomAwareness: awarenessProtocol.Awareness,
   identity: Identity,
+  mayClaim?: (clientId: number) => boolean,
 ): Uint8Array | null {
   const dec = decoding.createDecoder(update);
   let count: number;
@@ -61,7 +64,7 @@ export function sanitizeAwarenessUpdate(
 
   const roomStates = roomAwareness.getStates();
   const kept = entries.filter(
-    (e) => claimedClientIds.has(e.clientId) || !roomStates.has(e.clientId),
+    (e) => (claimedClientIds.has(e.clientId) || !roomStates.has(e.clientId)) && (!mayClaim || mayClaim(e.clientId)),
   );
   if (kept.length === 0) return null;
 

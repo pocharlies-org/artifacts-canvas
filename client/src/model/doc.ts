@@ -1,5 +1,7 @@
 import * as Y from 'yjs';
-import { ROOT, shapeRecordProblem, type ShapeFieldKind } from '@pocharlies/artifacts-canvas-shared/model';
+import {
+  ROOT, SHAPE_FIELDS, STYLE_ENUMS, keyOk, shapeFieldProblem, shapeRecordProblem, type ShapeFieldKind,
+} from '@pocharlies/artifacts-canvas-shared/model';
 import {
   DEFAULT_STYLE, STYLE_KEYS,
   type Attribution, type HistoryEntry, type Shape, type ShapeType, type Style, type UserInfo,
@@ -28,12 +30,20 @@ export type ShapeInit = Partial<Shape> & { type: ShapeType };
  * The server refuses such writes; this keeps a document that already holds one (or a
  * development relay) usable: the bad entry is skipped and every good shape still renders.
  * `key` is the entry's key in `shapes`, which is the shape id whatever the map says.
+ *
+ * The object is built from an allow-list of known fields on a null-prototype object:
+ * unknown fields (`__proto__` included) are never read, so nothing stored in the document
+ * can give the shape a prototype or shadow a field. A style value outside its allow-list
+ * (stored before the server checked enums) falls back to the default instead of reaching
+ * the renderer; terminals are rebuilt as clean {x, y, bind?} objects.
  */
 export function readShape(m: unknown, key?: string): Shape | null {
   if (!(m instanceof Y.Map)) return null;
-  const o: Record<string, unknown> = {};
+  if (key !== undefined && !keyOk(key)) return null;
+  const o: Record<string, unknown> = Object.create(null);
   const fields = new Map<string, [unknown, ShapeFieldKind]>();
   for (const [k, v] of (m as Y.Map<unknown>).entries()) {
+    if (!SHAPE_FIELDS.has(k)) continue;
     if (v instanceof Y.Text) {
       o[k] = v.toString();
       fields.set(k, [o[k], 'text']);
@@ -43,7 +53,9 @@ export function readShape(m: unknown, key?: string): Shape | null {
     } else if (v instanceof Y.AbstractType) {
       fields.set(k, [v, v instanceof Y.Map ? 'map' : 'other']);
     } else {
-      o[k] = v;
+      // an invalid style enum (or opacity) is dropped: the default applies below
+      if ((Object.hasOwn(STYLE_ENUMS, k) || k === 'opacity') && shapeFieldProblem(k, v)) continue;
+      o[k] = k === 'start' || k === 'end' ? cleanTerminal(v) : v;
       fields.set(k, [v, 'value']);
     }
   }
@@ -71,6 +83,16 @@ export function readShape(m: unknown, key?: string): Shape | null {
   return o as unknown as Shape;
 }
 
+/** A validated terminal value rebuilt from its own fields only (no inherited properties). */
+function cleanTerminal(v: unknown): unknown {
+  if (!v || typeof v !== 'object') return v;
+  const t = v as Record<string, unknown>;
+  const out: Record<string, unknown> = { x: t.x, y: t.y };
+  const b = Object.hasOwn(t, 'bind') ? (t.bind as Record<string, unknown> | null | undefined) : undefined;
+  if (b && typeof b === 'object') out.bind = { shapeId: b.shapeId, nx: b.nx, ny: b.ny };
+  return out;
+}
+
 /** The shape Y.Map at `id`, or undefined when absent or not a Y.Map. */
 function shapeMapOf(shapes: Y.Map<Y.Map<unknown>>, id: string): Y.Map<unknown> | undefined {
   const m = shapes.get(id) as unknown;
@@ -89,12 +111,17 @@ export interface ChangeSet {
 }
 
 /**
- * Typed wrapper around the Yjs document with per-user undo.
+ * Typed wrapper around the room's two Yjs documents with per-user undo:
+ *   doc     the CONTENT document (shapes, assets, meta) — this tab writes it;
+ *   ledger  the LEDGER document (attribution, users, history) — read-only here: the server
+ *           stamps it and sends it on its own message type (a dev tab against a plain relay
+ *           stamps a local one, see Editor.setIdentity).
  * Only `shapes` is in the undo scope: undo never touches other people's work,
  * attribution or history.
  */
 export class CanvasDoc {
   readonly doc: Y.Doc;
+  readonly ledger: Y.Doc;
   readonly shapes: Y.Map<Y.Map<unknown>>;
   readonly assets: Y.Map<string>;
   readonly meta: Y.Map<unknown>;
@@ -107,14 +134,16 @@ export class CanvasDoc {
   private cache = new Map<string, Shape>();
   private listeners = new Set<(c: ChangeSet) => void>();
 
-  constructor(doc: Y.Doc = new Y.Doc()) {
+  constructor(doc: Y.Doc = new Y.Doc(), ledger: Y.Doc = new Y.Doc()) {
+    if (doc === ledger) throw new Error('CanvasDoc: the ledger must be a separate Y.Doc');
     this.doc = doc;
+    this.ledger = ledger;
     this.shapes = doc.getMap(ROOT.shapes);
     this.assets = doc.getMap(ROOT.assets);
     this.meta = doc.getMap(ROOT.meta);
-    this.attribution = doc.getMap(ROOT.attribution);
-    this.users = doc.getMap(ROOT.users);
-    this.history = doc.getArray(ROOT.history);
+    this.attribution = ledger.getMap(ROOT.attribution);
+    this.users = ledger.getMap(ROOT.users);
+    this.history = ledger.getArray(ROOT.history);
     this.undoManager = new Y.UndoManager([this.shapes], {
       trackedOrigins: new Set([this.origin]),
       // Gestures are delimited explicitly with stopCapturing(); never merge by time alone

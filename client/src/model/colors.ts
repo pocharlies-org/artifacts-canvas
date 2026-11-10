@@ -36,15 +36,29 @@ export function tint(hex: string, t: number): string {
   return '#' + [m(r), m(g), m(b)].map((c) => c.toString(16).padStart(2, '0')).join('');
 }
 
+/**
+ * `rec[key]` when `key` is an OWN key of `rec`, else `fallback`. Every lookup of a style
+ * value from the document goes through this: a value outside the allow-list (or a name like
+ * `__proto__`, which would return Object.prototype) never reaches the renderer.
+ */
+export function own<K extends string, V>(rec: Readonly<Record<K, V>>, key: unknown, fallback: NoInfer<V>): V {
+  return typeof key === 'string' && Object.hasOwn(rec, key) ? rec[key as K] : fallback;
+}
+
+/** The colour name itself when it is one of the swatches, else 'black'. */
+export function colorName(c: unknown): ColorName {
+  return typeof c === 'string' && Object.hasOwn(COLORS, c) ? (c as ColorName) : 'black';
+}
+
 export function strokeColor(c: ColorName): string {
-  return COLORS[c] ?? COLORS.black;
+  return own(COLORS, c, COLORS.black);
 }
 
 /** Background of a sticky note of colour `c`. */
 export function noteFill(c: ColorName): string {
   if (c === 'white') return '#ffffff';
   if (c === 'black') return '#e9ecef';
-  return tint(COLORS[c], 0.78);
+  return tint(own(COLORS, c, COLORS.black), 0.78);
 }
 
 /** Person colours: stable per user id. Anonymous people get muted greys/teals. */

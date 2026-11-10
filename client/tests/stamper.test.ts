@@ -6,8 +6,8 @@ import { attachStamper, forbiddenRootWrite, STAMP_ORIGIN } from '../src/model/st
 function setup(now: { t: number }) {
   const doc = new CanvasDoc();
   const conns = { ana: { name: 'Ana López' }, bea: { name: 'Bea Gil' } } as const;
-  attachStamper(doc.doc, {
-    userOf: (origin) => {
+  attachStamper(doc.doc, doc.ledger, {
+    userOf: (origin: unknown) => {
       const k = origin as keyof typeof conns;
       return conns[k] ? { id: k, info: { name: conns[k].name, anonymous: false } } : null;
     },
@@ -55,7 +55,7 @@ describe('attribution stamper', () => {
   it('coalesces repeated lines and caps the history', () => {
     const now = { t: 0 };
     const doc = new CanvasDoc();
-    attachStamper(doc.doc, { userOf: (o) => (o === 'ana' ? { id: 'ana', info: { name: 'Ana', anonymous: false } } : null), now: () => now.t, historyLimit: 5 });
+    attachStamper(doc.doc, doc.ledger, { userOf: (o: unknown) => (o === 'ana' ? { id: 'ana', info: { name: 'Ana', anonymous: false } } : null), now: () => now.t, historyLimit: 5 });
     const ids: string[] = [];
     for (let i = 0; i < 8; i++) ids.push(doc.transact(() => doc.create({ type: 'geo', geo: 'rectangle' } as never), 'ana'));
     expect(doc.historyEntries()).toHaveLength(5);
@@ -72,6 +72,14 @@ describe('attribution stamper', () => {
     expect(d.history.length).toBe(0);
   });
 
+  it('writes the ledger document only: the content document never holds attribution', () => {
+    const d = setup({ t: 0 });
+    const id = d.transact(() => d.create({ type: 'geo', geo: 'rectangle' } as never), 'ana');
+    expect(d.ledger.getMap('attribution').has(id)).toBe(true);
+    expect([...d.doc.share.keys()].sort()).toEqual(['assets', 'meta', 'shapes']);
+    expect(() => attachStamper(d.doc, d.doc, { userOf: () => null })).toThrow(/separate/);
+  });
+
   it('forbiddenRootWrite rejects client writes to attribution, users and history', () => {
     const room = new Y.Doc();
     const client = new Y.Doc();
@@ -83,18 +91,26 @@ describe('attribution stamper', () => {
     });
     expect(forbiddenRootWrite(room, ok)).toBeNull();
     Y.applyUpdate(room, ok);
-    // forging attribution / users / history is not
-    expect(forbiddenRootWrite(room, captureUpdate(client, () => client.getMap('attribution').set('s1', { createdBy: 'someone-else' })))).toBe('attribution');
-    expect(forbiddenRootWrite(room, captureUpdate(client, () => client.getMap('users').set('x', { name: 'CEO', anonymous: false })))).toBe('users');
-    expect(forbiddenRootWrite(room, captureUpdate(client, () => client.getArray('history').push([{ by: 'x' }])))).toBe('history');
+    // forging attribution / users / history is not (each from a fresh copy of the room)
+    const fresh = () => {
+      const d = new Y.Doc();
+      Y.applyUpdate(d, Y.encodeStateAsUpdate(room));
+      return d;
+    };
+    const c1 = fresh();
+    expect(forbiddenRootWrite(room, captureUpdate(c1, () => c1.getMap('attribution').set('s1', { createdBy: 'someone-else' })))).toBe('attribution');
+    const c2 = fresh();
+    expect(forbiddenRootWrite(room, captureUpdate(c2, () => c2.getMap('users').set('x', { name: 'CEO', anonymous: false })))).toBe('users');
+    const c3 = fresh();
+    expect(forbiddenRootWrite(room, captureUpdate(c3, () => c3.getArray('history').push([{ by: 'x' }])))).toBe('history');
     // deleting server-written history is rejected too
     const server = new Y.Doc();
     Y.applyUpdate(server, Y.encodeStateAsUpdate(room));
     server.getArray('history').push([{ by: 'ana' }]);
     Y.applyUpdate(room, Y.encodeStateAsUpdate(server));
-    const c2 = new Y.Doc();
-    Y.applyUpdate(c2, Y.encodeStateAsUpdate(room));
-    const del = captureUpdate(c2, () => c2.getArray('history').delete(0, 1));
+    const c4 = new Y.Doc();
+    Y.applyUpdate(c4, Y.encodeStateAsUpdate(room));
+    const del = captureUpdate(c4, () => c4.getArray('history').delete(0, 1));
     expect(forbiddenRootWrite(room, del)).toBe('history');
   });
 });

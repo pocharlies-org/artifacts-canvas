@@ -128,7 +128,7 @@ artifacts-canvas dev stack (real server, fake core, in-memory S3)
   Private key (needs one of the logins above):
     ${serverUrl}/_canvas/sample-report.html
 
-  Canvas objects land in the S3 mock as _plugins/canvas/<key>.ydoc (in memory only).
+  Canvas objects land in the S3 mock as _plugins/canvas/<key>.ydoc and <key>.ydoc.ledger (in memory only).
   Ctrl-C stops everything.`);
 }
 

@@ -5,8 +5,13 @@ import type { Identity } from './model.js';
 /**
  * Wire protocol additions on top of the y-websocket protocol (see docs/protocol.md).
  *   0 sync, 1 awareness, 2 auth, 3 query-awareness   (standard y-websocket / y-protocols)
+ *     — sync (0) carries ONLY the content document (shapes, assets, meta)
  *   100 IDENTITY   server -> client, JSON Identity. MUST be the first message on the socket.
  *   101 NOTICE     server -> client, JSON {kind, message?}
+ *   102 LEDGER     server -> client, varUint8Array: a Yjs update of the room's LEDGER document
+ *                  (attribution, users, history, writers). Read-only for clients: the server
+ *                  never applies a client byte to the ledger and closes 4403 on any 102 a
+ *                  client sends.
  */
 export const MSG_SYNC = 0;
 export const MSG_AWARENESS = 1;
@@ -14,6 +19,7 @@ export const MSG_AUTH = 2;
 export const MSG_QUERY_AWARENESS = 3;
 export const MSG_IDENTITY = 100;
 export const MSG_NOTICE = 101;
+export const MSG_LEDGER = 102;
 
 export type NoticeKind = 'revoked' | 'expired' | 'readonly' | 'rate-limited' | 'too-large' | 'shutdown';
 
@@ -37,6 +43,14 @@ export function encodeIdentity(id: Identity): Uint8Array {
   const e = encoding.createEncoder();
   encoding.writeVarUint(e, MSG_IDENTITY);
   encoding.writeVarString(e, JSON.stringify(id));
+  return encoding.toUint8Array(e);
+}
+
+/** A LEDGER message carrying `update` (a Yjs update of the ledger document). */
+export function encodeLedger(update: Uint8Array): Uint8Array {
+  const e = encoding.createEncoder();
+  encoding.writeVarUint(e, MSG_LEDGER);
+  encoding.writeVarUint8Array(e, update);
   return encoding.toUint8Array(e);
 }
 

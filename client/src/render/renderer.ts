@@ -21,6 +21,8 @@ export class Renderer {
   private tags = new Map<string, SVGGElement>();
   private arrows = new Set<string>();
   private dirty = new Set<string>();
+  /** shapes whose render threw (logged once each) */
+  private readonly warned = new Set<string>();
   private dirtyAll = false;
   private reorder = false;
   private frame = 0;
@@ -96,9 +98,28 @@ export class Renderer {
       if ((a.start.bind && ids.has(a.start.bind.shapeId)) || (a.end.bind && ids.has(a.end.bind.shapeId))) ids.add(aid);
     }
     const showTags = this.tagsVisible && this.doc.shapes.size <= this.tagLimit;
-    for (const id of ids) this.renderOne(id, showTags);
+    // one bad shape never aborts the pass: it is left out, every other shape still renders
+    for (const id of ids) {
+      try {
+        this.renderOne(id, showTags);
+      } catch (err) {
+        this.dropShape(id);
+        if (!this.warned.has(id)) {
+          this.warned.add(id);
+          console.warn('[canvas] shape not rendered:', id, err);
+        }
+      }
+    }
     if (this.reorder) this.applyOrder();
     this.onRendered?.();
+  }
+
+  private dropShape(id: string) {
+    this.els.get(id)?.remove();
+    this.els.delete(id);
+    this.tags.get(id)?.remove();
+    this.tags.delete(id);
+    this.arrows.delete(id);
   }
 
   private renderOne(id: string, showTags: boolean) {
@@ -107,11 +128,7 @@ export class Renderer {
     const hidden = !s || (a && this.hiddenAuthors.has(a.createdBy));
     let el = this.els.get(id);
     if (!s || hidden) {
-      el?.remove();
-      this.els.delete(id);
-      this.tags.get(id)?.remove();
-      this.tags.delete(id);
-      this.arrows.delete(id);
+      this.dropShape(id);
       return;
     }
     if (s.type === 'arrow' || s.type === 'line') this.arrows.add(id);

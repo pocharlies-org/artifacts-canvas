@@ -59,7 +59,8 @@ while the client protocol speaks `/_canvas/<key>`. Both are accepted on every ro
 core link      /_canvas/<bucket>/<key>   (or client shape /_canvas/<key>)
 server route   strips /_canvas prefix + bucket segment → key
 authz path     POST /_gate/plugin/authz  {"artifact": "/artifacts/<key>"}
-S3 object      <CANVAS_PREFIX>/<key>.ydoc      (default _plugins/canvas/<key>.ydoc)
+S3 objects     <CANVAS_PREFIX>/<key>.ydoc         content   (default _plugins/canvas/<key>.ydoc)
+               <CANVAS_PREFIX>/<key>.ydoc.ledger  ledger    (§8)
 room name      <key>
 ```
 
@@ -130,6 +131,11 @@ browser attaches the session cookie to cross-site upgrades). The client is the
 stock `y-websocket` client (`WebsocketProvider`, BroadcastChannel disabled), so the room
 speaks the standard y-websocket protocol: every message is `varUint type` + payload.
 
+A room is **two Yjs documents** (§5, §6): the **content** document (`shapes`, `assets`, `meta`),
+synced both ways over the standard SYNC messages, and the **ledger** document (`attribution`,
+`users`, `history`, `writers`), which only the server writes and which travels server → client on
+its own message type, LEDGER (102).
+
 | Type | Name | Direction | Payload |
 |---|---|---|---|
 | 0 | SYNC | both | y-protocols/sync (step 1, step 2, update) |
@@ -138,6 +144,7 @@ speaks the standard y-websocket protocol: every message is `varUint type` + payl
 | 3 | QUERY_AWARENESS | client → server | — |
 | **100** | **IDENTITY** | server → client | `varString` JSON `Identity` (below). MUST be the **first** message on every connection. |
 | **101** | **NOTICE** | server → client | `varString` JSON `{kind, message?}`, `kind` ∈ `revoked`, `expired`, `readonly`, `rate-limited`, `too-large`, `shutdown` |
+| **102** | **LEDGER** | server → client **only** | `varUint8Array` Yjs update (v1) of the room's ledger document. A client that sends a 102 is closed `4403` (`ledger is read-only`); its bytes are never applied. |
 
 ```ts
 interface Identity {
@@ -179,31 +186,44 @@ interface Identity {
 
 ### 4.1 Sync handling (who sends what)
 
-- **On join** the server sends IDENTITY, then **SYNC step 2** with the full room state (the
-  server is the source of truth — it just loaded the doc from the object store). The server
-  never sends a step 1, so a correct client never needs to answer one.
-- **Client step 1** (state vector): the server answers with step 2 for that vector.
-- **Client step 2** payload is `[state vector][update]`: the state vector
-  (`varUint(count)` + count × (`varUint clientId`, `varUint clock`)) is skipped before the
-  §5.3 guard and the apply, so a step 2 must not be able to smuggle a stamper-root write
-  past `forbiddenRootWrite`.
-- **Client update** (type 2 of SYNC): guarded (§5.3) and applied with the connection as
+- **On join** the server sends, in this order: IDENTITY; LEDGER with the full ledger state;
+  **SYNC step 2** with the full content state; **SYNC step 1** with the content state vector;
+  then the awareness states. The step 1 is what makes edits made while disconnected arrive: the
+  stock y-websocket client answers it with a step 2 holding everything the room lacks (shapes
+  drawn while the socket was down, or while the server restarted), which the server treats as a
+  plain client update. Without it, a reconnected client's next edit depended on clocks the room
+  never received and was refused as `pending`.
+- **Client step 1** (state vector): the server answers with step 2 of the content for that vector.
+- **Client step 2** and **client update** carry the same payload, `varUint8Array(update)`
+  (y-protocols `writeSyncStep2` = `varUint8Array(encodeStateAsUpdate(doc, sv))` — there is **no**
+  state vector in a step 2). Both are guarded (§5.3) and applied with the connection as
   transaction origin.
 - Any other sync type closes the connection with `1003` (`unknown sync type`).
+- The ledger is sent as a full state on join and then as each stamper transaction's update, to
+  every connection (the sender included). It has no client → server direction.
 
 ## 5. Attribution: server-stamped, never client-written
 
-Attribution must not be forgeable (design §4), so clients never write it. In production the
+Attribution must not be forgeable (design §4), so clients never write it — and since the third
+independent verification they cannot even reach the document that holds it. In production the
 server announces `attribution: 'server'` and MUST:
 
-1. **Apply each client update with the connection as transaction origin**
-   (`Y.applyUpdate(roomDoc, update, conn)`).
-2. **Stamp** after every such transaction: run `attachStamper(roomDoc, {userOf: origin =>
-   conn identity})` from
-   [`shared/src/stamper.ts`](../shared/src/stamper.ts)
-   (`@pocharlies/artifacts-canvas-shared/stamper` — the same code the client uses in dev, so
-   there is one implementation, not a port). It writes, with origin
-   `artifacts-canvas:stamper`:
+1. **Keep two documents per room.** The **content** document (`shapes`, `assets`, `meta`) is the
+   only one client updates are applied to. The **ledger** document (`attribution`, `users`,
+   `history`, `writers`) is written only by the stamper and sent read-only (LEDGER, §4). The
+   server never applies a client byte to the ledger; any client message on the ledger channel
+   closes the connection `4403`. (Why: with one shared document, every Yjs integration path —
+   items without a parent, parked pending structs, zero-length structs — was a way to forge or
+   erase attribution past the guard. With two, a guard bug can at worst let a malformed value into
+   the content document; it can never name an author.)
+2. **Apply each client update to the content document with the connection as transaction
+   origin** (`applyGuarded(content, update, conn)`, which wraps `Y.applyUpdate`).
+3. **Stamp** after every such transaction: `attachStamper(content, ledger, {userOf: origin =>
+   conn identity})` from [`shared/src/stamper.ts`](../shared/src/stamper.ts)
+   (`@pocharlies/artifacts-canvas-shared/stamper` — the same code the client uses in dev). It
+   observes the content transaction and derives the created / updated / deleted shape ids from
+   it alone (`transaction.changed`, its deletions), attributes them to the verified identity of
+   the connection that sent it, and writes the ledger with origin `artifacts-canvas:stamper`:
    - `attribution[shapeId] = {createdBy, createdAt, updatedBy, updatedAt}` (ms epoch;
      `updatedAt` refreshed at most every 5 s per user; the entry is kept when the shape is
      deleted so an undo restores the original author),
@@ -211,66 +231,95 @@ server announces `attribution: 'server'` and MUST:
    - `history.push({t, by, verb, shapeId, shapeType, geo?, highlight?, owner?})`, verbs
      `create | move | resize | rotate | edit | style | delete | order | group | lock`,
      rate-limited per (user, shape, verb) to one line per 10 s, the author's own creation
-     gesture coalesced, capped at 300 entries.
-   These stamper transactions are broadcast to every connection, including the sender.
-3. **Reject client writes outside `shapes`, `assets` and `meta`** (an allow-list: the stamper
-   roots `attribution`, `users`, `history` and any unknown root are server-only): before
-   applying an update, call `checkClientUpdate(roomDoc, update, {serverClient, mayWriteClient})`
-   (same file; `forbiddenRootWrite` is the same check returning only the reason). It resolves
-   every NEW struct to its parent type — Yjs omits `parent` (and the map key) for an item
-   that has a left/right origin, so origins are followed through the room for clocks it has
-   (a forged copy of a known struct in the update is ignored, as Yjs ignores it) and through
-   the update for new ones — and every deletion through the room. Refused:
-   - a write or delete outside the allow-list (the root's name);
+     gesture coalesced, capped at 300 entries,
+   - `writers[clientId] = principal` (decimal Yjs client id → identity id), see 5.
+   These ledger transactions are broadcast to every connection, including the sender.
+4. **Guard the content document** before applying (`checkClientUpdate(content, update,
+   {serverClient, mayWriteClient})`, same file; `forbiddenRootWrite` returns only the reason).
+   Its job is schema/size safety and pending-state hygiene, not attribution. It resolves every
+   NEW struct to its parent type — Yjs omits `parent` (and the map key) for an item that has a
+   left/right origin, so origins are followed through the room for clocks it has and through the
+   update for new ones — and every deletion through the room. Refused (close `4403`, update
+   **not** applied):
+   - a write or delete in any root other than `shapes`, `assets`, `meta` (an allow-list: a
+     ledger-named root in the content document, a root left by a pre-split document, any
+     unknown root);
+   - `malformed`: a **zero-length** struct (Yjs integrates a zero-length item even at a known
+     clock: over a live map entry it erases that entry and the document can no longer be
+     encoded) or a **zero-length delete range** (Yjs throws re-encoding it); a client that
+     appears in more than one struct block (Yjs keeps only the last one); a same-client
+     dependency on a clock at or after the struct's own;
    - `pending`: anything that would not integrate completely — a struct starting beyond the
-     room's clock for its client, a hole (Skip) or non-contiguous clocks, an origin/parent
-     that neither the room nor the update has, a delete of clocks nobody wrote yet. Yjs would
-     park it and release it later, after the guard, e.g. right after the stamper's next
-     history line. **The room never holds pending state**;
-   - `server-client` (a struct carrying the stamper's client id), `foreign-client` (new
-     clocks for a client id bound to another principal or announced in another connection's
-     awareness), `overlap` (a struct that only partly overlaps the room), `malformed`;
-   - `shapes-schema` / `assets-schema` / `meta-schema`: §6.
-   What it cannot resolve (origin cycles, very long chains) is applied to a scratch copy of
-   the integrated room and rejected if a server-only root changed, a touched value breaks
-   §6, or anything is left pending. A malformed update that makes decoding throw counts as
-   forbidden too. Then close the connection with `4403` and do **not** apply the update.
-   This applies to plain updates and to step-2 payloads alike (§4.1). After every apply the
-   server asserts that the room holds no pending structs/deletes; if one ever did, the sender
-   is closed `4403` and the parked part — which no observer, client or save ever saw — is
-   dropped, which returns the room to its last good state, and that state is saved. A room
-   never persists pending state (saves encode the integrated document only) and a stored
-   object that has some is cleaned on load and saved back.
-4. **Overwrite the awareness `user` field** of every awareness update from a connection with
-   that connection's identity (`awarenessProtocol.modifyAwarenessUpdate`), so live cursors
-   and labels cannot lie either. States for clientIds already owned by another connection
-   are dropped.
+     room's clock for its client, a hole (Skip) or non-contiguous clocks, an origin/parent that
+     neither the room nor the update has (**for structs the room already has too**: Yjs
+     resolves their dependencies before it skips them), a cross-client dependency cycle, a
+     delete of clocks nobody wrote yet;
+   - `server-client` (a struct carrying the content document's own client id),
+     `foreign-client` (new clocks for a client id bound to another principal, or not yet
+     bound and announced in another principal's awareness), `overlap` (a struct that only partly
+     overlaps the room);
+   - `shapes-schema` / `assets-schema` / `meta-schema`: §6 — for every new item at a field key,
+     a deleted (`ContentDeleted`) one included (it deletes the value there: a live shape's
+     `type` can never go away).
+   What the fast path cannot resolve (origin cycles, very long chains, a `type` both replaced
+   and erased in one update) is applied to a scratch copy of the content and rejected if a
+   non-content root changed, a touched value breaks §6, Yjs threw, or anything is left pending.
+   A malformed update that makes decoding throw counts as forbidden too.
+   **Whatever the apply does, the room never keeps pending state**: `applyGuarded` drops any
+   parked structs/deletes in a `finally` — also when `Y.applyUpdate` throws half-way (a throw
+   used to skip that check and leave the room pending, refusing every later writer as
+   `room-pending`) — the sender is closed `4403` and the room is marked dirty. Saves encode the
+   integrated documents only, and a stored object that has pending state is cleaned on load.
+5. **Bind client ids.** A Yjs client id is bound to the first principal that adds clocks to it,
+   in the ledger's `writers` map, so the binding is persisted and survives a room reload or a
+   server restart. Nobody else may extend it (`foreign-client`). Awareness alone never binds an
+   id: a state announced for an id the ledger binds to another principal is dropped, and an
+   awareness claim only blocks ids that have no clocks yet. (An id with clocks from a document
+   stored before the bindings existed is bound by its first writer.)
+6. **Overwrite the awareness `user` field** of every awareness update from a connection with
+   that connection's identity (`awarenessProtocol.modifyAwarenessUpdate`), so live cursors and
+   labels cannot lie either. States for clientIds already owned by another connection are
+   dropped.
 
 `attribution: 'client'` exists only for development against a plain relay (e.g.
-`npx y-websocket`): the client then runs the same stamper for its own transactions. Never
-announce it in production.
+`npx y-websocket`): the client then runs the same stamper for its own transactions, into a
+ledger document local to that tab (the ledger has no outgoing channel, so it is never shared).
+Never announce it in production.
 
 ## 6. Document schema (Yjs)
 
-| Root | Type | Written by | Content |
-|---|---|---|---|
-| `shapes` | `Y.Map<Y.Map>` | clients | one Y.Map per shape, key = shape id |
-| `assets` | `Y.Map<string>` | clients | pasted images as data URLs, key = asset id (client caps at `maxImageBytes`, default 2 MiB, downscaled to ≤1600 px) |
-| `meta` | `Y.Map` | clients | `pageWidth` (set once by the first client) |
-| `attribution` | `Y.Map<Attribution>` | server | §5 |
-| `users` | `Y.Map<UserInfo>` | server | §5 |
-| `history` | `Y.Array<HistoryEntry>` | server | §5 |
+| Document | Root | Type | Written by | Content |
+|---|---|---|---|---|
+| content | `shapes` | `Y.Map<Y.Map>` | clients | one Y.Map per shape, key = shape id |
+| content | `assets` | `Y.Map<string>` | clients | pasted images as data URLs, key = asset id (client caps at `maxImageBytes`, default 2 MiB, downscaled to ≤1600 px) |
+| content | `meta` | `Y.Map` | clients | `pageWidth` (set once by the first client) |
+| ledger | `attribution` | `Y.Map<Attribution>` | server | §5 |
+| ledger | `users` | `Y.Map<UserInfo>` | server | §5 |
+| ledger | `history` | `Y.Array<HistoryEntry>` | server | §5 |
+| ledger | `writers` | `Y.Map<string>` | server | Yjs client id (decimal) → principal, §5.5 |
 
-Enforced schema (server guard `shapes-schema`/`assets-schema`/`meta-schema`, the same rules
-the client reader applies to skip a malformed entry instead of throwing): every direct child
-of `shapes` is a `Y.Map` (never a number, string, `null`, array or text); a new shape carries a
-`type` from the list below in its first update and a live shape never loses it; `x, y, w, h,
-rotation, index, opacity, bend, ow, oh` are finite numbers within ±1e9; `locked, highlight,
-done, pen, fixedWidth` booleans; `id, groupId, name, assetId` and the style strings strings;
-`geo` one of `GEO_KINDS`; `start`/`end` terminals; `text` a `Y.Text` (or a string) holding text;
-`points` a `Y.Array` (or array) of finite numbers; unknown fields only plain JSON values, never
-nested types. `assets` values are strings; `meta` values plain JSON (no nested types). The
-client reader also needs both terminals on lines/arrows and uses the map key as the shape id.
+Enforced schema of the content document (server guard `shapes-schema`/`assets-schema`/
+`meta-schema`, the same rules the client reader applies to skip a malformed entry instead of
+throwing; all in [`shared/src/model.ts`](../shared/src/model.ts)): every direct child of `shapes`
+is a `Y.Map` (never a number, string, `null`, array or text); a new shape carries a `type` from
+the list below in its first update and a live shape never loses it (not by a delete, not by a
+deleted item at the key); `x, y, w, h, rotation, index, opacity, bend, ow, oh` are finite numbers
+within ±1e9; `locked, highlight, done, pen, fixedWidth` booleans; `id, groupId, name, assetId`
+strings ≤ 1024; the **style enums come from shared allow-lists**: `color` ∈ `COLOR_NAMES`
+(`black grey violet pink blue light-blue orange yellow red green light-green white`), `fill` ∈
+`none semi solid pattern`, `dash` ∈ `solid dashed dotted draw`, `size` ∈ `s m l xl`, `font` ∈
+`draw sans serif mono`, `arrowheads` ∈ `none end both dot`; `geo` one of `GEO_KINDS`;
+`start`/`end` terminals `{x, y, bind?: {shapeId, nx, ny}}` with no other keys and a plain
+prototype; `text` a `Y.Text` (or a string) holding text; `points` a `Y.Array` (or array) of
+finite numbers, **at most 300 000** (`MAX_POINTS`), counted across appends; unknown fields only
+plain JSON values, never nested types. **Forbidden keys**: `__proto__`, `constructor`,
+`prototype` are never a shape id, a field name, an asset id, a meta key, or a key inside a JSON
+value (a decoder assigns `o[key] = v`, so such a key gives the value an attacker-chosen
+prototype); map keys are 1–256 chars. `assets` values are strings; `meta` values plain JSON (no
+nested types). The client reader also needs both terminals on lines/arrows, uses the map key as
+the shape id, reads only the known shape fields into a null-prototype object, falls back to the
+default for a style value outside its allow-list, and renders each shape in its own try/catch
+(one bad shape never aborts a render pass).
 
 Shape map fields (types in [`shared/src/model.ts`](../shared/src/model.ts)): `id`, `type`
 (`draw | line | arrow | text | note | geo | frame | image`), `x, y, w, h, rotation`
@@ -342,28 +391,46 @@ Body: `{allowed, reason, user:{id,name,anonymous}, artifact:{key,expires,ttl}}`.
 
 ## 8. Persistence
 
-One S3/MinIO object per artifact: `<CANVAS_PREFIX>/<artifact key>.ydoc` (default prefix
-`_plugins/canvas`). The room loads it on first join (`Y.applyUpdate`, origin `'load'` — never
-stamped, never re-broadcast), saves debounced (`SAVE_DEBOUNCE_MS`) and flushes on last leave
-and on shutdown. Saves are serialized. Credentials are scoped by the core to
-`_plugins/canvas/` (Get/Put/Delete/List on the prefix only).
+Two S3/MinIO objects per artifact (default prefix `_plugins/canvas`), both with the artifact's
+`ttl` tag:
+
+```
+<CANVAS_PREFIX>/<artifact key>.ydoc          content document
+<CANVAS_PREFIX>/<artifact key>.ydoc.ledger   ledger document
+```
+
+(Not `<key>.ledger.ydoc`: that is also the content object of an artifact named `<key>.ledger`.
+Content objects always end in `.ydoc`, ledgers in `.ledger`, so the families never collide.)
+The room loads both on first join (`Y.applyUpdate`, origin `'load'` — never stamped, never
+re-broadcast; the ledger first), saves debounced (`SAVE_DEBOUNCE_MS`) and flushes on last leave
+and on shutdown; each save writes the ledger, then the content. Saves are serialized.
+Credentials are scoped by the core to `_plugins/canvas/` (Get/Put/Delete/List on the prefix
+only).
+
+**Migration.** A content object stored before the split holds `attribution`/`users`/`history`
+itself. On load, their live entries are copied into the ledger (entries the ledger already has
+win) and deleted from the content document, and both objects are saved back (metric
+`canvas_legacy_migrations_total`). Deleting rather than rebuilding keeps every content struct id
+stable for tabs that were open across the upgrade.
 
 ## 9. Expiry and orphan sweep
 
 When authz (connect, re-check, or HTTP gate) says expired/gone, the server refuses or drops
-the room (NOTICE + `4410`/`4404`) and **deletes the canvas object**. A periodic sweep
-(`SWEEP_INTERVAL_SECONDS`, default 3600) lists the prefix, asks the gate about each object's
-artifact, and deletes objects whose artifact is gone or expired.
+the room (NOTICE + `4410`/`4404`) and **deletes both canvas objects** (content and ledger). A
+periodic sweep (`SWEEP_INTERVAL_SECONDS`, default 3600) lists the prefix, asks the gate once per
+artifact found (from a content or a ledger object), and deletes both objects of every artifact
+that is gone or expired.
 
 ## 10. Enforcement summary (the server enforces; defaults)
 
 - **Path validation** before anything else: reject traversal, control chars, encoded
   traversal, absolute paths, and the reserved namespaces `_gate/`, `_plugins/`, `_/`,
   dotfiles (`.acl.json`). Optional allowlist `ARTIFACT_PREFIXES`.
-- **Stamper** (§5, shared code): client updates are applied with the connection as
-  transaction origin; `attribution`/`users`/`history` are written server-side only. A client
-  write to those roots closes `4403` and the update is **not** applied
-  (`forbiddenRootWrite`, throw treated as forbidden).
+- **Two documents** (§5): client updates reach only the content document, applied with the
+  connection as transaction origin; `attribution`/`users`/`history`/`writers` live in the ledger
+  document, written by the stamper only. A client message on the ledger channel, or a content
+  update the guard refuses, closes `4403` and is **not** applied (`checkClientUpdate`, throw
+  treated as forbidden); the apply itself never leaves pending state (`applyGuarded`).
 - **Awareness hardening** (§5.4): the `user` field is overwritten with the verified
   identity; states for clientIds already owned by another connection are dropped.
 - **Limits** (anonymous gets the stricter set): messages `120/s` burst 240 (anon 30/60) →
@@ -374,9 +441,13 @@ artifact, and deletes objects whose artifact is gone or expired.
 - **Origin** (§4): WebSocket upgrades only from `ALLOWED_ORIGINS`, else `4403`. The HTTP routes
   are `GET`/`HEAD` only (no state-changing HTTP route exists).
 
-## 11. Known model constraint
+## 11. Known model constraints
 
-The shared stamper assumes every value in the `shapes` root is a `Y.Map` (the client model's
-invariant). A malicious client that writes a non-map value into `shapes` gets the connection
-closed (`1003`, the stamper's guard throws inside the server transaction); the offending
-value is not stamped. v1 accepts this: the room stays consistent, the writer is dropped.
+- A client that relays someone else's structs (e.g. a tab reconnecting after a server CRASH that
+  lost unsaved edits of other people) delivers them in its own step 2: the stamper attributes
+  them to the relaying connection, and the relayed client ids get bound to it, so the original
+  author's tab is refused `foreign-client` when it reconnects. After a graceful restart nothing
+  is lost (the server flushes on shutdown). The ledger is never forged either way: it only ever
+  records verified identities.
+- An id with clocks from a stored document that predates the persisted `writers` bindings is
+  bound to its first writer after the upgrade.
