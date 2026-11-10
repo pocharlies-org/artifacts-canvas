@@ -1,0 +1,48 @@
+{
+  "name": "@pocharlies/artifacts-canvas-shared",
+  "version": "0.1.0",
+  "description": "Shared document model, wire protocol and attribution stamper for artifacts-canvas (client + server).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./model": {
+      "types": "./dist/model.d.ts",
+      "import": "./dist/model.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol.d.ts",
+      "import": "./dist/protocol.js"
+    },
+    "./stamper": {
+      "types": "./dist/stamper.d.ts",
+      "import": "./dist/stamper.js"
+    },
+    "./awareness": {
+      "types": "./dist/awareness.d.ts",
+      "import": "./dist/awareness.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "lib0": "^0.2.99",
+    "y-protocols": "^1.0.6",
+    "yjs": "^13.6.20"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

@@ -1,6 +1,6 @@
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
-import type { Identity } from './client-model.js';
+import type { Identity } from './model.js';
 
 /**
  * Wire protocol additions on top of the y-websocket protocol (see docs/protocol.md).

@@ -9,9 +9,9 @@ import type { Metrics } from './metrics.js';
 import { canvasObjectKey } from './paths.js';
 import type { CanvasObjectStore } from './store.js';
 import type { Identity } from './types.js';
-import { attachStamper } from './vendor/stamper.js';
-import { ROOT } from './vendor/client-model.js';
-import { MSG_SYNC } from './vendor/protocol.js';
+import { attachStamper } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { ROOT } from '@pocharlies/artifacts-canvas-shared/model';
+import { MSG_SYNC } from '@pocharlies/artifacts-canvas-shared/protocol';
 import type { TokenBucket } from './limits.js';
 
 /** A live WebSocket connection in a room. Used as the Yjs transaction origin. */

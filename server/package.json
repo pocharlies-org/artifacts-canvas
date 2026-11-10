@@ -4,17 +4,21 @@
   "description": "Collaborative canvas server for artifacts (y-websocket rooms, gate authz, S3 persistence)",
   "license": "Apache-2.0",
   "type": "module",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.700.0",
+    "@pocharlies/artifacts-canvas-shared": "0.1.0",
     "lib0": "^0.2.99",
     "pino": "^9.5.0",
     "prom-client": "^15.1.3",

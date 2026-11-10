@@ -11,9 +11,11 @@
     "typecheck": "tsc --noEmit -p .",
     "test": "VITE_CONFIG_NATIVE_IGNORE_WARNING=true NODE_OPTIONS=--no-warnings vitest run",
     "e2e": "playwright test",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "e2e:server": "playwright test -c playwright.server.config.ts"
   },
   "dependencies": {
+    "@pocharlies/artifacts-canvas-shared": "0.1.0",
     "html-to-image": "^1.11.13",
     "lib0": "^0.2.119",
     "perfect-freehand": "^1.2.3",

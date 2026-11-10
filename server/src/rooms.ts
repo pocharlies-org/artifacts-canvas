@@ -1,5 +1,5 @@
 import type { Config } from './config.js';
-import { encodeNotice } from './vendor/protocol.js';
+import { encodeNotice } from '@pocharlies/artifacts-canvas-shared/protocol';
 import type { Logger } from './logging.js';
 import type { Metrics } from './metrics.js';
 import { Room, sendWs } from './room.js';

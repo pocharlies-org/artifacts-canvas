@@ -23,8 +23,8 @@ import {
   MSG_SYNC,
   encodeIdentity,
   encodeNotice,
-} from './vendor/protocol.js';
-import { forbiddenRootWrite } from './vendor/stamper.js';
+} from '@pocharlies/artifacts-canvas-shared/protocol';
+import { forbiddenRootWrite } from '@pocharlies/artifacts-canvas-shared/stamper';
 
 export const WS_ROUTE = '/_canvas/_/ws/';
 /** Same route when the ingress controller strips the plugin prefix. */
@@ -188,7 +188,11 @@ export class WsServer {
     sendWs(ws, encodeIdentity(identity));
     const e = encoding.createEncoder();
     encoding.writeVarUint(e, MSG_SYNC);
-    syncProtocol.writeSyncStep1(e, room.doc);
+    // Push the room state directly (step2). The server is the source of truth (it just
+    // loaded the doc from the object store), so there is nothing to request from the
+    // client — and a step1 here would make clients answer with a step2 that echoes the
+    // stamper roots back, which the §5.3 guard must (and now does) reject.
+    syncProtocol.writeSyncStep2(e, room.doc);
     sendWs(ws, encoding.toUint8Array(e));
     const states = room.awareness.getStates();
     if (states.size) {
@@ -260,6 +264,20 @@ export class WsServer {
         encoding.writeVarUint(e, MSG_SYNC);
         syncProtocol.writeSyncStep2(e, room.doc, decoding.readVarUint8Array(dec));
         sendWs(conn.ws, encoding.toUint8Array(e));
+        return;
+      }
+      if (syncType === syncProtocol.messageYjsSyncStep2) {
+        // A step2 payload is [state vector][update]. The state vector is
+        // varUint(count) + count×(varUint clientId, varUint clock); skip it so the
+        // guard and the apply below see the plain update (a step2 must not be able to
+        // smuggle a stamper-root write past forbiddenRootWriteSafe).
+        const n = decoding.readVarUint(dec);
+        for (let i = 0; i < n; i++) {
+          decoding.readVarUint(dec);
+          decoding.readVarUint(dec);
+        }
+      } else if (syncType !== syncProtocol.messageYjsUpdate) {
+        conn.ws.close(1003, 'unknown sync type');
         return;
       }
       const update = decoding.readVarUint8Array(dec);

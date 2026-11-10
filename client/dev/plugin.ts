@@ -18,7 +18,17 @@ import { devIdentity, getRoom } from './yroom';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
 const ARTIFACTS = path.join(here, 'artifacts');
-const H2I = path.join(root, 'node_modules/html-to-image/dist/html-to-image.js');
+/** html-to-image lives in client/node_modules standalone and in the workspace root
+ * node_modules when the repo is built as an npm workspace — find whichever exists. */
+function findHtmlToImage(): string {
+  for (let dir = root; ; dir = path.dirname(dir)) {
+    const p = path.join(dir, 'node_modules', 'html-to-image', 'dist', 'html-to-image.js');
+    if (fs.existsSync(p)) return p;
+    const parent = path.dirname(dir);
+    if (parent === dir) throw new Error('html-to-image not found under node_modules');
+  }
+}
+const H2I = findHtmlToImage();
 const REPORTER = path.join(root, 'public/reporter.js');
 
 /** Insert the reporter as the first script of the document (the production server does the same). */

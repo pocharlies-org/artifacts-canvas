@@ -71,7 +71,17 @@ svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-e
 .menu-item .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 .geo-grid.open { display: grid; grid-template-columns: repeat(6, 40px); gap: 2px; min-width: 0; }
 
-.toolbar { z-index: 25; bottom: 16px; left: 50%; transform: translateX(-50%); padding: 6px; display: flex; gap: 2px; align-items: center; }
+/* One flex row for the bottom panels (zoom | toolbar | minimap): no overlap at any
+   desktop width. Children stay `relative` so popovers anchored inside them (geo grid)
+   keep their positioning context. */
+.bottomrow { position: absolute; left: 12px; right: 12px; bottom: 16px; z-index: 25; display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; pointer-events: none; }
+.bottomrow > .panel { position: relative; pointer-events: auto; }
+.toolbar { z-index: 25; padding: 6px; display: flex; gap: 2px; align-items: center; flex: 0 1 auto; min-width: 0; }
+/* Narrow desktop: let the toolbar scroll instead of overlapping the side panels. Not at
+   normal widths — `overflow` would clip the geo-grid popover that opens above the bar. */
+@media (min-width: 761px) and (max-width: 1240px) {
+  .toolbar { overflow-x: auto; scrollbar-width: none; }
+}
 .tool { width: 40px; height: 40px; border-radius: 8px; display: flex; align-items: center; justify-content: center; cursor: pointer; position: relative; font-size: 18px; border: none; background: none; color: #374151; flex: none; padding: 0; }
 .tool:hover { background: #f3f4f6; }
 .tool:disabled { opacity: .35; cursor: default; }
@@ -103,9 +113,9 @@ svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-e
 .history { margin-top: 10px; font-size: 11.5px; color: #374151; line-height: 1.6; }
 .history .t { color: var(--muted); }
 
-.bottomleft { bottom: 16px; left: 12px; padding: 6px; display: flex; gap: 4px; align-items: center; font-size: 12.5px; }
+.bottomleft { padding: 6px; display: flex; gap: 4px; align-items: center; font-size: 12.5px; flex: 0 0 auto; }
 .zoom-pct { min-width: 44px; text-align: center; border: 0; background: none; cursor: pointer; font-size: 12.5px; }
-.bottomright { bottom: 16px; right: 12px; width: 170px; height: 110px; padding: 6px; }
+.bottomright { width: 170px; height: 110px; padding: 6px; flex: 0 0 auto; }
 .mini { width: 100%; height: 100%; border-radius: 6px; overflow: hidden; }
 .minimap { width: 100%; height: 100%; display: block; cursor: pointer; }
 
@@ -130,6 +140,9 @@ svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-e
   .people { top: 102px; width: calc(100vw - 24px); max-height: 40vh; }
   .stylepanel { top: auto; bottom: 128px; left: 12px; right: 12px; width: auto; max-height: 40vh; overflow: auto; }
   .stylepanel .swatches { grid-template-columns: repeat(12, 1fr); }
+  /* Phone: back to individually positioned panels (toolbar full width, zoom above it). */
+  .bottomrow { position: static; display: block; pointer-events: auto; }
+  .bottomrow > .panel { position: absolute; }
   .toolbar { left: 12px; right: 12px; transform: none; bottom: 12px; overflow-x: auto; justify-content: flex-start; scrollbar-width: none; }
   .toolbar .tool { width: 38px; height: 38px; }
   .tool[data-tip]:hover::after { display: none; }

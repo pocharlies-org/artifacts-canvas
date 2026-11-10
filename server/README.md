@@ -2,8 +2,8 @@
 
 Collaborative annotation canvas for published artifacts: y-websocket rooms per artifact,
 core-gate authorization, Yjs documents persisted as single S3/MinIO objects, Helm chart.
-Apache-2.0. The wire contract is [`docs/protocol.md`](../docs/protocol.md); server-side
-enforcement and the core contract are in [`PROTOCOL.md`](./PROTOCOL.md).
+Apache-2.0. The single authoritative protocol — wire contract, core authz contract and the
+server-side enforcement — is [`docs/protocol.md`](../docs/protocol.md).
 
 ## What it does
 

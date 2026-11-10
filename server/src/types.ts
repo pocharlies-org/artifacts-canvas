@@ -1,20 +1,11 @@
 /** Shared types for the canvas server. */
 
-export interface Identity {
-  id: string;
-  name: string;
-  anonymous: boolean;
-  color?: string;
-  attribution: 'server' | 'client';
-  readOnly?: boolean;
-}
+// Identity and the NOTICE vocabulary are defined once, in
+// @pocharlies/artifacts-canvas-shared (docs/protocol.md §4); re-exported here so the
+// server modules keep their historical import paths.
+import type { Identity } from '@pocharlies/artifacts-canvas-shared';
 
-export type NoticeKind = 'revoked' | 'expired' | 'readonly' | 'rate-limited' | 'too-large' | 'shutdown';
-
-export interface Notice {
-  kind: NoticeKind;
-  message?: string;
-}
+export type { Identity, Notice, NoticeKind } from '@pocharlies/artifacts-canvas-shared';
 
 export interface AuthzArtifact {
   /** Artifact key as the core sees it (no `/artifacts/` prefix). */

@@ -1,6 +1,6 @@
 import * as Y from 'yjs';
-import { ROOT } from './client-model.js';
-import type { Attribution, GeoKind, HistoryEntry, HistoryVerb, ShapeType, UserInfo } from './client-model.js';
+import { ROOT } from './model.js';
+import type { Attribution, GeoKind, HistoryEntry, HistoryVerb, ShapeType, UserInfo } from './model.js';
 
 /**
  * Attribution stamper.

@@ -16,6 +16,7 @@ import * as awarenessProtocol from 'y-protocols/awareness';
 import type { WebSocket } from 'ws';
 import { attachStamper, forbiddenRootWrite } from '../src/model/stamper';
 import { CLOSE, MSG_AWARENESS, MSG_QUERY_AWARENESS, MSG_SYNC, encodeIdentity } from '../src/collab/protocol';
+import { sanitizeAwarenessUpdate } from '@pocharlies/artifacts-canvas-shared/awareness';
 import { personColor } from '../src/model/colors';
 import type { Identity } from '../src/model/types';
 
@@ -110,13 +111,11 @@ export class Room {
       }
       if (type === MSG_AWARENESS) {
         const update = decoding.readVarUint8Array(dec);
-        const id = conn.identity;
-        // never trust the client's idea of who it is
-        const fixed = awarenessProtocol.modifyAwarenessUpdate(update, (state: Record<string, unknown> | null) => {
-          if (!state) return state;
-          return { ...state, user: { id: id.id, name: id.name, anonymous: id.anonymous, color: id.color } };
-        });
-        awarenessProtocol.applyAwarenessUpdate(this.awareness, fixed, conn);
+        // never trust the client's idea of who it is: the exact same hardening the
+        // production server applies (shared/awareness: foreign clientIds dropped, the
+        // `user` field forced to the connection identity).
+        const fixed = sanitizeAwarenessUpdate(update, conn.clientIds, this.awareness, conn.identity);
+        if (fixed) awarenessProtocol.applyAwarenessUpdate(this.awareness, fixed, conn);
         return;
       }
       if (type === MSG_QUERY_AWARENESS) {

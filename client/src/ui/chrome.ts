@@ -24,14 +24,18 @@ export function buildChrome(ed: Editor, root: HTMLElement) {
     toastTimer = window.setTimeout(() => toastEl.classList.remove('show'), 2600);
   };
 
+  // The three bottom panels share one flex row (zoom | toolbar | minimap) so they can
+  // never overlap at narrow desktop widths (1280): the centered toolbar used to collide
+  // with the zoom panel there.
+  const bottomRow = h('div', { class: 'bottomrow' });
+  bottomRow.append(bottomLeft(ed), toolbar(ed), minimapPanel(ed));
+
   root.append(
     topLeft(ed),
     topRight(ed),
     peoplePanel(ed),
     stylePanel(ed),
-    bottomLeft(ed),
-    minimapPanel(ed),
-    toolbar(ed),
+    bottomRow,
     banner(ed),
   );
 }

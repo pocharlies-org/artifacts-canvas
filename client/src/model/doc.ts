@@ -1,27 +1,13 @@
 import * as Y from 'yjs';
+import { ROOT } from '@pocharlies/artifacts-canvas-shared/model';
 import {
   DEFAULT_STYLE, STYLE_KEYS,
   type Attribution, type HistoryEntry, type Shape, type ShapeType, type Style, type UserInfo,
 } from './types';
 
-/**
- * Root types of the shared Yjs document (see docs/protocol.md):
- *   shapes       Y.Map<Y.Map>      one Y.Map per shape, keyed by shape id   (clients write)
- *   assets       Y.Map<string>     image data URLs, keyed by asset id       (clients write)
- *   meta         Y.Map<any>        pageWidth, ...                           (clients write)
- *   attribution  Y.Map<Attribution> keyed by shape id                       (stamper writes)
- *   users        Y.Map<UserInfo>   keyed by user id                         (stamper writes)
- *   history      Y.Array<HistoryEntry>                                      (stamper writes)
- * "Stamper writes" means the server when it announces `attribution: 'server'`, else this client.
- */
-export const ROOT = {
-  shapes: 'shapes',
-  assets: 'assets',
-  meta: 'meta',
-  attribution: 'attribution',
-  users: 'users',
-  history: 'history',
-} as const;
+// The root names are defined once, in @pocharlies/artifacts-canvas-shared/model
+// (see docs/protocol.md §6); re-exported here for the client's historical paths.
+export { ROOT };
 
 /** Fields kept as nested Y types instead of plain values. */
 const YTEXT_FIELDS = new Set(['text']);
