@@ -126,6 +126,8 @@ export const es = {
   'ctl.zoomOut': 'Alejar',
   'ctl.zoomIn': 'Acercar',
   'ctl.fit': 'Encajar todo',
+  'ctl.toolsPrev': 'Más herramientas a la izquierda',
+  'ctl.toolsNext': 'Más herramientas a la derecha',
   'ctl.minimap': 'Minimapa',
 
   'style.color': 'Color',

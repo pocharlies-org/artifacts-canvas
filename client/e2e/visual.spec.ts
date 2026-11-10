@@ -5,7 +5,7 @@ import { dragBox, drawStroke, newRoom, open } from './helpers';
 const OUT = process.env.SCREENSHOT_DIR ?? 'screenshots';
 
 // Recreates the meeting of the approved mockup: 3 people, notes, a circled chart, a highlight, an arrow.
-test('screenshots at 1440x900 and 390x844', async ({ browser }) => {
+test('screenshots at 1440x900, 390x844 and 360x780', async ({ browser }) => {
   fs.mkdirSync(OUT, { recursive: true });
   const room = newRoom('visual');
   const D = await open(browser, 'Daniel Ibáñez', room);
@@ -73,5 +73,16 @@ test('screenshots at 1440x900 and 390x844', async ({ browser }) => {
     return getComputedStyle(el).display !== 'none' && (r.right > window.innerWidth + 1 || r.left < -1);
   }).map((el) => el.className));
   expect(overflow).toEqual([]);
-  for (const o of [D, M, I, P]) await o.close();
+  await P.page.locator('.panels-btn').click();
+  // the toolbar overflows on a phone: its chevron pages to the hidden tools
+  await expect(P.page.getByTestId('toolbar-next')).toBeVisible();
+  for (let k = 0; k < 4 && (await P.page.getByTestId('toolbar-next').isVisible()); k++) {
+    await P.page.getByTestId('toolbar-next').click();
+    await P.page.waitForTimeout(450);
+  }
+  await P.page.screenshot({ path: `${OUT}/phone-390x844-toolbar-end.png` });
+  const S = await open(browser, 'Marta Ruiz', room, { viewport: { width: 360, height: 780 } });
+  await S.page.waitForTimeout(600);
+  await S.page.screenshot({ path: `${OUT}/phone-360x780.png` });
+  for (const o of [D, M, I, P, S]) await o.close();
 });

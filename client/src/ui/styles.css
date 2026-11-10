@@ -76,7 +76,15 @@ svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-e
    keep their positioning context. */
 .bottomrow { position: absolute; left: 12px; right: 12px; bottom: 16px; z-index: 25; display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; pointer-events: none; }
 .bottomrow > .panel { position: relative; pointer-events: auto; }
-.toolbar { z-index: 25; padding: 6px; display: flex; gap: 2px; align-items: center; flex: 0 1 auto; min-width: 0; }
+.toolbar-wrap { position: relative; display: flex; flex: 0 1 auto; min-width: 0; pointer-events: auto; }
+.toolbar-wrap > .panel { position: relative; }
+.toolbar { z-index: 25; padding: 6px; display: flex; gap: 2px; align-items: center; flex: 0 1 auto; min-width: 0; max-width: 100%; }
+/* Overflow affordance: a fade + chevron on every side that still hides tools (phones and
+   narrow desktops). The chevron pages the bar; it sits above the panel, inside its radius. */
+.tb-nav { position: absolute; top: 0; bottom: 0; width: 34px; z-index: 26; border: 0; padding: 0; cursor: pointer; font-size: 24px; line-height: 1; color: var(--blue); font-weight: 700; display: flex; align-items: center; }
+.tb-nav[hidden] { display: none; }
+.tb-nav.prev { left: 0; justify-content: flex-start; padding-left: 7px; border-radius: 12px 0 0 12px; background: linear-gradient(to right, #fff 55%, rgba(255,255,255,0)); }
+.tb-nav.next { right: 0; justify-content: flex-end; padding-right: 7px; border-radius: 0 12px 12px 0; background: linear-gradient(to left, #fff 55%, rgba(255,255,255,0)); }
 /* Narrow desktop: let the toolbar scroll instead of overlapping the side panels. Not at
    normal widths — `overflow` would clip the geo-grid popover that opens above the bar. */
 @media (min-width: 761px) and (max-width: 1240px) {
@@ -143,7 +151,9 @@ svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-e
   /* Phone: back to individually positioned panels (toolbar full width, zoom above it). */
   .bottomrow { position: static; display: block; pointer-events: auto; }
   .bottomrow > .panel { position: absolute; }
-  .toolbar { left: 12px; right: 12px; transform: none; bottom: 12px; overflow-x: auto; justify-content: flex-start; scrollbar-width: none; }
+  .toolbar-wrap { position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 25; }
+  .bottomrow .toolbar-wrap > .toolbar { position: relative; left: auto; right: auto; bottom: auto; width: 100%; transform: none; overflow-x: auto; justify-content: flex-start; scrollbar-width: none; }
+  .toolbar::-webkit-scrollbar { display: none; }
   .toolbar .tool { width: 38px; height: 38px; }
   .tool[data-tip]:hover::after { display: none; }
   .bottomleft { bottom: 70px; left: 12px; padding: 4px; }

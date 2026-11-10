@@ -403,7 +403,44 @@ function toolbar(ed: Editor): HTMLElement {
   };
   ed.on('tool', sync);
   sync();
-  return bar;
+  return scrollableToolbar(ed, bar);
+}
+
+/**
+ * Wrap the toolbar so it scrolls horizontally whenever it is wider than the screen (phones,
+ * narrow desktops), with a visible affordance: a fade + chevron button on each side that
+ * still has hidden tools. The chevrons page the bar; the selected tool is kept in view.
+ */
+function scrollableToolbar(ed: Editor, bar: HTMLElement): HTMLElement {
+  const prev = h('button', { class: 'tb-nav prev', 'aria-label': t('ctl.toolsPrev'), title: t('ctl.toolsPrev'), 'data-testid': 'toolbar-prev', hidden: true }, '‹');
+  const next = h('button', { class: 'tb-nav next', 'aria-label': t('ctl.toolsNext'), title: t('ctl.toolsNext'), 'data-testid': 'toolbar-next', hidden: true }, '›');
+  const wrap = h('div', { class: 'toolbar-wrap', 'data-testid': 'toolbar-wrap' }, bar, prev, next);
+  const NAV = 34; // chevron width: a tool under a visible chevron is not reachable yet
+  const update = () => {
+    const max = bar.scrollWidth - bar.clientWidth;
+    const over = max > 1;
+    wrap.classList.toggle('overflow', over);
+    prev.hidden = !over || bar.scrollLeft <= 1;
+    next.hidden = !over || bar.scrollLeft >= max - 1;
+  };
+  const page = (dir: -1 | 1) => bar.scrollBy({ left: dir * Math.max(80, bar.clientWidth - 2 * NAV - 40), behavior: 'smooth' });
+  prev.addEventListener('click', () => page(-1));
+  next.addEventListener('click', () => page(1));
+  bar.addEventListener('scroll', update, { passive: true });
+  window.addEventListener('resize', update);
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(update).observe(bar);
+  requestAnimationFrame(update);
+  // Keyboard shortcuts can select a tool that is scrolled out of view: bring it in.
+  ed.on('tool', () => {
+    if (bar.scrollWidth - bar.clientWidth <= 1) return;
+    const on = bar.querySelector<HTMLElement>('.tool.on');
+    if (!on) return;
+    const br = bar.getBoundingClientRect();
+    const r = on.getBoundingClientRect();
+    if (r.left < br.left + NAV) bar.scrollLeft -= br.left + NAV - r.left;
+    else if (r.right > br.right - NAV) bar.scrollLeft += r.right - (br.right - NAV);
+  });
+  return wrap;
 }
 
 // ------------------------------------------------------------------ banner: presenting / following / notices

@@ -128,6 +128,8 @@ export const en: Record<MessageKey, string> = {
   'ctl.zoomOut': 'Zoom out',
   'ctl.zoomIn': 'Zoom in',
   'ctl.fit': 'Zoom to fit',
+  'ctl.toolsPrev': 'More tools to the left',
+  'ctl.toolsNext': 'More tools to the right',
   'ctl.minimap': 'Minimap',
 
   'style.color': 'Colour',
