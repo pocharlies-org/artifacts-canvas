@@ -84,6 +84,9 @@ export async function startStack(): Promise<Stack> {
         AUTHZ_RECHECK_SECONDS: '1',
         SAVE_DEBOUNCE_MS: '200',
         SWEEP_INTERVAL_SECONDS: '3600',
+        // the browser opens the canvas on the server's own origin
+        ALLOWED_ORIGINS: `http://127.0.0.1:${port}`,
+        METRICS_PORT: '0',
         LOG_LEVEL: 'warn',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -206,7 +209,8 @@ export async function openAs(
 export async function rawConnect(stack: Stack, key: string, user: string | null): Promise<WebSocket> {
   const ws = new WebSocket(
     `${stack.wsUrl}/_canvas/_/ws/${key.split('/').map(encodeURIComponent).join('/')}`,
-    { headers: user ? { cookie: cookieFor(user) } : {} },
+    // a browser on the canvas page sends this Origin; the server refuses any other
+    { headers: { origin: stack.serverUrl, ...(user ? { cookie: cookieFor(user) } : {}) } },
   );
   // The client never sends IDENTITY (protocol §4: it is server → client and MUST be the
   // first message). Wait for the server's IDENTITY: it proves the authz join finished and

@@ -104,6 +104,10 @@ async function main(): Promise<void> {
       STATIC_DIR: path.join(clientDir, 'dist'),
       AUTHZ_RECHECK_SECONDS: '5',
       SAVE_DEBOUNCE_MS: '500',
+      // the browser opens the canvas on the server's own origin
+      ALLOWED_ORIGINS: `http://127.0.0.1:${SERVER_PORT},http://localhost:${SERVER_PORT}`,
+      METRICS_PORT: String(num('DEV_METRICS_PORT', 9403)),
+      METRICS_HOST: '127.0.0.1',
       LOG_LEVEL: process.env.LOG_LEVEL ?? 'info',
     },
   });

@@ -13,6 +13,8 @@ import type { AuthzClient } from './authz.js';
 import { artifactState } from './expiry.js';
 import { TokenBucket } from './limits.js';
 import { composeIdentity, sanitizeAwarenessUpdate } from './identity.js';
+import { AnonIssuer, assignNum } from './anon.js';
+import { normalizeOrigin } from './config.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
 import type { RoomManager } from './rooms.js';
 import { Room, sendWs, type Conn } from './room.js';
@@ -36,12 +38,36 @@ export interface WsDeps {
   manager: RoomManager;
   log: Logger;
   metrics: Metrics;
+  /** Shared with the HTTP app so the wrapper page and the socket issue the same cookie. */
+  anon?: AnonIssuer;
 }
+
+/** Request property carrying the Set-Cookie of the upgrade response (see the 'headers' hook). */
+const SET_COOKIE = Symbol('canvas-set-cookie');
+type UpgradeReq = IncomingMessage & { [SET_COOKIE]?: string };
 
 export class WsServer {
   readonly wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
+  readonly anon: AnonIssuer;
 
-  constructor(private readonly deps: WsDeps) {}
+  constructor(private readonly deps: WsDeps) {
+    this.anon = deps.anon ?? new AnonIssuer(deps.cfg.anonCookieSecret);
+    // The anonymous-visitor cookie rides on the 101 response of the upgrade.
+    this.wss.on('headers', (headers: string[], req: UpgradeReq) => {
+      const c = req[SET_COOKIE];
+      if (c) headers.push(`Set-Cookie: ${c}`);
+    });
+  }
+
+  /** Exact match against ALLOWED_ORIGINS; a missing or `null` Origin never matches. */
+  originAllowed(origin: string | undefined): boolean {
+    if (typeof origin !== 'string' || origin === '' || origin === 'null') return false;
+    try {
+      return this.deps.cfg.allowedOrigins.has(normalizeOrigin(origin));
+    } catch {
+      return false;
+    }
+  }
 
   handleUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer): void => {
     const url = new URL(req.url ?? '/', 'http://internal');
@@ -52,6 +78,14 @@ export class WsServer {
       // Not our route: fail the upgrade, leave the socket to nothing.
       socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
       socket.destroy();
+      return;
+    }
+    // Cross-site WebSocket hijacking guard: the browser attaches the visitor's session
+    // cookie to any cross-site upgrade, so only the configured origins may open a room.
+    if (!this.originAllowed(req.headers.origin)) {
+      this.deps.metrics.wsRejected.inc({ reason: 'origin' });
+      this.deps.log.warn({ origin: req.headers.origin ?? null }, 'ws refused: origin not allowed');
+      this.wss.handleUpgrade(req, socket, head, (ws) => ws.close(CLOSE.forbidden, 'origin not allowed'));
       return;
     }
     // Accept both the core link shape `/_canvas/_/ws/<bucket>/<key>` and the client shape
@@ -86,35 +120,35 @@ export class WsServer {
           this.wss.handleUpgrade(req, socket, head, (ws) => ws.close(CLOSE.forbidden, 'not allowed'));
           return;
         }
-        const identity = composeIdentity(res, anonParam);
         const existing = this.deps.manager.get(key.key);
-        if (existing && existing.overCapacity) {
-          this.wss.handleUpgrade(req, socket, head, (ws) => {
-            sendWs(ws, encodeNotice({ kind: 'too-large' }));
-            ws.close(CLOSE.tooLarge, 'document too large');
-          });
-          this.deps.metrics.wsRejected.inc({ reason: 'doc_too_large' });
-          return;
-        }
-        // Capacity (protocol §7): per room (anon stricter) and per anonymous visitor.
+        // Anonymous pseudonym: assigned by the server (anon.ts); ?anon= is only a hint.
+        const anonymous = !res.identity || res.identity.anonymous;
+        const visitor = anonymous ? this.anon.visitor(cookie, anonParam) : null;
+        const num = visitor ? assignNum(visitor.num, visitor.nonce, existing ? existing.anonHolders() : new Map()) : '';
+        const identity = composeIdentity(res, num);
+        // Capacity (protocol §7): per room (anon stricter) and per anonymous visitor. Every
+        // penalty is per connection: nothing a visitor sends can lock other people out.
         if (existing) {
           if (existing.conns.size >= this.deps.cfg.maxConnsPerRoom) {
             this.rejectCapacity(socket, req, head, 'room full');
             return;
           }
-          if (identity.anonymous) {
+          if (visitor) {
             if (existing.countAnon() >= this.deps.cfg.maxConnsPerRoomAnon) {
               this.rejectCapacity(socket, req, head, 'room anon capacity');
               return;
             }
-            if (existing.hasAnonConn(identity.id) >= this.deps.cfg.maxConnsPerAnonVisitor) {
+            if (existing.countVisitor(visitor.nonce) >= this.deps.cfg.maxConnsPerAnonVisitor) {
               this.rejectCapacity(socket, req, head, 'anon visitor capacity');
               return;
             }
           }
         }
+        if (visitor && (visitor.fresh || num !== visitor.num)) {
+          (req as UpgradeReq)[SET_COOKIE] = this.anon.setCookie(visitor.nonce, num, isHttps(req));
+        }
         this.wss.handleUpgrade(req, socket, head, (ws) => {
-          void this.join(ws, key.key, cookie, authorization, identity, res.artifact?.ttl ?? null);
+          void this.join(ws, key.key, cookie, authorization, identity, visitor?.nonce ?? null, res.artifact?.ttl ?? null);
         });
       })
       .catch((err) => {
@@ -155,7 +189,8 @@ export class WsServer {
     artifactKey: string,
     cookie: string,
     authorization: string,
-    identity: Parameters<typeof encodeIdentity>[0],
+    identityIn: Parameters<typeof encodeIdentity>[0],
+    anonVisitor: string | null,
     ttl: number | null,
   ): Promise<void> {
     const { cfg, manager, metrics, log } = this.deps;
@@ -167,12 +202,21 @@ export class WsServer {
       ws.close(1011, 'storage error');
       return;
     }
+    let identity = identityIn;
+    if (anonVisitor) {
+      // Two upgrades may have raced for the same free pseudonym before the room existed:
+      // re-check against the live connections now that the room is loaded.
+      const num = identity.id.slice('anon:'.length);
+      const got = assignNum(num, anonVisitor, room.anonHolders());
+      if (got !== num) identity = { ...identity, id: `anon:${got}`, name: `Anónimo ${got}` };
+    }
     const conn: Conn = {
       ws,
       artifactKey,
       cookie,
       authorization,
       identity,
+      anonVisitor: anonVisitor ?? undefined,
       clientIds: new Set(),
       rate: identity.anonymous
         ? new TokenBucket(cfg.anonMsgRatePerSec, cfg.anonMsgBurst)
@@ -291,19 +335,25 @@ export class WsServer {
         this.deps.metrics.wsRejected.inc({ reason: 'forbidden_write' });
         return;
       }
-      Y.applyUpdate(room.doc, update, conn);
-      room.approxBytes += update.byteLength;
+      // Document size cap (protocol §7), per connection: an update that would grow the room
+      // past THIS connection's cap is refused and only this connection is closed. The room
+      // stays open for everyone else (an anonymous visitor cannot lock the room).
       const limit = conn.identity.anonymous ? cfg.anonMaxDocBytes : cfg.maxDocBytes;
-      if (room.approxBytes > limit) {
-        const exact = Y.encodeStateAsUpdate(room.doc).byteLength;
-        room.approxBytes = exact;
-        if (exact > limit) {
-          room.overCapacity = true;
-          sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
-          conn.ws.close(CLOSE.tooLarge, 'document too large');
-          this.deps.metrics.wsRejected.inc({ reason: 'doc_too_large' });
+      if (room.approxBytes + update.byteLength > limit) {
+        const current = Y.encodeStateAsUpdate(room.doc).byteLength;
+        room.approxBytes = current;
+        if (current + update.byteLength > limit) {
+          const after = sizeAfter(room.doc, update);
+          if (after > limit && after > current) {
+            sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
+            conn.ws.close(CLOSE.tooLarge, 'document too large');
+            this.deps.metrics.wsRejected.inc({ reason: 'doc_too_large' });
+            return;
+          }
         }
       }
+      Y.applyUpdate(room.doc, update, conn);
+      room.approxBytes += update.byteLength;
       return;
     }
     if (type === MSG_AWARENESS) {
@@ -354,4 +404,22 @@ function forbiddenRootWriteSafe(doc: Y.Doc, update: Uint8Array): string | null {
   } catch {
     return 'forbidden';
   }
+}
+
+/** Size of the room state after `update`, measured on a scratch copy (the room is untouched). */
+function sizeAfter(doc: Y.Doc, update: Uint8Array): number {
+  const scratch = new Y.Doc({ gc: doc.gc });
+  try {
+    Y.applyUpdate(scratch, Y.encodeStateAsUpdate(doc));
+    Y.applyUpdate(scratch, update);
+    return Y.encodeStateAsUpdate(scratch).byteLength;
+  } finally {
+    scratch.destroy();
+  }
+}
+
+function isHttps(req: IncomingMessage): boolean {
+  const xf = req.headers['x-forwarded-proto'];
+  const v = (Array.isArray(xf) ? xf[0] : xf ?? '').split(',')[0].trim().toLowerCase();
+  return v === 'https';
 }

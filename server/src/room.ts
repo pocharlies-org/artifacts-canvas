@@ -22,6 +22,8 @@ export interface Conn {
   /** Raw `Authorization` header (if any), forwarded to the gate on every re-check. */
   authorization: string;
   identity: Identity;
+  /** anonymous visitor nonce from the server-signed cookie (anon.ts); undefined if logged in */
+  anonVisitor?: string;
   /** awareness clientIds this connection has claimed (protocol §5.4 hardening) */
   clientIds: Set<number>;
   rate: TokenBucket;
@@ -49,7 +51,6 @@ export class Room {
   readonly conns = new Map<WebSocket, Conn>();
   /** rough doc size estimate; refreshed exactly when it crosses the limit or on save */
   approxBytes = 0;
-  overCapacity = false;
   ttlTag: string | null = null;
   private saveTimer?: ReturnType<typeof setTimeout>;
   private dirty = false;
@@ -185,12 +186,20 @@ export class Room {
     await this.save();
   }
 
-  hasAnonConn(anonId: string): number {
+  /** Live connections of one anonymous visitor (server-issued nonce). */
+  countVisitor(nonce: string): number {
     let n = 0;
-    for (const c of this.conns.values()) {
-      if (c.identity.anonymous && c.identity.id === anonId) n++;
-    }
+    for (const c of this.conns.values()) if (c.anonVisitor === nonce) n++;
     return n;
+  }
+
+  /** Live anonymous pseudonyms (the NNNN of `anon:NNNN`) -> the visitor holding them. */
+  anonHolders(): Map<string, string> {
+    const m = new Map<string, string>();
+    for (const c of this.conns.values()) {
+      if (c.identity.anonymous && c.anonVisitor) m.set(c.identity.id.slice('anon:'.length), c.anonVisitor);
+    }
+    return m;
   }
 
   countAnon(): number {

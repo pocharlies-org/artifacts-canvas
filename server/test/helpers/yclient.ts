@@ -11,6 +11,9 @@ import type { Identity } from '../../src/types.js';
  * payload) exactly like the browser client, plus captures of the canvas-specific
  * messages (IDENTITY 100, NOTICE 101) and the close code.
  */
+/** Origin every test client sends unless told otherwise (tests set ALLOWED_ORIGINS to it). */
+export const TEST_ORIGIN = 'http://canvas.test';
+
 export class TestClient {
   readonly doc = new Y.Doc();
   readonly awareness = new awarenessProtocol.Awareness(this.doc);
@@ -24,9 +27,14 @@ export class TestClient {
   private closedResolve!: (code: number) => void;
   private lastIdentity: Identity | null = null;
 
+  /** Set-Cookie of the 101 response (anonymous pseudonym cookie). */
+  setCookie: string | null = null;
+
   constructor(
     private readonly url: string,
     private readonly cookie?: string,
+    /** Origin header; null = send none. */
+    private readonly origin: string | null = TEST_ORIGIN,
   ) {
     this.closed = new Promise((resolve) => (this.closedResolve = resolve));
   }
@@ -39,9 +47,13 @@ export class TestClient {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.url, {
         maxPayload: 16 * 1024 * 1024,
-        ...(this.cookie ? { headers: { cookie: this.cookie } } : {}),
+        headers: { ...(this.cookie ? { cookie: this.cookie } : {}), ...(this.origin !== null ? { origin: this.origin } : {}) },
       });
       this.ws = ws;
+      ws.on('upgrade', (res) => {
+        const sc = res.headers['set-cookie'];
+        this.setCookie = sc ? sc.join('\n') : null;
+      });
       ws.on('open', () => {
         const e = encoding.createEncoder();
         encoding.writeVarUint(e, 0);

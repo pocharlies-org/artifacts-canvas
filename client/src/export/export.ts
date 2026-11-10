@@ -2,6 +2,7 @@ import type { Editor } from '../editor/editor';
 import { shapeBounds } from '../geometry/shapes';
 import { type Box, boxesOverlap } from '../geometry/vec';
 import { defsMarkup, shapeElement } from '../render/shapeSvg';
+import { HAND_FAMILY, exportFontCss } from '../render/fonts';
 import { buildPdf, type PdfPage } from './pdf';
 
 export type ExportScope = 'view' | 'full';
@@ -10,12 +11,27 @@ export type ExportFormat = 'png' | 'pdf';
 const MAX_SIDE = 16000;
 const BG = '#e9ebef';
 
-/** SVG of the annotations inside `rect` (world units), sized rect * scale. */
-export function annotationsSvg(ed: Editor, rect: Box, scale: number): string {
+/** Markup of the annotations inside `rect` (world units). */
+export function annotationsBody(ed: Editor, rect: Box): string {
   const env = ed.renderer.env;
   const shapes = ed.annotationsVisible ? ed.visibleShapes().filter((s) => boxesOverlap(shapeBounds(s, env), rect)) : [];
-  const body = shapes.map((s) => shapeElement(s, env)).join('');
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.round(rect.w * scale)}" height="${Math.round(rect.h * scale)}" viewBox="${rect.x} ${rect.y} ${rect.w} ${rect.h}"><defs>${defsMarkup()}</defs>${body}</svg>`;
+  return shapes.map((s) => shapeElement(s, env)).join('');
+}
+
+/**
+ * Standalone SVG of `body` for the world rectangle `rect`, sized rect * scale. `fontCss` holds
+ * the embedded @font-face rules: an SVG drawn through an <img> cannot load external fonts.
+ */
+export function wrapSvg(body: string, rect: Box, scale: number, fontCss = ''): string {
+  const style = fontCss ? `<style>${fontCss}</style>` : '';
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.round(rect.w * scale)}" height="${Math.round(rect.h * scale)}" viewBox="${rect.x} ${rect.y} ${rect.w} ${rect.h}"><defs>${style}${defsMarkup()}</defs>${body}</svg>`;
+}
+
+/** SVG of the annotations inside `rect`, with the bundled hand font embedded when it is used. */
+export async function annotationsSvg(ed: Editor, rect: Box, scale: number): Promise<string> {
+  const body = annotationsBody(ed, rect);
+  const fontCss = body.includes(HAND_FAMILY) ? await exportFontCss() : '';
+  return wrapSvg(body, rect, scale, fontCss);
 }
 
 /** Render artifact + annotations of a world rectangle into a canvas. */
@@ -36,7 +52,7 @@ export async function renderRegion(ed: Editor, rect: Box, scale: number): Promis
     if (img) ctx.drawImage(img, (inter.x - rect.x) * scale, (inter.y - rect.y) * scale, inter.w * scale, inter.h * scale);
   }
   // annotations
-  const svg = annotationsSvg(ed, rect, scale);
+  const svg = await annotationsSvg(ed, rect, scale);
   const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
   try {
     const img = await loadImage(url);
@@ -54,15 +70,25 @@ export function exportRect(ed: Editor, scope: ExportScope): Box {
   return { x: b.x - pad, y: b.y - pad, w: b.w + pad * 2, h: b.h + pad * 2 };
 }
 
-export function exportScale(rect: Box, scope: ExportScope): number {
-  const want = scope === 'view' ? Math.min(2, Math.max(1, window.devicePixelRatio || 1)) : 1.5;
-  return Math.max(0.1, Math.min(want, MAX_SIDE / rect.w, MAX_SIDE / rect.h));
+/** Output pixels per screen (CSS) pixel of a "current view" export: the device ratio, 1..2. */
+export function viewPixelRatio(): number {
+  return Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+}
+
+/**
+ * Output pixels per WORLD unit. The view export must look like the screen, where one world
+ * unit spans `zoom` CSS px, so it is zoom x pixel ratio (the output is then exactly the
+ * viewport size x pixel ratio). The full export is at a fixed 1.5 px per artifact px.
+ */
+export function exportScale(rect: Box, scope: ExportScope, zoom = 1): number {
+  const want = scope === 'view' ? zoom * viewPixelRatio() : 1.5;
+  return Math.max(0.01, Math.min(want, MAX_SIDE / rect.w, MAX_SIDE / rect.h));
 }
 
 export async function exportCanvas(ed: Editor, format: ExportFormat, scope: ExportScope): Promise<{ blob: Blob; filename: string }> {
   ed.renderer.flush();
   const rect = exportRect(ed, scope);
-  const scale = exportScale(rect, scope);
+  const scale = exportScale(rect, scope, ed.camera.z);
   const canvas = await renderRegion(ed, rect, scale);
   const base = fileBase(ed);
   if (format === 'png') {

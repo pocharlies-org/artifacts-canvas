@@ -26,7 +26,8 @@ stripped `/ws/`).
 | `GET /_canvas/_/assets/*`, `GET /_canvas/_/reporter.js`, `GET /_canvas/_/vendor/html-to-image.js` | no | The static bundle from `client/dist/` (build with `npm run build`; base path `/_canvas/_/`, override with `CANVAS_BASE`). `assets/*` are `max-age=31536000, immutable`, everything else `max-age=60`. They carry no artifact data, so they need no authz. |
 | `GET /_canvas/_/frame/<artifact key>` | yes | The artifact HTML with the reporter injected (§3), fetched from `ARTIFACT_BASE_URL` with the visitor's cookie (and `Authorization` when present). Upstream 3xx is refused (403) — the credentials are never sent to a redirect target. Non-HTML passes through unchanged. |
 | `WS /_canvas/_/ws/<artifact key>[?anon=NNNN]` | yes + re-check | The room of that artifact (§4). |
-| `GET /healthz`, `/readyz`, `/metrics` | no | Liveness, readiness (cached `store.ready()`: a one-key list of `<CANVAS_PREFIX>/`, which the prefix-scoped `plugin-canvas` user may do — a HeadBucket would be denied), Prometheus. Also served under `/_canvas/…` (prefix stripped). |
+| `GET /healthz`, `/readyz` | no | Liveness, readiness (cached `store.ready()`: a one-key list of `<CANVAS_PREFIX>/`, which the prefix-scoped `plugin-canvas` user may do — a HeadBucket would be denied). Also served under `/_canvas/…` (prefix stripped). |
+| `GET /metrics` on `METRICS_PORT` | no | Prometheus, on a **separate internal listener** (default `9091`; `0` disables it). The public listener answers `404` for `/metrics` and `/_canvas/metrics`. |
 
 Every route that reveals anything about an artifact (wrapper, frame, ws) MUST first get
 `allowed: true` from the core's `POST /_gate/plugin/authz` for that key and the visitor's
@@ -122,7 +123,10 @@ origin and appear blank in exports.
 
 ## 4. WebSocket room
 
-`WS /_canvas/_/ws/<artifact key>?anon=NNNN` — one room per artifact key. The client is the
+`WS /_canvas/_/ws/<artifact key>?anon=NNNN` — one room per artifact key. The upgrade MUST carry an
+`Origin` listed in `ALLOWED_ORIGINS` (default: the origin of `ARTIFACT_BASE_URL`, i.e. the public
+artifacts host); a missing, `null` or foreign Origin is closed `4403` before any authz call (the
+browser attaches the session cookie to cross-site upgrades). The client is the
 stock `y-websocket` client (`WebsocketProvider`, BroadcastChannel disabled), so the room
 speaks the standard y-websocket protocol: every message is `varUint type` + payload.
 
@@ -149,9 +153,14 @@ interface Identity {
 - Identity comes from the authz answer (`user: {id, name, anonymous}`), never from anything
   the client sends. **There is no client→server identity**: the server never parses an
   incoming `100`; one closes the connection (`1003`).
-- `anon=NNNN` is the pseudonym the visitor keeps in `localStorage`
-  (`artifacts-canvas:anon`, 4 digits). The server MAY use it for anonymous connections
-  (`anon:NNNN`, after checking `^\d{4}$`) and MUST ignore it for logged-in ones. Anonymous
+- Anonymous pseudonyms are **assigned by the server**. Each anonymous browser holds an
+  HttpOnly cookie `canvas_anon=<visitor nonce>.<NNNN>.<hmac>` signed by the server
+  (`ANON_COOKIE_SECRET`, else a per-process key), set on the wrapper page or on the 101 of
+  the upgrade. The nonce identifies the visitor (per-visitor caps; two tabs share one
+  pseudonym). `anon=NNNN` (the number the client keeps in `localStorage`,
+  `artifacts-canvas:anon`) is only a **hint** for a visitor without a cookie; a number held
+  by another visitor on a live connection of the room is never given out again — the
+  server picks a free one. Logged-in connections ignore both. Anonymous
   connections are accepted only for keys inside `ANON_ALLOWED_PREFIXES` (default `pub/`);
   anything else is denied with reason `anon_outside_pub` (§7).
 - Close codes (RFC 6455 private range; the client does not reconnect on 44xx): `4403`
@@ -201,9 +210,15 @@ server announces `attribution: 'server'` and MUST:
      rate-limited per (user, shape, verb) to one line per 10 s, the author's own creation
      gesture coalesced, capped at 300 entries.
    These stamper transactions are broadcast to every connection, including the sender.
-3. **Reject client writes to `attribution`, `users` and `history`**: before applying an
-   update, call `forbiddenRootWrite(roomDoc, update)` (same file). It decodes the update and
-   returns the root name if any insertion or deletion touches those types. A malformed update
+3. **Reject client writes outside `shapes`, `assets` and `meta`** (an allow-list: the stamper
+   roots `attribution`, `users`, `history` and any unknown root are server-only): before
+   applying an update, call `forbiddenRootWrite(roomDoc, update)` (same file). It resolves
+   every inserted struct to its root — Yjs omits `parent` for an item that has a left/right
+   origin, so the origin chain is followed through the update and the room — and every
+   deletion through the room (deleting an item the room does not have yet, which would wait
+   as a pending delete for a future stamper item, is refused as `pending`). What it cannot
+   resolve (missing dependencies, origin cycles) is applied to a scratch copy of the room and
+   rejected if any server-only root changed or anything is left pending. A malformed update
    that makes decoding throw counts as forbidden too. Then close the connection with `4403`
    and do **not** apply the update. This applies to plain updates and to step-2 payloads
    alike (§4.1).
@@ -281,12 +296,15 @@ Body: `{allowed, reason, user:{id,name,anonymous}, artifact:{key,expires,ttl}}`.
   answer.
 - `user.anonymous: true` (the gate sends `id: null`, `name: "anonymous"`) is accepted only
   for keys inside `ANON_ALLOWED_PREFIXES` (default `pub/`); anything else is denied with
-  reason `anon_outside_pub`. The server composes the `anon:<NNNN>` pseudonym itself from
-  `?anon=`.
+  reason `anon_outside_pub`. The server composes the `anon:<NNNN>` pseudonym itself (§4:
+  server-assigned, `?anon=` only a hint).
 - `artifact.ttl` is an **integer number of days** (or null); valid values (0–999) are copied
   onto the canvas object as an S3 tag `ttl=<n>` (design §6.3). `artifact.expires` is an ISO
   8601 datetime (ACL `expires`, else lastModified + ttl) — a past value means expired even
-  when `allowed: true`, so canvas data never outlives the artifact.
+  when `allowed: true`, so canvas data never outlives the artifact. It is read only on an
+  `allowed: true` answer: the core tells `expired`/`object-missing` (and the expiry) only
+  to a visitor who would otherwise be allowed, and the canvas never derives `410` for a
+  denied one either, so a stranger always gets the plain `403`/`4403` (no existence leak).
 - `reason` is informational for the decision; the server only classifies it for expiry:
   expired → `expired`; gone → `object-missing` (gate: allowed-but-HEAD-404). Both
   configurable via `EXPIRED_REASONS` / `GONE_REASONS`.
@@ -319,7 +337,11 @@ artifact, and deletes objects whose artifact is gone or expired.
   identity; states for clientIds already owned by another connection are dropped.
 - **Limits** (anonymous gets the stricter set): messages `120/s` burst 240 (anon 30/60) →
   `4429`; message size 8 MiB (anon 2 MiB) → `4413`; document 20 MiB (anon 5 MiB) → `4413`;
-  room connections 50 (anon rooms 10; per anon visitor 2) → `1013`.
+  room connections 50 (anon rooms 10; per anon visitor 2) → `1013`. Every penalty is **per
+  connection**: an update that would grow the document past the sender's cap is refused and
+  only that connection is closed; the room stays open for everyone else.
+- **Origin** (§4): WebSocket upgrades only from `ALLOWED_ORIGINS`, else `4403`. The HTTP routes
+  are `GET`/`HEAD` only (no state-changing HTTP route exists).
 
 ## 11. Known model constraint
 

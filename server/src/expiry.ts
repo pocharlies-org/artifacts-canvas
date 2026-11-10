@@ -10,6 +10,10 @@ export type ArtifactState = 'alive' | 'expired' | 'gone';
 export function artifactState(res: AuthzResult, cfg: Config, now: number = Date.now()): ArtifactState {
   if (cfg.goneReasons.has(res.reason)) return 'gone';
   if (cfg.expiredReasons.has(res.reason)) return 'expired';
+  // No existence/expiry leak: the artifact's own expiry date only counts for a visitor the
+  // core allowed. A denied visitor is just denied (the core reports `expired` and
+  // `object-missing` only to visitors who would otherwise be allowed).
+  if (!res.allowed) return 'alive';
   const exp = res.artifact?.expires;
   if (exp) {
     const t = Date.parse(exp);

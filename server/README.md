@@ -25,7 +25,8 @@ server-side enforcement — is [`docs/protocol.md`](../docs/protocol.md).
   `history` are written by the server only; a client write to those roots closes the connection
   (`4403`) and is not applied.
 - Abuse limits (rate, message size, document size, room capacity), stricter for anonymous.
-- `/healthz`, `/readyz`, `/metrics` (Prometheus), structured pino logs.
+- `/healthz`, `/readyz` on the public listener; Prometheus `/metrics` on a separate internal
+  listener (`METRICS_PORT`, default 9091); structured pino logs.
 
 ## Requirements
 
@@ -68,12 +69,15 @@ an in-memory object store; the S3 store is covered against s3rver — no Docker 
 | `MAX_CONNS_PER_ROOM` / `MAX_CONNS_PER_ROOM_ANON` / `MAX_CONNS_PER_ANON_VISITOR` | `50` / `10` / `2` | Over capacity → close `1013`. |
 | `MSG_RATE_PER_SEC` / `MSG_BURST` | `120` / `240` | Over → NOTICE + `4429`. |
 | `ANON_MSG_RATE_PER_SEC` / `ANON_MSG_BURST` | `30` / `60` | |
-| `MAX_DOC_BYTES` / `ANON_MAX_DOC_BYTES` | `20 MiB` / `5 MiB` | Over → NOTICE + `4413`. |
+| `MAX_DOC_BYTES` / `ANON_MAX_DOC_BYTES` | `20 MiB` / `5 MiB` | An update that would grow the doc past the sender's cap → NOTICE + `4413` for that connection only. |
 | `MAX_MESSAGE_BYTES` / `ANON_MAX_MESSAGE_BYTES` | `8 MiB` / `2 MiB` | |
 | `MAX_IMAGE_BYTES` / `ANON_MAX_IMAGE_BYTES` | `2 MiB` / `1 MiB` | Advertised to the client in the wrapper config. |
 | `ARTIFACT_PREFIXES` | *(any valid key)* | Optional key-space allowlist (comma separated). |
 | `ANON_ALLOWED_PREFIXES` | `pub/` | Anonymous is only ever accepted here. |
 | `EXPIRED_REASONS` / `GONE_REASONS` | `expired` / `object-missing` | Authz `reason` values (core gate vocabulary) treated as expired / gone. |
+| `ALLOWED_ORIGINS` | origin of `ARTIFACT_BASE_URL` | Comma-separated browser origins (`scheme://host[:port]`) allowed to open the WebSocket; missing/`null`/foreign Origin → `4403`. |
+| `METRICS_PORT` / `METRICS_HOST` | `9091` / `0.0.0.0` | Internal Prometheus listener (`/metrics` only); `0` disables it. Never routed publicly. |
+| `ANON_COOKIE_SECRET` | *(random per process)* | Signs the anonymous-visitor cookie (server-assigned pseudonyms). |
 | `CANVAS_INJECT_CONFIG` | `true` | Inject the wrapper config element. |
 | `LOG_LEVEL` | `info` | pino level. |
 

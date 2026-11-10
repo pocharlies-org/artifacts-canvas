@@ -14,18 +14,28 @@ nameOverride: ""
 fullnameOverride: ""
 
 # --- Core plugin contract (design §8) ---
+# Defaults match the core chart (pocharlies-org/artifacts helm/artifacts): the gate is the
+# Service `artifact-gate` in namespace `sso` (decision port 8081), the login proxy is
+# mounted at /oauth2-artifacts/, and the routes are served by Traefik.
 core:
-  # Internal authz endpoint of the artifacts core (never the public URL).
-  gateAuthzUrl: "http://artifacts-core:8081/_gate/plugin/authz"
-  # Internal base URL the canvas server fetches artifact HTML from (frame route).
-  artifactBaseUrl: "http://artifacts-core:8080"
-  # Optional: where a visitor with no session is sent from the wrapper page, `{rd}` = the
-  # original path (URL-encoded). With the core chart: "/oauth2-artifacts/sign_in?rd={rd}".
-  # Empty = unauthenticated visitors get the plain 403.
-  loginUrl: ""
-  # Namespace label selector of the core's namespace, for the NetworkPolicy.
+  # The artifacts host (the core chart's `artifactsHost`). EXAMPLE value: replace it.
+  publicHost: artifacts.example.com
+  # The artifacts bucket (the core chart's `minio.bucket`); empty = s3.bucket.
+  bucket: ""
+  # Internal authz endpoint of the core's gate (never the public URL).
+  gateAuthzUrl: "http://artifact-gate.sso.svc.cluster.local:8081/_gate/plugin/authz"
+  # Where the frame route fetches artifact HTML, with the visitor's cookie: the core's EDGE
+  # (Traefik forwardAuth to the gate, then the gate-signed MinIO read), exactly like a browser
+  # read. Empty = https://<publicHost>/<bucket>.
+  artifactBaseUrl: ""
+  # Where a visitor with no session is sent from the wrapper page, `{rd}` = the original path
+  # (URL-encoded): the core chart's login proxy. Empty = unauthenticated visitors get a 403.
+  loginUrl: "/oauth2-artifacts/sign_in?rd={rd}"
+  # Browser origins allowed to open the WebSocket (CSWSH guard). Empty = https://<publicHost>.
+  allowedOrigins: []
+  # Namespace label selector of the core's namespace (the gate), for the NetworkPolicy.
   namespace:
-    kubernetes.io/metadata.name: artifacts
+    kubernetes.io/metadata.name: sso
 
 # --- Object storage (canvas documents) ---
 # The operator supplies the credentials secret (keys below); the core's bootstrap Job uses it
@@ -81,15 +91,26 @@ service:
   type: ClusterIP
   port: 8080
 
+# --- Metrics (Prometheus) ---
+# Served on their own internal port, never on the public route (the public listener answers
+# 404 for /metrics). Scrape <service>:<metrics.port>/metrics from the namespaces allowed below.
+metrics:
+  enabled: true
+  port: 9091
+
 # --- NetworkPolicy ---
-# Ingress to the canvas pods is allowed only from the ingress controller's namespace and
-# the core's namespace (the core's gate is called by the canvas, but co-allowing the core
-# keeps the pair connected if the ingress rewrites source). Egress is unrestricted: the
-# server must reach the core and the object store.
+# Ingress to the canvas pods: the http port only from the ingress controller's namespace and
+# the core's namespace (the canvas calls the gate, but co-allowing the core keeps the pair
+# connected if the ingress rewrites source); the metrics port only from metricsNamespaces.
+# Egress is unrestricted: the server must reach the core, its edge and the object store.
 networkPolicy:
   enabled: true
+  # The ingress controller's namespace (the core chart's routes are Traefik IngressRoutes).
   ingressNamespace:
-    kubernetes.io/metadata.name: ingress-nginx
+    kubernetes.io/metadata.name: traefik-system
+  # Namespaces allowed to scrape the metrics port (empty list = nobody).
+  metricsNamespaces:
+    - kubernetes.io/metadata.name: monitoring
 
 # Rooms are in-memory: with more than one replica, two pods would serve divergent rooms for
 # the same artifact unless the ingress does sticky routing per artifact key. Keep 1 until

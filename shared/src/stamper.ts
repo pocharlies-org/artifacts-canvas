@@ -217,35 +217,155 @@ export function attachStamper(doc: Y.Doc, opts: StamperOptions): () => void {
 }
 
 /**
- * Server-side guard: a client may never write the stamper-owned root types.
- * Returns the offending root name, or null when the update is acceptable.
- * Insertions are checked by decoding the update; deletions by looking up the
- * deleted items in `doc` (the room document the update would be applied to).
+ * Root types a client may write. Everything else — the stamper-owned roots `attribution`,
+ * `users` and `history`, and any root name the schema does not define — is server-only.
+ * An allow-list, so a future server-only root is protected without touching the guard.
+ */
+export const CLIENT_WRITABLE_ROOTS: ReadonlySet<string> = new Set<string>([ROOT.shapes, ROOT.assets, ROOT.meta]);
+
+/**
+ * Server-side guard (protocol §5.3): a client may only write the client-writable roots.
+ * Returns the name of the offending root (or a reason such as `pending`), or null when the
+ * update is acceptable. `doc` is the room document the update would be applied to; it is
+ * never modified.
+ *
+ * Fast path: every inserted struct is resolved to its root type. Yjs encodes `parent` only
+ * for items without neighbours; an item with a left/right origin travels with
+ * `parent === null` and inherits the parent of that origin, so the origin chain is followed
+ * through the update itself and the room document. Deletions are resolved through the
+ * room document. Anything the fast path cannot resolve (missing dependencies, cycles, a
+ * room with pending structs) goes to the slow path: the update is applied to a scratch
+ * copy of the room and every root changed by that transaction is checked — plus the update
+ * must integrate completely (no pending structs/deletes left behind that a later update
+ * could release into a forbidden root).
  */
 export function forbiddenRootWrite(doc: Y.Doc, update: Uint8Array): string | null {
-  const forbidden = new Set<string>([ROOT.attribution, ROOT.users, ROOT.history]);
+  const fast = fastRootCheck(doc, update);
+  if (fast !== UNRESOLVED) return fast;
+  return scratchRootCheck(doc, update);
+}
+
+const UNRESOLVED = Symbol('unresolved');
+/** A struct that Yjs integrates as garbage (a neighbour is GC): it writes nothing. */
+const GC_ROOT = Symbol('gc');
+type RootOf = string | typeof GC_ROOT;
+
+function fastRootCheck(doc: Y.Doc, update: Uint8Array): string | null | typeof UNRESOLVED {
+  if (doc.store.pendingStructs || doc.store.pendingDs) return UNRESOLVED;
   const decoded = Y.decodeUpdate(update);
+  // structs of the update, per client, sorted by clock (decodeUpdate keeps that order)
+  const own = new Map<number, Y.Item[]>();
   for (const s of decoded.structs) {
     if (!(s instanceof Y.Item)) continue;
-    const p = s.parent;
-    if (typeof p === 'string' && forbidden.has(p)) return p;
-    if (p && typeof p === 'object' && 'client' in p) {
-      const parentRoot = rootNameOfId(doc, p as Y.ID);
-      if (parentRoot && forbidden.has(parentRoot)) return parentRoot;
+    let arr = own.get(s.id.client);
+    if (!arr) own.set(s.id.client, (arr = []));
+    arr.push(s);
+  }
+  const findOwn = (id: Y.ID): Y.Item | null => {
+    const arr = own.get(id.client);
+    if (!arr) return null;
+    let lo = 0;
+    let hi = arr.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const it = arr[mid];
+      if (id.clock < it.id.clock) hi = mid - 1;
+      else if (id.clock >= it.id.clock + it.length) lo = mid + 1;
+      else return it;
+    }
+    return null;
+  };
+  const memo = new Map<Y.Item, RootOf>();
+
+  /** Root of the type that the item/GC at `id` lives in, or UNRESOLVED. */
+  const rootOfId = (id: Y.ID, depth: number): RootOf | typeof UNRESOLVED => {
+    const inUpdate = findOwn(id);
+    if (inUpdate) return rootOfStruct(inUpdate, depth + 1);
+    if (id.clock >= Y.getState(doc.store, id.client)) return UNRESOLVED;
+    let item: Y.Item | Y.GC;
+    try {
+      item = Y.getItem(doc.store, id) as Y.Item | Y.GC;
+    } catch {
+      return UNRESOLVED;
+    }
+    if (!(item instanceof Y.Item)) return GC_ROOT;
+    return rootNameOfType(item.parent as Y.AbstractType<unknown>, doc) ?? UNRESOLVED;
+  };
+
+  /** Root of the type the item `s` of the update is inserted into. */
+  const rootOfStruct = (s: Y.Item, depth: number): RootOf | typeof UNRESOLVED => {
+    const hit = memo.get(s);
+    if (hit !== undefined) return hit;
+    if (depth > 64) return UNRESOLVED; // deep origin chains or cycles: let the slow path decide
+    let r: RootOf | typeof UNRESOLVED;
+    const p = s.parent as unknown;
+    if (typeof p === 'string') r = p;
+    else if (p && typeof p === 'object' && 'client' in (p as object)) {
+      // parent = the type created by the item with this id: it lives where that item lives
+      const parentItem = findOwn(p as Y.ID);
+      if (parentItem) r = rootOfStruct(parentItem, depth + 1);
+      else {
+        const pid = p as Y.ID;
+        if (pid.clock >= Y.getState(doc.store, pid.client)) r = UNRESOLVED;
+        else {
+          let it: Y.Item | Y.GC;
+          try {
+            it = Y.getItem(doc.store, pid) as Y.Item | Y.GC;
+          } catch {
+            it = null as unknown as Y.GC;
+          }
+          if (!it) r = UNRESOLVED;
+          else if (!(it instanceof Y.Item)) r = GC_ROOT;
+          else r = rootNameOfType(it.parent as Y.AbstractType<unknown>, doc) ?? UNRESOLVED;
+        }
+      }
+    } else {
+      // parent omitted: Yjs takes the parent of the left origin, else of the right origin;
+      // if either neighbour is GC the item is integrated as GC.
+      const left = s.origin ? rootOfId(s.origin, depth) : null;
+      const right = s.rightOrigin ? rootOfId(s.rightOrigin, depth) : null;
+      if (left === UNRESOLVED || right === UNRESOLVED) r = UNRESOLVED;
+      else if (left === GC_ROOT || right === GC_ROOT) r = GC_ROOT;
+      else if (left !== null) r = left;
+      else if (right !== null) r = right;
+      else r = UNRESOLVED; // no parent and no origin: malformed
+    }
+    if (r !== UNRESOLVED) memo.set(s, r);
+    return r;
+  };
+
+  for (const arr of own.values()) {
+    for (const s of arr) {
+      const r = rootOfStruct(s, 0);
+      if (r === UNRESOLVED) return UNRESOLVED;
+      if (r !== GC_ROOT && !CLIENT_WRITABLE_ROOTS.has(r)) return r;
     }
   }
+
   for (const [client, ranges] of decoded.ds.clients) {
+    const known = Y.getState(doc.store, client);
     for (const r of ranges) {
       for (let clock = r.clock; clock < r.clock + r.len; ) {
+        if (clock >= known) {
+          // a delete of something the room does not have yet: only fine if the update
+          // itself inserts it (already checked above); otherwise it would wait as a
+          // pending delete for a future (stamper) item
+          const it = findOwn(Y.createID(client, clock));
+          if (!it) return 'pending';
+          clock = it.id.clock + it.length;
+          continue;
+        }
         let item: Y.Item | Y.GC;
         try {
           item = Y.getItem(doc.store, Y.createID(client, clock)) as Y.Item | Y.GC;
         } catch {
-          break;
+          return UNRESOLVED;
         }
-        if (item instanceof Y.Item) {
+        // already-deleted items are a no-op (a full-state update repeats the whole delete set)
+        if (item instanceof Y.Item && !item.deleted) {
           const root = rootNameOfType(item.parent as Y.AbstractType<unknown>, doc);
-          if (root && forbidden.has(root)) return root;
+          if (root === null) return UNRESOLVED;
+          if (!CLIENT_WRITABLE_ROOTS.has(root)) return root;
         }
         clock = item.id.clock + item.length;
       }
@@ -254,15 +374,33 @@ export function forbiddenRootWrite(doc: Y.Doc, update: Uint8Array): string | nul
   return null;
 }
 
-function rootNameOfId(doc: Y.Doc, id: Y.ID): string | null {
-  let item: Y.Item | Y.GC;
+/** Apply the update to a scratch copy of the room and inspect what actually changed. */
+function scratchRootCheck(doc: Y.Doc, update: Uint8Array): string | null {
+  const scratch = new Y.Doc({ gc: doc.gc });
+  Y.applyUpdate(scratch, Y.encodeStateAsUpdate(doc));
+  // pending structs/deletes the room already had are part of the state copied above, so an
+  // update that releases them into a forbidden root shows up as a change below
+  const hadPending = !!(doc.store.pendingStructs || doc.store.pendingDs);
+  let bad: string | null = null;
+  const onTr = (tr: Y.Transaction) => {
+    for (const t of tr.changed.keys()) {
+      const root = rootNameOfType(t as unknown as Y.AbstractType<unknown>, scratch);
+      if (root === null || !CLIENT_WRITABLE_ROOTS.has(root)) {
+        bad = bad ?? root ?? 'unknown';
+      }
+    }
+  };
+  scratch.on('afterTransaction', onTr);
   try {
-    item = Y.getItem(doc.store, id) as Y.Item | Y.GC;
-  } catch {
-    return null;
+    Y.applyUpdate(scratch, update);
+  } finally {
+    scratch.off('afterTransaction', onTr);
   }
-  if (!(item instanceof Y.Item)) return null;
-  return rootNameOfType(item.parent as Y.AbstractType<unknown>, doc);
+  const pending = !!(scratch.store.pendingStructs || scratch.store.pendingDs);
+  scratch.destroy();
+  if (bad) return bad;
+  if (pending && !hadPending) return 'pending';
+  return null;
 }
 
 function rootNameOfType(t: Y.AbstractType<unknown> | null, doc: Y.Doc): string | null {

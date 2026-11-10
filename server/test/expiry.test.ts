@@ -36,6 +36,11 @@ describe('artifactState (gate reason vocabulary)', () => {
       artifactState({ allowed: true, reason: 'ok', artifact: { expires: '2099-01-01T00:00:00Z' } }, cfg),
     ).toBe('alive');
   });
+  it('never derives expiry for a denied visitor (no existence/expiry leak)', () => {
+    expect(
+      artifactState({ allowed: false, reason: 'not-listed', artifact: { expires: '2020-01-01T00:00:00Z' } }, cfg),
+    ).toBe('alive');
+  });
   it('alive otherwise', () => {
     expect(artifactState({ allowed: true, reason: 'ok' }, cfg)).toBe('alive');
     expect(artifactState({ allowed: false, reason: 'forbidden' }, cfg)).toBe('alive');

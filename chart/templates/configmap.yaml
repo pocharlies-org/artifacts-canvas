@@ -7,7 +7,8 @@ metadata:
 data:
   # --- core plugin contract (docs: core repo docs/plugins.md) ---
   GATE_AUTHZ_URL: {{ .Values.core.gateAuthzUrl | quote }}
-  ARTIFACT_BASE_URL: {{ .Values.core.artifactBaseUrl | quote }}
+  ARTIFACT_BASE_URL: {{ include "artifacts-canvas.artifactBaseUrl" . | quote }}
+  ALLOWED_ORIGINS: {{ include "artifacts-canvas.allowedOrigins" . | quote }}
   {{- if .Values.core.loginUrl }}
   LOGIN_URL: {{ .Values.core.loginUrl | quote }}
   {{- end }}
@@ -21,6 +22,7 @@ data:
   {{- end }}
   # --- behaviour ---
   PORT: {{ int64 .Values.service.port | quote }}
+  METRICS_PORT: {{ ternary (int64 .Values.metrics.port) 0 .Values.metrics.enabled | quote }}
   AUTHZ_TIMEOUT_MS: {{ int64 .Values.config.authzTimeoutMs | quote }}
   AUTHZ_RECHECK_SECONDS: {{ int64 .Values.config.authzRecheckSeconds | quote }}
   FRAME_FETCH_TIMEOUT_MS: {{ int64 .Values.config.frameFetchTimeoutMs | quote }}

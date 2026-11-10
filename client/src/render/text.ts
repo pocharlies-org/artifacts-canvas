@@ -1,7 +1,10 @@
 import type { Font } from '../model/types';
 
+/** The bundled hand font (client/public/fonts, loaded by render/fonts.ts). */
+export const HAND_FAMILY = 'Shantell Sans';
+
 export const FONT_FAMILY: Record<Font, string> = {
-  draw: '"Comic Sans MS","Segoe Print","Bradley Hand","Chalkboard SE","Comic Neue",cursive',
+  draw: `"${HAND_FAMILY}","Comic Sans MS","Segoe Print","Bradley Hand","Chalkboard SE","Comic Neue",cursive`,
   sans: '-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif',
   serif: 'Georgia,"Times New Roman",Times,serif',
   mono: 'ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace',
@@ -21,6 +24,11 @@ function measureCtx(): CanvasRenderingContext2D | null {
 }
 
 const widthCache = new Map<string, number>();
+
+/** Forget measured widths (after a web font finishes loading the old ones are wrong). */
+export function clearMeasureCache() {
+  widthCache.clear();
+}
 
 export function measureWidth(text: string, font: Font, size: number): number {
   const key = `${font}|${size}|${text}`;

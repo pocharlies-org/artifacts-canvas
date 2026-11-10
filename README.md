@@ -92,8 +92,8 @@ Caddy routes `/_canvas/` to the canvas, the core bootstrap creates the S3 user `
 Compose v2.24+ and Node 22+.
 
 ```sh
-git clone -b feat/initial-import https://github.com/pocharlies-org/artifacts.git
-git clone -b feat/integrate https://github.com/pocharlies-org/artifacts-canvas.git
+git clone https://github.com/pocharlies-org/artifacts.git
+git clone https://github.com/pocharlies-org/artifacts-canvas.git
 cd artifacts-canvas/deploy/compose
 docker compose up -d --build --wait     # the core next to this repo: ../artifacts (else ARTIFACTS_CORE_DIR=...)
 ```
@@ -105,14 +105,15 @@ cd ../../../artifacts
 ARTIFACTS_ACCESS_KEY=minioadmin ARTIFACTS_SECRET_KEY=minioadmin \
 ARTIFACTS_WRITE_BASE=http://127.0.0.1:9000 ARTIFACTS_READ_BASE=http://127.0.0.1:8080 \
 ARTIFACTS_PLUGINS="canvas=/_canvas/" \
-  cli/publish.sh -u test@example.com,test2@example.com -t 7 report.html
+  cli/publish.sh -u test@example.com,test2@example.com -t 7 examples/report.html
 #   INDEX (deliver this link): http://127.0.0.1:8080/artifacts/u/<run>/index.html
 #     open with canvas: http://127.0.0.1:8080/_canvas/artifacts/u/<run>/index.html
 ```
 
 Open the canvas link in two browsers: without a session it sends you through oauth2-proxy to the Dex
-login and back. Dex has three dev users — `test@example.com` / `test-password`,
-`test2@example.com` / `test2-password`, `test3@example.com` / `test3-password` — so with the ACL above
+login and back. Dex has three dev users — `test@example.com` / `test-password` (*Test One*),
+`test2@example.com` / `test2-password` (*Test Two*), `test3@example.com` / `test3-password` (*Test
+Three*); the canvas shows those display names, the ACLs use the e-mails — so with the ACL above
 the first two collaborate and the third is refused. `-g pub` publishes an anonymous `pub/` artifact (the
 dev stack enables anonymous `pub/`; visitors appear as *Anónimo NNNN*). The stack is laptop-only: fixed dev
 credentials, every port bound to `127.0.0.1`.
@@ -125,12 +126,15 @@ npm run e2e:system      # ARTIFACTS_CORE_DIR defaults to ../artifacts
 ```
 
 It publishes with the core CLI and checks: two Dex users through the real login chain drawing together
-live (strokes before mouse-up, cursors with their names, server-stamped attribution); a user outside the
+live (strokes before mouse-up, cursors labelled with their display names, server-stamped attribution); a user outside the
 ACL refused on the page, the frame and the WebSocket (4403); anonymous drawing on `pub/` as *Anónimo
 NNNN* and refused on `u/`; persistence in MinIO at `_plugins/canvas/<key>.ydoc` (with the artifact's `ttl`
 tag) across a reload and a canvas container restart; revocation by editing `.acl.json` (the open session
 drops with 4403 within the re-check interval, 3 s + the 2 s ACL cache); the opaque-origin artifact iframe;
-and finally the core's own `deploy/compose/e2e.sh`, which must still pass with the plugin enabled.
+the adversarial cases (a forged `history` append, `attribution`/`users` overwrites, a foreign or missing
+`Origin`, the expired-artifact leak to a stranger, `/metrics` on the public route, an anonymous visitor
+filling the document, a client-chosen anonymous id); and finally the core's own `deploy/compose/e2e.sh`,
+which must still pass with the plugin enabled.
 
 Stop everything with `docker compose down -v` (from `deploy/compose/`).
 
@@ -152,7 +156,8 @@ The canvas is a core plugin (design §8): the core answers *who may see this art
    plugins:
      - name: canvas
        pathPrefix: /_canvas/
-       service: canvas-artifacts-canvas   # the canvas chart's Service
+       service: canvas-artifacts-canvas   # the canvas chart's Service (release `canvas`)
+       namespace: sso                     # where the canvas chart is installed
        port: 8080
        secretName: plugin-canvas-s3
    ```
@@ -163,14 +168,29 @@ The canvas is a core plugin (design §8): the core answers *who may see this art
 3. **Install the canvas chart** ([`chart/`](chart)), pointing at the core:
 
    ```sh
-   helm install canvas ./chart \
-     --set core.gateAuthzUrl=http://artifacts-core:8081/_gate/plugin/authz \
-     --set core.artifactBaseUrl=http://artifacts-core:8080 \
-     --set s3.bucket=artifacts
+   helm install canvas ./chart -n sso \
+     --set core.publicHost=artifacts.example.com \
+     --set s3.bucket=artifacts \
+     --set s3.endpoint=http://minio.minio.svc.cluster.local:9000
    ```
 
-   The chart ships the Deployment, Service, ConfigMap, ServiceAccount and a NetworkPolicy that allows ingress
-   only from the ingress controller's namespace and the core's namespace.
+   The defaults match the core chart, so `core.publicHost` (the core's `artifactsHost`) is the only
+   required value:
+
+   | Value | Default | Core chart object |
+   |---|---|---|
+   | `core.gateAuthzUrl` | `http://artifact-gate.sso.svc.cluster.local:8081/_gate/plugin/authz` | Service `artifact-gate` (ns `sso`), decision port `auth` 8081 (never routed publicly) |
+   | `core.artifactBaseUrl` | `https://<core.publicHost>/<bucket>` | the artifacts host's edge: Traefik forwardAuth to the gate, then the gate-signed MinIO read (the frame route fetches with the visitor's cookie, like a browser) |
+   | `core.loginUrl` | `/oauth2-artifacts/sign_in?rd={rd}` | `oauth2-proxy-artifacts` (`--proxy-prefix=/oauth2-artifacts`) |
+   | `core.allowedOrigins` | `[https://<core.publicHost>]` | the origin browsers open the canvas from (WebSocket Origin check) |
+   | `core.bucket` | `s3.bucket` | `minio.bucket` |
+   | `networkPolicy.ingressNamespace` | `traefik-system` | namespace of the Traefik controller serving the core's IngressRoutes |
+   | `core.namespace` | `sso` | `namespaces.sso` (the gate) |
+   | `metrics.port` / `networkPolicy.metricsNamespaces` | `9091` / `[monitoring]` | internal Prometheus port, not in any route |
+
+   The chart ships the Deployment, Service (`http` 8080, `metrics` 9091), ConfigMap, ServiceAccount and a
+   NetworkPolicy: `http` only from the ingress controller's namespace and the core's namespace, `metrics`
+   only from `networkPolicy.metricsNamespaces`.
 
 ## Configuration reference (server)
 
@@ -179,7 +199,7 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | Variable | Default | Meaning |
 |---|---|---|
 | `GATE_AUTHZ_URL` | — (required) | Core internal authz endpoint (`POST /_gate/plugin/authz`). |
-| `ARTIFACT_BASE_URL` | — (required) | Internal base URL to fetch artifact HTML (frame route). |
+| `ARTIFACT_BASE_URL` | — (required) | Base URL the frame route fetches artifact HTML from, with the visitor's cookie: the core's edge, e.g. `https://<artifacts host>/<bucket>` (chart default) or `http://caddy/artifacts` (compose). |
 | `S3_BUCKET` | — (required) | Bucket holding the artifacts and the canvas objects. |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Listen address. |
 | `S3_ENDPOINT` | (AWS default) | S3-compatible endpoint (MinIO, etc.). |
@@ -202,9 +222,12 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `MAX_CONNS_PER_ROOM` / `MAX_CONNS_PER_ROOM_ANON` / `MAX_CONNS_PER_ANON_VISITOR` | `50` / `10` / `2` | Room capacity (anon gets the stricter set); over capacity closes `1013`. |
 | `MSG_RATE_PER_SEC` / `MSG_BURST` | `120` / `240` | Per-connection message rate → `4429`. |
 | `ANON_MSG_RATE_PER_SEC` / `ANON_MSG_BURST` | `30` / `60` | Same for anonymous. |
-| `MAX_DOC_BYTES` / `ANON_MAX_DOC_BYTES` | `20 MiB` / `5 MiB` | Document size limit → `4413`. |
+| `MAX_DOC_BYTES` / `ANON_MAX_DOC_BYTES` | `20 MiB` / `5 MiB` | An update that would grow the document past the sender's cap is refused and only that connection closes `4413`; the room stays open. |
 | `MAX_MESSAGE_BYTES` / `ANON_MAX_MESSAGE_BYTES` | `8 MiB` / `2 MiB` | Message size limit → `4413`. |
 | `MAX_IMAGE_BYTES` / `ANON_MAX_IMAGE_BYTES` | `2 MiB` / `1 MiB` | Announced to the client as its paste cap. |
+| `ALLOWED_ORIGINS` | origin of `ARTIFACT_BASE_URL` | Comma-separated browser origins (`scheme://host[:port]`) allowed to open the WebSocket. A missing, `null` or foreign `Origin` is closed `4403` (cross-site WebSocket hijacking guard). |
+| `METRICS_PORT` / `METRICS_HOST` | `9091` / `0.0.0.0` | Internal Prometheus listener (`/metrics` only; `0` disables it). The public listener answers `404` for `/metrics`. |
+| `ANON_COOKIE_SECRET` | (random per process) | Signs the anonymous-visitor cookie: the server assigns the *Anónimo NNNN* pseudonym, `?anon=` is only a hint. |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. |
 
 ### Container image

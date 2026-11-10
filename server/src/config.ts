@@ -73,6 +73,22 @@ export interface Config {
   /** authz `reason` values that mean the artifact is gone (deleted / never existed). */
   goneReasons: Set<string>;
 
+  /**
+   * Browser origins allowed to open the canvas WebSocket (exact `scheme://host[:port]`).
+   * A missing, `null` or foreign Origin is refused with 4403 (cross-site WebSocket
+   * hijacking: the session cookie rides along on any cross-site upgrade). Default: the
+   * origin of ARTIFACT_BASE_URL, which in the core chart is the public artifacts host.
+   */
+  allowedOrigins: Set<string>;
+  /** Internal metrics listener (Prometheus `/metrics`); 0 disables it. Never routed publicly. */
+  metricsPort: number;
+  metricsHost: string;
+  /**
+   * Key that signs the anonymous-visitor cookie (server-assigned pseudonyms). Empty = a
+   * random key per process (pseudonyms then survive reloads but not a server restart).
+   */
+  anonCookieSecret: string;
+
   logLevel: string;
 }
 
@@ -93,6 +109,27 @@ function bool(env: NodeJS.ProcessEnv, name: string, def: boolean): boolean {
   const v = env[name];
   if (v === undefined || v === '') return def;
   return v === '1' || v.toLowerCase() === 'true';
+}
+function int(env: NodeJS.ProcessEnv, name: string, def: number): number {
+  const v = env[name];
+  if (v === undefined || v === '') return def;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0 || n > 65535) throw new Error(`${name} must be an integer 0..65535, got "${v}"`);
+  return n;
+}
+/** `scheme://host[:port]` only (what browsers send in Origin); throws otherwise. */
+export function normalizeOrigin(raw: string): string {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error(`invalid origin "${raw}"`);
+  }
+  if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.origin === 'null') throw new Error(`invalid origin "${raw}"`);
+  if (raw.replace(/\/+$/, '') !== u.origin && raw.replace(/\/+$/, '').toLowerCase() !== u.origin) {
+    throw new Error(`origin "${raw}" must be scheme://host[:port] with no path`);
+  }
+  return u.origin;
 }
 function list(env: NodeJS.ProcessEnv, name: string, def: string[]): string[] {
   const v = env[name];
@@ -152,8 +189,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // ACL expiry has passed, `object-missing` when the artifact object is gone (HEAD failed).
     expiredReasons: new Set(list(env, 'EXPIRED_REASONS', ['expired'])),
     goneReasons: new Set(list(env, 'GONE_REASONS', ['object-missing'])),
+    allowedOrigins: new Set(list(env, 'ALLOWED_ORIGINS', [new URL(artifactBaseUrl).origin]).map(normalizeOrigin)),
+    metricsPort: int(env, 'METRICS_PORT', 9091),
+    metricsHost: str(env, 'METRICS_HOST', '0.0.0.0'),
+    anonCookieSecret: str(env, 'ANON_COOKIE_SECRET', ''),
     logLevel: str(env, 'LOG_LEVEL', 'info'),
   };
+  if (cfg.metricsPort !== 0 && cfg.metricsPort === cfg.port) {
+    throw new Error('METRICS_PORT must differ from PORT (metrics are never served on the public listener)');
+  }
   if (cfg.loginUrl && !(/^\/[^/\\]/.test(cfg.loginUrl) || /^https?:\/\/[^/]+/.test(cfg.loginUrl))) {
     throw new Error('LOGIN_URL must be a same-host path (/...) or an http(s) URL');
   }

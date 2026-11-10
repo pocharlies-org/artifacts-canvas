@@ -9,7 +9,7 @@ import { createApp, type App } from '../src/app.js';
 import { MemoryCanvasObjectStore } from '../src/store.js';
 import { canvasObjectKey } from '../src/paths.js';
 import { startFakeCore, allowUser, allowAnon, type FakeCore } from './helpers/fakecore.js';
-import { TestClient, expectClose, waitFor } from './helpers/yclient.js';
+import { TEST_ORIGIN, TestClient, expectClose, waitFor } from './helpers/yclient.js';
 
 let core: FakeCore;
 let staticDir: string;
@@ -27,6 +27,8 @@ function makeCfg(overrides: Record<string, string> = {}): Config {
     SAVE_DEBOUNCE_MS: '50',
     READYZ_CACHE_MS: '10',
     PORT: String(++portSeq),
+    ALLOWED_ORIGINS: TEST_ORIGIN,
+    METRICS_PORT: '0',
     ...overrides,
   });
 }
@@ -169,6 +171,69 @@ describe('real client protocol: two y-websocket clients through the server', () 
   });
 });
 
+describe('stamper-root guard through the server (finding: origin-only items)', () => {
+  it('appending after the last history item (parent omitted in the update) closes 4403 and is NOT applied', async () => {
+    core.rules.set('pub/h.html', allowAnon());
+    core.rules.set('runs/h.html', allowUser('ana@corp', 'Ana'));
+    const app = await startApp();
+    const port = (app.server.address() as { port: number }).port;
+    for (const key of ['runs/h.html', 'pub/h.html']) {
+      const url = `ws://127.0.0.1:${port}/_canvas/_/ws/${key}`;
+      const honest = new TestClient(url);
+      await honest.connect();
+      honest.doc.transact(() => honest.doc.getMap('shapes').set('s1', shape()));
+      await waitFor(() => honest.doc.getArray('history').length === 1, 3000, 'server history line');
+      const attacker = new TestClient(url);
+      await attacker.connect();
+      await waitFor(() => attacker.doc.getArray('history').length === 1, 3000, 'attacker synced');
+      attacker.doc.getArray('history').push([{ t: 1, by: 'test@example.com', verb: 'delete', shapeId: 'zz', shapeType: 'geo' }]);
+      await expectClose(attacker, 4403);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(honest.doc.getArray('history').toArray().map((e) => (e as { by: string }).by)).toEqual([honest.identity!.id]);
+      // insert in the middle / overwrite an existing attribution entry: same answer
+      const a2 = new TestClient(url);
+      await a2.connect();
+      await waitFor(() => a2.doc.getArray('history').length === 1, 3000, 'a2 synced');
+      a2.doc.getArray('history').insert(0, [{ by: 'mallory' }]);
+      await expectClose(a2, 4403);
+      const a3 = new TestClient(url);
+      await a3.connect();
+      await waitFor(() => a3.doc.getMap('attribution').has('s1'), 3000, 'a3 synced');
+      a3.doc.getMap('attribution').set('s1', { createdBy: 'mallory', createdAt: 1, updatedBy: 'mallory', updatedAt: 1 });
+      await expectClose(a3, 4403);
+      await new Promise((r) => setTimeout(r, 150));
+      expect((honest.doc.getMap('attribution').get('s1') as { createdBy: string }).createdBy).toBe(honest.identity!.id);
+      honest.close();
+    }
+  });
+});
+
+describe('origin check on the WebSocket upgrade', () => {
+  it('missing, null and foreign Origin are refused with 4403 before authz; the allowed origin joins', async () => {
+    core.rules.set('runs/o.html', allowUser('ana@corp', 'Ana'));
+    const app = await startApp();
+    const url = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/o.html`;
+    const callsBefore = core.calls.length;
+    for (const origin of [null, 'null', 'https://evil.example.net', 'http://canvas.test.evil.example', 'http://canvas.test:81']) {
+      const c = new TestClient(url, undefined, origin);
+      await c.connect().catch(() => undefined);
+      await expectClose(c, 4403);
+      expect(c.identity, String(origin)).toBeNull();
+    }
+    expect(core.calls.length).toBe(callsBefore); // refused before any authz call
+    const ok = new TestClient(url, undefined, 'HTTP://CANVAS.TEST');
+    await ok.connect();
+    expect(ok.identity?.id).toBe('ana@corp');
+  });
+
+  it('ALLOWED_ORIGINS defaults to the origin of ARTIFACT_BASE_URL and rejects non-origins', () => {
+    const cfg = makeCfg({ ALLOWED_ORIGINS: '', ARTIFACT_BASE_URL: 'https://artifacts.example.com/artifacts' });
+    expect([...cfg.allowedOrigins]).toEqual(['https://artifacts.example.com']);
+    expect(() => makeCfg({ ALLOWED_ORIGINS: 'https://a.example.com/path' })).toThrow(/no path/);
+    expect(() => makeCfg({ ALLOWED_ORIGINS: '*' })).toThrow(/invalid origin/);
+  });
+});
+
 describe('authz enforcement', () => {
   it('denied visitor is refused with 4403 while an allowed one joins', async () => {
     core.rulesByCookie.set('good|runs/x.html', allowUser('ana@corp', 'Ana'));
@@ -237,12 +302,69 @@ describe('authz enforcement', () => {
     await expectClose(c, 4403);
   });
 
-  it('anonymous pub/ visitor gets the anon:NNNN pseudonym', async () => {
+  it('anonymous pub/ visitor gets the anon:NNNN pseudonym (the hint, when free) and a signed cookie', async () => {
     core.rules.set('pub/doc.html', allowAnon());
     const app = await startApp();
     const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/pub/doc.html?anon=4321`);
     await c.connect();
     expect(c.identity).toMatchObject({ id: 'anon:4321', name: 'Anónimo 4321', anonymous: true });
+    expect(c.setCookie).toMatch(/^canvas_anon=[A-Za-z0-9_-]{22}\.4321\.[A-Za-z0-9_-]{27}; Path=\/_canvas\/; Max-Age=\d+; HttpOnly; SameSite=Lax$/);
+  });
+
+  it('the server assigns anonymous ids: a client hint never collides with another live visitor', async () => {
+    core.rules.set('pub/anon.html', allowAnon());
+    const app = await startApp();
+    const url = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/pub/anon.html`;
+    const a = new TestClient(`${url}?anon=1234`);
+    await a.connect();
+    const cookieA = a.setCookie!.split(';')[0];
+    // another visitor (no cookie) asking for the same number gets a different one
+    const b = new TestClient(`${url}?anon=1234`);
+    await b.connect();
+    expect(a.identity!.id).toBe('anon:1234');
+    expect(b.identity!.id).toMatch(/^anon:\d{4}$/);
+    expect(b.identity!.id).not.toBe('anon:1234');
+    // the same visitor (its cookie) in a second tab keeps its pseudonym, whatever it hints
+    const a2 = new TestClient(`${url}?anon=9999`, cookieA);
+    await a2.connect();
+    expect(a2.identity!.id).toBe('anon:1234');
+    expect(a2.setCookie).toBeNull();
+    // a forged/tampered cookie is just ignored (new visitor), it cannot claim 1234
+    const forged = cookieA.replace(/\.1234\./, '.1234.').replace(/.$/, (ch) => (ch === 'A' ? 'B' : 'A'));
+    const f = new TestClient(`${url}?anon=1234`, forged);
+    await f.connect();
+    expect(f.identity!.id).not.toBe('anon:1234');
+    // non-numeric hints are ignored
+    const g = new TestClient(`${url}?anon=test@example.com`);
+    await g.connect();
+    expect(g.identity!.id).toMatch(/^anon:\d{4}$/);
+    // per-visitor cap counts the visitor (cookie), not the number it shows
+    const app2 = await startApp({ MAX_CONNS_PER_ANON_VISITOR: '2' });
+    const url2 = `ws://127.0.0.1:${(app2.server.address() as { port: number }).port}/_canvas/_/ws/pub/anon.html`;
+    const v1 = new TestClient(url2);
+    await v1.connect();
+    const ck = v1.setCookie!.split(';')[0];
+    const v2 = new TestClient(url2, ck);
+    await v2.connect();
+    const v3 = new TestClient(url2, ck);
+    await v3.connect().catch(() => undefined);
+    await expectClose(v3, 1013);
+    for (const x of [a, b, a2, f, g, v1, v2]) x.close();
+  });
+
+  it('expiry is never revealed to a denied visitor: 403/4403 and the canvas object stays', async () => {
+    const objKey = canvasObjectKey('_plugins/canvas', 'runs/leak.html');
+    store.objects.set(objKey, { body: new Uint8Array([1]) });
+    // an older core that still sent the artifact expiry to a non-listed visitor
+    core.rules.set('runs/leak.html', { allowed: false, reason: 'not-listed', artifact: { key: 'runs/leak.html', expires: '2020-01-01T00:00:00+00:00', ttl: 7 } } as never);
+    const app = await startApp();
+    const port = (app.server.address() as { port: number }).port;
+    expect((await http(makeCfg({ PORT: String(port) }), '/_canvas/runs/leak.html')).status).toBe(403);
+    const c = new TestClient(`ws://127.0.0.1:${port}/_canvas/_/ws/runs/leak.html`);
+    await c.connect().catch(() => undefined);
+    await expectClose(c, 4403);
+    expect(c.notices.some((n) => n.kind === 'expired')).toBe(false);
+    expect(store.objects.has(objKey)).toBe(true);
   });
 });
 
@@ -299,6 +421,34 @@ describe('abuse limits', () => {
     expect(c.notices.some((n) => n.kind === 'rate-limited')).toBe(true);
   });
 
+  it('an anonymous visitor filling the document is closed alone; the room stays open for everyone', async () => {
+    core.rules.set('pub/fill.html', allowAnon());
+    core.rulesByCookie.set('ana|pub/fill.html', allowUser('ana@corp', 'Ana'));
+    const app = await startApp({ MAX_DOC_BYTES: '200000', ANON_MAX_DOC_BYTES: '20000', ANON_MAX_MESSAGE_BYTES: '200000' });
+    const url = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/pub/fill.html`;
+    const anon = new TestClient(url);
+    await anon.connect();
+    anon.doc.getMap('assets').set('blob', 'x'.repeat(30_000));
+    await expectClose(anon, 4413);
+    expect(anon.notices.some((n) => n.kind === 'too-large')).toBe(true);
+    // a logged-in visitor joins, syncs and writes (no room-wide lock)
+    const ana = new TestClient(url, 'ana');
+    await ana.connect();
+    expect(ana.identity?.id).toBe('ana@corp');
+    await new Promise((r) => setTimeout(r, 100));
+    expect(ana.doc.getMap('assets').has('blob')).toBe(false); // the oversized update was not applied
+    ana.doc.getMap('assets').set('ok', 'y'.repeat(50_000)); // within the logged-in cap
+    const watcher = new TestClient(url, 'ana');
+    await watcher.connect();
+    await waitFor(() => watcher.doc.getMap('assets').has('ok'), 3000, 'ana write applied');
+    // and a new anonymous visitor can still join (read) the room
+    const anon2 = new TestClient(url);
+    await anon2.connect();
+    await waitFor(() => anon2.doc.getMap('assets').has('ok'), 3000, 'anon2 synced');
+    expect(anon2.closeCode).toBeNull();
+    for (const x of [ana, watcher, anon2]) x.close();
+  });
+
   it('oversized document closes the writer with 4413', async () => {
     core.rules.set('runs/big.html', allowUser('ana@corp', 'Ana'));
     const app = await startApp({ MAX_DOC_BYTES: '600', ANON_MAX_DOC_BYTES: '400' });
@@ -337,17 +487,25 @@ describe('abuse limits', () => {
 });
 
 describe('http routes', () => {
-  it('health, readiness and metrics', async () => {
-    const app = await startApp();
-    const cfg = makeCfg();
-    void cfg;
+  it('health and readiness public; metrics only on the internal listener', async () => {
+    const metricsPort = ++portSeq;
+    const app = await startApp({ METRICS_PORT: String(metricsPort), METRICS_HOST: '127.0.0.1' });
     const port = (app.server.address() as { port: number }).port;
     const h = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json();
     expect(h).toEqual({ ok: true });
     const r = await fetch(`http://127.0.0.1:${port}/readyz`);
     expect(r.status).toBe(200);
-    const m = await (await fetch(`http://127.0.0.1:${port}/metrics`)).text();
-    expect(m).toContain('canvas_rooms_active');
+    // public listener: 404 with and without the plugin prefix
+    for (const p of ['/metrics', '/_canvas/metrics']) {
+      const pr = await fetch(`http://127.0.0.1:${port}${p}`);
+      expect(pr.status, p).toBe(404);
+      expect(await pr.text()).not.toContain('canvas_rooms_active');
+    }
+    const m = await fetch(`http://127.0.0.1:${metricsPort}/metrics`);
+    expect(m.status).toBe(200);
+    expect(await m.text()).toContain('canvas_rooms_active');
+    expect((await fetch(`http://127.0.0.1:${metricsPort}/healthz`)).status).toBe(404);
+    expect(() => makeCfg({ METRICS_PORT: '8080', PORT: '8080' })).toThrow(/METRICS_PORT/);
     store.readyNow = false;
     await new Promise((res) => setTimeout(res, 10));
     const r2 = await fetch(`http://127.0.0.1:${port}/readyz`);

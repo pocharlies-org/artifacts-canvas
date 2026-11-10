@@ -3,6 +3,7 @@ import * as Y from 'yjs';
 import * as encoding from 'lib0/encoding';
 import * as awarenessProtocol from 'y-protocols/awareness';
 import { composeIdentity, sanitizeAwarenessUpdate } from '../src/identity.js';
+import { AnonIssuer, assignNum } from '../src/anon.js';
 import type { AuthzResult } from '../src/types.js';
 
 const identified: AuthzResult = {
@@ -17,7 +18,7 @@ describe('composeIdentity', () => {
     expect(composeIdentity(identified, '1234')).toMatchObject({ id: 'ana@corp', anonymous: false });
   });
 
-  it('uses a valid ?anon= pseudonym for anonymous visitors', () => {
+  it('uses the server-assigned pseudonym for anonymous visitors', () => {
     expect(composeIdentity(anonymous, '4321')).toMatchObject({
       id: 'anon:4321',
       name: 'Anónimo 4321',
@@ -25,11 +26,33 @@ describe('composeIdentity', () => {
       attribution: 'server',
     });
   });
+});
 
-  it('rejects malformed pseudonyms with a random one', () => {
-    const id = composeIdentity(anonymous, '99999; DROP');
-    expect(id.id).toMatch(/^anon:\d{4}$/);
-    expect(composeIdentity(anonymous, null).id).toMatch(/^anon:\d{4}$/);
+describe('anonymous pseudonyms are server-assigned (anon.ts)', () => {
+  it('signed cookie round-trips; tampering, other keys and malformed values are rejected', () => {
+    const a = new AnonIssuer('secret-a');
+    const v = a.visitor('', '4242');
+    expect(v).toMatchObject({ num: '4242', fresh: true });
+    const cookie = a.setCookie(v.nonce, v.num, true).split(';')[0];
+    expect(a.setCookie(v.nonce, v.num, true)).toContain('; Secure');
+    expect(a.parse(`other=1; ${cookie}`)).toEqual({ nonce: v.nonce, num: '4242' });
+    expect(a.visitor(cookie, '1111')).toMatchObject({ nonce: v.nonce, num: '4242', fresh: false });
+    expect(a.parse(cookie.replace('.4242.', '.4243.'))).toBeNull();
+    expect(new AnonIssuer('secret-b').parse(cookie)).toBeNull();
+    expect(a.parse('canvas_anon=garbage')).toBeNull();
+    // invalid hints fall back to a random number
+    for (const hint of ['99999; DROP', 'test@example.com', '0042', null]) {
+      expect(a.visitor('', hint).num).toMatch(/^[1-9]\d{3}$/);
+    }
+  });
+
+  it('assignNum keeps a free or own number and replaces one held by another visitor', () => {
+    const held = new Map([['1234', 'visitor-a']]);
+    expect(assignNum('1234', 'visitor-a', held)).toBe('1234');
+    expect(assignNum('5555', 'visitor-b', held)).toBe('5555');
+    const other = assignNum('1234', 'visitor-b', held);
+    expect(other).toMatch(/^\d{4}$/);
+    expect(other).not.toBe('1234');
   });
 });
 

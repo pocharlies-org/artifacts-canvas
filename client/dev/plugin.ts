@@ -1,7 +1,8 @@
 /*
  * Vite plugin: the development stack of the canvas client.
  *   GET  /                                   -> redirect to the sample artifact
- *   GET  /_canvas/<path>                     -> the wrapper page (index.html)
+ *   GET  /_canvas/<path>                     -> the wrapper page (index.html); with ?csp=prod it carries
+ *                                               the production wrapper CSP (e2e of fonts/export under CSP)
  *   GET  /_canvas/_/frame/<path>             -> dev/artifacts/<path> with reporter.js injected,
  *                                               served with "Content-Security-Policy: sandbox allow-scripts"
  *   GET  /_canvas/_/vendor/html-to-image.js
@@ -14,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import type { Plugin, ViteDevServer } from 'vite';
 import { WebSocketServer } from 'ws';
 import { devIdentity, getRoom } from './yroom';
+import { WRAPPER_CSP } from './csp';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
@@ -91,6 +93,7 @@ export function canvasDev(): Plugin {
         if (p.startsWith('/_canvas/') && !p.startsWith('/_canvas/_/')) {
           const html = await server.transformIndexHtml(req.url ?? '/', fs.readFileSync(path.join(root, 'index.html'), 'utf8'));
           res.setHeader('Content-Type', 'text/html; charset=utf-8');
+          if (url.searchParams.get('csp') === 'prod') res.setHeader('Content-Security-Policy', WRAPPER_CSP);
           res.end(html);
           return;
         }

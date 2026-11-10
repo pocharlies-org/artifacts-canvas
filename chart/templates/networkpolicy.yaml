@@ -26,4 +26,15 @@ spec:
       ports:
         - protocol: TCP
           port: {{ .Values.service.port }}
+    {{- if and .Values.metrics.enabled .Values.networkPolicy.metricsNamespaces }}
+    - from:
+        {{- range .Values.networkPolicy.metricsNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.metrics.port }}
+    {{- end }}
 {{- end }}

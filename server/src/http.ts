@@ -10,6 +10,7 @@ import type { RoomManager } from './rooms.js';
 import type { AuthzResult } from './types.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
 import type { CanvasObjectStore } from './store.js';
+import type { AnonIssuer } from './anon.js';
 
 export interface HttpDeps {
   cfg: Config;
@@ -19,6 +20,7 @@ export interface HttpDeps {
   log: Logger;
   metrics: Metrics;
   fetchImpl: typeof fetch;
+  anon: AnonIssuer;
 }
 
 /** The plugin prefix. The ingress may forward the full path or strip it; both work. */
@@ -130,10 +132,10 @@ export class HttpApp {
       res.end(ok ? '{"ready":true}' : '{"ready":false}');
       return;
     }
+    // /metrics is NOT served here: it lives on the internal metrics listener (METRICS_PORT),
+    // which no public route points at. On this listener it is an ordinary unknown path.
     if (p === '/metrics') {
-      res.statusCode = 200;
-      res.setHeader('content-type', this.deps.metrics.registry.contentType);
-      res.end(await this.deps.metrics.registry.metrics());
+      this.generic(res, 404);
       return;
     }
 
@@ -238,6 +240,12 @@ export class HttpApp {
     }
     res.statusCode = 200;
     for (const [k, v] of Object.entries(WRAPPER_HEADERS)) res.setHeader(k, v);
+    const anonymous = !gate.res.identity || gate.res.identity.anonymous;
+    if (anonymous && !this.deps.anon.parse(cookie)) {
+      // Anonymous visitor without a pseudonym yet: the server assigns one (anon.ts).
+      const v = this.deps.anon.visitor('', url.searchParams.get('anon'));
+      res.setHeader('set-cookie', this.deps.anon.setCookie(v.nonce, v.num, forwardedHttps(req)));
+    }
     res.end(req.method === 'HEAD' ? undefined : html);
   }
 
@@ -364,6 +372,34 @@ export class HttpApp {
     res.setHeader('content-type', 'text/html; charset=utf-8');
     res.end(req.method === 'HEAD' ? undefined : injectReporter(html, reporter));
   }
+}
+
+function forwardedHttps(req: IncomingMessage): boolean {
+  const xf = req.headers['x-forwarded-proto'];
+  return (Array.isArray(xf) ? xf[0] : xf ?? '').split(',')[0].trim().toLowerCase() === 'https';
+}
+
+/** Internal listener: Prometheus metrics only (METRICS_PORT, never routed publicly). */
+export function metricsHandler(metrics: Metrics) {
+  return (req: IncomingMessage, res: ServerResponse): void => {
+    const p = new URL(req.url ?? '/', 'http://internal').pathname;
+    if ((req.method === 'GET' || req.method === 'HEAD') && p === '/metrics') {
+      void metrics.registry.metrics().then(
+        (body) => {
+          res.statusCode = 200;
+          res.setHeader('content-type', metrics.registry.contentType);
+          res.end(req.method === 'HEAD' ? undefined : body);
+        },
+        () => {
+          res.statusCode = 500;
+          res.end();
+        },
+      );
+      return;
+    }
+    res.statusCode = 404;
+    res.end('not found');
+  };
 }
 
 /** Scripted callers (bearer token) must get the 403, never a login redirect. */

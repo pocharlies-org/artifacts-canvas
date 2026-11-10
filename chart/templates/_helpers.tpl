@@ -43,6 +43,29 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{/* The artifacts bucket: core.bucket, else s3.bucket. */}}
+{{- define "artifacts-canvas.bucket" -}}
+{{- default .Values.s3.bucket .Values.core.bucket -}}
+{{- end -}}
+
+{{/* Frame-route base URL: core.artifactBaseUrl, else the core's edge https://<publicHost>/<bucket>. */}}
+{{- define "artifacts-canvas.artifactBaseUrl" -}}
+{{- if .Values.core.artifactBaseUrl -}}
+{{- .Values.core.artifactBaseUrl -}}
+{{- else -}}
+{{- printf "https://%s/%s" (required "core.publicHost is required (the artifacts host) unless core.artifactBaseUrl is set" .Values.core.publicHost) (include "artifacts-canvas.bucket" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* WebSocket origin allow-list: core.allowedOrigins, else https://<publicHost>. */}}
+{{- define "artifacts-canvas.allowedOrigins" -}}
+{{- if .Values.core.allowedOrigins -}}
+{{- join "," .Values.core.allowedOrigins -}}
+{{- else -}}
+{{- printf "https://%s" (required "core.publicHost is required (the artifacts host) unless core.allowedOrigins is set" .Values.core.publicHost) -}}
+{{- end -}}
+{{- end -}}
+
 {{/* Digest-pinned image reference: repository@digest when digest is set, else repository:tag. */}}
 {{- define "artifacts-canvas.image" -}}
 {{- if .Values.image.digest -}}

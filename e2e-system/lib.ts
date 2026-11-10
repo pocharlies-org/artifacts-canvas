@@ -22,10 +22,11 @@ export const PROJECT = process.env.COMPOSE_PROJECT_NAME ?? 'artifacts';
 export const RECHECK_SECONDS = Number(process.env.SYSTEM_RECHECK_SECONDS ?? 3);
 export const ACL_CACHE_SECONDS = Number(process.env.SYSTEM_ACL_CACHE_SECONDS ?? 2);
 
+/** The core's Dex users; `name` is the display name (id_token `name` claim, via the gate). */
 export const USERS = {
-  user1: { email: 'test@example.com', password: 'test-password' },
-  user2: { email: 'test2@example.com', password: 'test2-password' },
-  user3: { email: 'test3@example.com', password: 'test3-password' },
+  user1: { email: 'test@example.com', password: 'test-password', name: 'Test One' },
+  user2: { email: 'test2@example.com', password: 'test2-password', name: 'Test Two' },
+  user3: { email: 'test3@example.com', password: 'test3-password', name: 'Test Three' },
 } as const;
 export type UserName = keyof typeof USERS;
 
@@ -174,10 +175,15 @@ export async function waitFor(fn: () => Promise<boolean> | boolean, timeoutMs: n
   }
 }
 
-/** Raw WebSocket probe from Node (no browser): resolves with the close code. */
+/**
+ * Raw WebSocket probe from Node (no browser): resolves with the close code. Sends the
+ * browser's Origin (BASE) unless `headers` overrides it (`origin: ''` = send none).
+ */
 export async function wsCloseCode(pathAndQuery: string, headers: Record<string, string> = {}): Promise<number> {
   const { WebSocket } = await import('ws');
-  const ws = new WebSocket(`${BASE.replace(/^http/, 'ws')}${pathAndQuery}`, { headers });
+  const h: Record<string, string> = { origin: BASE, ...headers };
+  if (h.origin === '') delete h.origin;
+  const ws = new WebSocket(`${BASE.replace(/^http/, 'ws')}${pathAndQuery}`, { headers: h });
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('socket neither closed nor refused')), 15_000);
     ws.on('close', (code) => { clearTimeout(t); resolve(code); });

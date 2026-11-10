@@ -6,6 +6,7 @@ import { Connection, anonPseudonym } from './collab/connection';
 import { Editor } from './editor/editor';
 import { buildChrome } from './ui/chrome';
 import { personColor } from './model/colors';
+import { loadHandFont } from './render/fonts';
 import type { Identity } from './model/types';
 
 const cfg = resolveConfig(location, document, import.meta.env.DEV);
@@ -27,6 +28,8 @@ const conn = new Connection(ydoc, { wsUrl: cfg.wsUrl, room: cfg.room, params, de
 const app = document.getElementById('app')!;
 const editor = new Editor(cfg, app, ydoc, conn);
 buildChrome(editor, app);
+// the bundled hand font: lay text out again once it replaces the fallback
+void loadHandFont(() => editor.renderer.invalidateAll());
 
 // Handle for tests and debugging; it has the same powers as the page itself.
 (window as unknown as { __canvas: unknown }).__canvas = { editor, ydoc, conn, Y };

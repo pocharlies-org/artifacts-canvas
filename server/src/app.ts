@@ -4,7 +4,8 @@ import { createLogger, type Logger } from './logging.js';
 import { Metrics } from './metrics.js';
 import { AuthzClient } from './authz.js';
 import { RoomManager } from './rooms.js';
-import { HttpApp } from './http.js';
+import { HttpApp, metricsHandler } from './http.js';
+import { AnonIssuer } from './anon.js';
 import { WsServer } from './ws.js';
 import { S3CanvasObjectStore, type CanvasObjectStore } from './store.js';
 
@@ -19,6 +20,8 @@ export interface AppDeps {
 
 export interface App {
   server: http.Server;
+  /** internal metrics listener (null when METRICS_PORT=0) */
+  metricsServer: http.Server | null;
   manager: RoomManager;
   metrics: Metrics;
   log: Logger;
@@ -36,30 +39,45 @@ export function createApp(deps: AppDeps): App {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const authz = new AuthzClient(cfg, log, metrics, fetchImpl);
   const manager = new RoomManager({ cfg, store, authz, log, metrics });
-  const httpApp = new HttpApp({ cfg, authz, manager, store, log, metrics, fetchImpl });
-  const wsApp = new WsServer({ cfg, authz, manager, log, metrics });
+  const anon = new AnonIssuer(cfg.anonCookieSecret);
+  const httpApp = new HttpApp({ cfg, authz, manager, store, log, metrics, fetchImpl, anon });
+  const wsApp = new WsServer({ cfg, authz, manager, log, metrics, anon });
+  const metricsServer = cfg.metricsPort ? http.createServer(metricsHandler(metrics)) : null;
 
   const server = http.createServer(httpApp.handler);
   server.on('upgrade', (req, socket, head) => wsApp.handleUpgrade(req, socket, head));
 
   return {
     server,
+    metricsServer,
     manager,
     metrics,
     log,
     listen(): Promise<void> {
-      return new Promise((resolve, reject) => {
+      return new Promise<void>((resolve, reject) => {
         server.once('error', reject);
         server.listen(cfg.port, cfg.host, () => {
           server.removeListener('error', reject);
           log.info({ port: cfg.port }, 'artifacts-canvas server listening');
           resolve();
         });
-      });
+      }).then(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            if (!metricsServer) return resolve();
+            metricsServer.once('error', reject);
+            metricsServer.listen(cfg.metricsPort, cfg.metricsHost, () => {
+              metricsServer.removeListener('error', reject);
+              log.info({ port: cfg.metricsPort }, 'metrics listener (internal)');
+              resolve();
+            });
+          }),
+      );
     },
     async close(): Promise<void> {
       await manager.shutdown('shutdown');
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (metricsServer) await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
     },
   };
 }

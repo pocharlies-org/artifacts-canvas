@@ -78,8 +78,9 @@ test('a. user1 + user2 log in through oauth2-proxy -> Dex and collaborate live w
   expect(new URL(p1.url()).pathname).toBe(canvasPath(priv));
   await editorReady(p1);
   await editorReady(p2);
-  expect(await me(p1)).toEqual({ id: USERS.user1.email, name: USERS.user1.email, anonymous: false });
-  expect(await me(p2)).toEqual({ id: USERS.user2.email, name: USERS.user2.email, anonymous: false });
+  // identity = the e-mail the gate verified; display name = the id_token `name` claim (Dex)
+  expect(await me(p1)).toEqual({ id: USERS.user1.email, name: USERS.user1.name, anonymous: false });
+  expect(await me(p2)).toEqual({ id: USERS.user2.email, name: USERS.user2.name, anonymous: false });
 
   // live: user2 sees user1's stroke while the mouse button is still down
   await draw(p1, [420, 380], 18, false);
@@ -103,14 +104,28 @@ test('a. user1 + user2 log in through oauth2-proxy -> Dex and collaborate live w
   const attr2 = await p1.evaluate((id) => (window as any).__canvas.editor.doc.attribution.get(id), s2.id);
   expect(attr2).toMatchObject({ createdBy: USERS.user2.email });
   const users = await p1.evaluate(() => (window as any).__canvas.editor.doc.users.toJSON());
-  expect(users[USERS.user1.email]).toMatchObject({ name: USERS.user1.email, anonymous: false });
-  expect(users[USERS.user2.email]).toMatchObject({ name: USERS.user2.email, anonymous: false });
+  expect(users[USERS.user1.email]).toMatchObject({ name: USERS.user1.name, anonymous: false });
+  expect(users[USERS.user2.email]).toMatchObject({ name: USERS.user2.name, anonymous: false });
 
-  // live cursors labelled with the Dex identity (name = e-mail from the gate)
+  // live cursors, name tags, avatars and the people panel show the display names, never e-mails
   await p2.mouse.move(760, 300, { steps: 4 });
-  await expect(p1.locator('.cursors .cursor .lbl', { hasText: USERS.user2.email })).toBeVisible({ timeout: 8_000 });
+  await expect(p1.locator('.cursors .cursor .lbl', { hasText: 'Test T.' })).toBeVisible({ timeout: 8_000 });
   await p1.mouse.move(820, 340, { steps: 4 });
-  await expect(p2.locator('.cursors .cursor .lbl', { hasText: USERS.user1.email })).toBeVisible({ timeout: 8_000 });
+  await expect(p2.locator('.cursors .cursor .lbl', { hasText: 'Test O.' })).toBeVisible({ timeout: 8_000 });
+  await expect(p2.locator(`g.name-tag[data-tag-for="${s1.id}"]`)).toHaveText('Test O.', { timeout: 8_000 });
+  await expect(p1.locator(`g.name-tag[data-tag-for="${s2.id}"]`)).toHaveText('Test T.', { timeout: 8_000 });
+  await expect(p1.locator(`[data-testid="avatars"] .av[data-user="${USERS.user2.name}"]`)).toHaveText('TT', { timeout: 8_000 });
+  expect(await p1.locator('[data-testid="avatars"] .av').evaluateAll((els) => els.map((e) => e.getAttribute('title')))).toEqual(
+    expect.arrayContaining([expect.stringContaining(USERS.user2.name)]),
+  );
+  const rows = (await p1.getByTestId('author-row').allInnerTexts()).join('\n');
+  expect(rows).toContain(USERS.user1.name);
+  expect(rows).toContain(USERS.user2.name);
+  for (const page of [p1, p2]) {
+    const visible = await page.locator('.cursors, g.name-tag, [data-testid="avatars"], [data-testid="author-row"]')
+      .evaluateAll((els) => els.map((e) => `${e.textContent ?? ''} ${e.querySelector('[title]')?.getAttribute('title') ?? ''}`));
+    expect(visible.join(' ')).not.toContain('@example.com');
+  }
 });
 
 test('b. user3 (not in the ACL) is refused the canvas page and the WebSocket', async ({ browser }) => {

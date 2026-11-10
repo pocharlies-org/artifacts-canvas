@@ -2,16 +2,16 @@ import type { AuthzResult, Identity } from './types.js';
 
 /**
  * Identity composition (protocol §4). The identity is ONLY ever derived from the authz
- * answer; the client's `?anon=NNNN` pseudonym is accepted (validated `^\d{4}$`) for
- * anonymous pub/ visitors and ignored for logged-in ones.
+ * answer. Logged-in visitors get the core's verified id/name; anonymous pub/ visitors get
+ * `anon:<num>`, where `num` is the pseudonym the SERVER assigned (see anon.ts) — never a
+ * client-chosen value.
  */
-export function composeIdentity(authz: AuthzResult, anonParam: string | null): Identity {
+export function composeIdentity(authz: AuthzResult, anonNum: string): Identity {
   const authIdentity = authz.identity;
   if (authIdentity && !authIdentity.anonymous) {
-    return authIdentity; // logged-in: the core's verified id/name, anon param ignored
+    return authIdentity; // logged-in: the core's verified id/name
   }
-  const p = anonParam && /^\d{4}$/.test(anonParam) ? anonParam : String(1000 + Math.floor(Math.random() * 9000));
-  return { id: `anon:${p}`, name: `Anónimo ${p}`, anonymous: true, attribution: 'server' };
+  return { id: `anon:${anonNum}`, name: `Anónimo ${anonNum}`, anonymous: true, attribution: 'server' };
 }
 
 // Awareness hardening (the `user` field forced to the verified identity, foreign
