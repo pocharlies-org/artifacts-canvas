@@ -3,7 +3,7 @@ import { expect, test } from '@playwright/test';
 import { dragBox, newRoom, open } from './helpers';
 
 test('export PNG and PDF of the current view and of the whole artifact', async ({ browser }) => {
-  const A = await open(browser, 'Daniel Ibáñez', newRoom('export'));
+  const A = await open(browser, 'Ana', newRoom('export'));
   const page = A.page;
   await page.keyboard.press('r');
   await dragBox(page, 450, 300, 700, 420);
@@ -87,7 +87,7 @@ function colorBox(page: import('@playwright/test').Page, png: Buffer, rgb: [numb
 
 // Regression: the "current view" PNG must be the visible viewport (same size x pixel ratio, same world region).
 for (const dpr of [1, 2]) test(`PNG of the current view matches the visible viewport at any pan and zoom (devicePixelRatio ${dpr})`, async ({ browser }) => {
-  const A = await open(browser, 'Daniel Ibáñez', newRoom('export-view'), { deviceScaleFactor: dpr });
+  const A = await open(browser, 'Ana', newRoom('export-view'), { deviceScaleFactor: dpr });
   const page = A.page;
   // a known camera: zoomed in to 150% and panned
   await page.evaluate(() => (window as any).__canvas.editor.setCamera({ z: 1.5, tx: -260, ty: -180 }));
@@ -173,7 +173,7 @@ for (const dpr of [1, 2]) test(`PNG of the current view matches the visible view
 
 // The "draw" hand font is bundled (Shantell Sans, same-origin woff2) and also used inside exports.
 test('bundled hand font loads under the wrapper CSP and is embedded in exports', async ({ browser }) => {
-  const A = await open(browser, 'Daniel Ibáñez', newRoom('export-font'), { prodCsp: true });
+  const A = await open(browser, 'Ana', newRoom('export-font'), { prodCsp: true });
   const page = A.page;
   // the CSP really is on the wrapper document
   const hdr = await page.evaluate(async () => (await fetch(location.href)).headers.get('content-security-policy'));

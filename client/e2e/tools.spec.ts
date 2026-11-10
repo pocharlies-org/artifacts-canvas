@@ -4,7 +4,7 @@ import { camera, dragBox, drawStroke, newRoom, open, shapes, wave } from './help
 const PNG_1x1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
 
 test('every tool creates its shape, with its shortcut', async ({ browser }) => {
-  const A = await open(browser, 'Daniel Ibáñez', newRoom('tools'));
+  const A = await open(browser, 'Ana', newRoom('tools'));
   const p = A.page;
   const last = async () => (await shapes(p)).sort((a, b) => a.index - b.index).at(-1);
 
@@ -59,8 +59,8 @@ test('every tool creates its shape, with its shortcut', async ({ browser }) => {
 });
 
 test('arrows bind to shapes and follow them when the shape moves', async ({ browser }) => {
-  const A = await open(browser, 'Daniel Ibáñez', newRoom('bind'));
-  const B = await open(browser, 'Marta Ruiz', A.page.url().match(/room=([^&]+)/)![1]);
+  const A = await open(browser, 'Ana', newRoom('bind'));
+  const B = await open(browser, 'Marta', A.page.url().match(/room=([^&]+)/)![1]);
   const p = A.page;
   await p.keyboard.press('r');
   await dragBox(p, 600, 400, 760, 480);
@@ -95,7 +95,7 @@ test('arrows bind to shapes and follow them when the shape moves', async ({ brow
 });
 
 test('select, marquee, move, resize, rotate, style, group, lock, eraser, delete', async ({ browser }) => {
-  const A = await open(browser, 'Daniel Ibáñez', newRoom('select'));
+  const A = await open(browser, 'Ana', newRoom('select'));
   const p = A.page;
   await p.keyboard.press('r');
   await dragBox(p, 400, 400, 500, 480);
@@ -168,7 +168,7 @@ test('select, marquee, move, resize, rotate, style, group, lock, eraser, delete'
 });
 
 test('camera: space-pan, hand, zoom buttons, zoom to fit, minimap, annotations toggle', async ({ browser }) => {
-  const A = await open(browser, 'Daniel Ibáñez', newRoom('camera'));
+  const A = await open(browser, 'Ana', newRoom('camera'));
   const p = A.page;
   await p.keyboard.press('d');
   await drawStroke(p, wave(400, 300, 8));
@@ -211,7 +211,7 @@ test('camera: space-pan, hand, zoom buttons, zoom to fit, minimap, annotations t
 });
 
 test('English UI is available', async ({ browser }) => {
-  const A = await open(browser, 'Daniel Ibáñez', newRoom('en'), { lang: 'en' });
+  const A = await open(browser, 'Ana', newRoom('en'), { lang: 'en' });
   await expect(A.page.getByTestId('present')).toHaveText('▶ Present');
   await expect(A.page.getByTestId('live')).toHaveText('Live');
   await A.close();

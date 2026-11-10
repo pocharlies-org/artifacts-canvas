@@ -46,25 +46,25 @@ describe('i18n', () => {
   });
   it('interpolates', () => {
     setLang('es');
-    expect(t('app.follow', { name: 'Daniel' })).toBe('Seguir a Daniel');
+    expect(t('app.follow', { name: 'Ana' })).toBe('Seguir a Ana');
     setLang('en');
-    expect(t('app.follow', { name: 'Daniel' })).toBe('Follow Daniel');
+    expect(t('app.follow', { name: 'Ana' })).toBe('Follow Ana');
     setLang('es');
   });
 });
 
 describe('people', () => {
-  const users = (id: string) => ({ ivan: { name: 'Iván Pérez', anonymous: false }, dan: { name: 'Daniel Ibáñez', anonymous: false } } as Record<string, { name: string; anonymous: boolean }>)[id];
+  const users = (id: string) => ({ ivan: { name: 'Iván Pérez', anonymous: false }, dan: { name: 'Ana Torres', anonymous: false } } as Record<string, { name: string; anonymous: boolean }>)[id];
   it('formats names', () => {
-    expect(shortName('Daniel Ibáñez')).toBe('Daniel I.');
+    expect(shortName('Ana Torres')).toBe('Ana T.');
     expect(shortName('Anónimo 4821', true)).toBe('Anónimo 4821');
     expect(firstName('Marta Ruiz')).toBe('Marta');
   });
   it('describes history lines like the mockup', () => {
     setLang('es');
-    expect(describeHistory({ t: 0, by: 'dan', verb: 'move', shapeId: 's', shapeType: 'geo', geo: 'rectangle', owner: 'ivan' }, users)).toBe('Daniel movió un rectángulo de Iván');
+    expect(describeHistory({ t: 0, by: 'dan', verb: 'move', shapeId: 's', shapeType: 'geo', geo: 'rectangle', owner: 'ivan' }, users)).toBe('Ana movió un rectángulo de Iván');
     expect(describeHistory({ t: 0, by: 'anon:4821', verb: 'create', shapeId: 's', shapeType: 'arrow' }, users)).toBe('Anónimo 4821 añadió una flecha');
-    expect(describeHistory({ t: 0, by: 'dan', verb: 'create', shapeId: 's', shapeType: 'draw', highlight: true }, users)).toBe('Daniel dibujó un resaltado');
+    expect(describeHistory({ t: 0, by: 'dan', verb: 'create', shapeId: 's', shapeType: 'draw', highlight: true }, users)).toBe('Ana dibujó un resaltado');
   });
   it('builds the hover card', () => {
     const now = new Date(2026, 10, 9, 10, 20).getTime();
@@ -73,7 +73,7 @@ describe('people', () => {
     const s = { id: 's', type: 'geo', geo: 'rectangle' } as never;
     expect(hoverLines(s, { createdBy: 'ivan', createdAt: created, updatedBy: 'dan', updatedAt: edited }, users, now)).toEqual([
       'Rectángulo · dibujado por Iván P.',
-      'hoy 10:14 · editado por Daniel I. 10:16',
+      'hoy 10:14 · editado por Ana T. 10:16',
     ]);
     expect(formatTime(now - 86400000, now)).toBe('ayer 10:20');
   });

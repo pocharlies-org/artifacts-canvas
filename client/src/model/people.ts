@@ -2,7 +2,7 @@ import { has, t } from '../i18n';
 import { personColor } from './colors';
 import type { Attribution, HistoryEntry, Shape, ShapeType, GeoKind, UserInfo } from './types';
 
-/** "Daniel Ibáñez" -> "Daniel I."; anonymous pseudonyms and single names stay as they are. */
+/** "Ana Torres" -> "Ana T."; anonymous pseudonyms and single names stay as they are. */
 export function shortName(name: string, anonymous = false): string {
   if (anonymous) return name;
   const parts = name.trim().split(/\s+/);
@@ -10,7 +10,7 @@ export function shortName(name: string, anonymous = false): string {
   return `${parts[0]} ${parts[parts.length - 1][0]}.`;
 }
 
-/** First name for history lines ("Daniel movió…"). */
+/** First name for history lines ("Ana movió…"). */
 export function firstName(name: string, anonymous = false): string {
   if (anonymous) return name;
   return name.trim().split(/\s+/)[0] || name;
@@ -67,7 +67,7 @@ export function describeHistory(e: HistoryEntry, users: (id: string) => UserInfo
   return t(key as never, { who: firstName(who.name, who.anonymous), what });
 }
 
-/** "Rectángulo · dibujado por Iván P." / "hoy 10:14 · editado por Daniel I. 10:16" */
+/** "Rectángulo · dibujado por Iván P." / "hoy 10:14 · editado por Ana T. 10:16" */
 export function hoverLines(s: Shape, a: Attribution | undefined, users: (id: string) => UserInfo | undefined, now = Date.now()): [string, string] {
   const type = shapeTypeLabel(s.type, s.type === 'geo' ? s.geo : undefined, s.type === 'draw' ? s.highlight : undefined);
   if (!a) return [type, ''];

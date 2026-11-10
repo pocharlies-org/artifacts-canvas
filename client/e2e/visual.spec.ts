@@ -8,11 +8,11 @@ const OUT = process.env.SCREENSHOT_DIR ?? 'screenshots';
 test('screenshots at 1440x900, 390x844 and 360x780', async ({ browser }) => {
   fs.mkdirSync(OUT, { recursive: true });
   const room = newRoom('visual');
-  const D = await open(browser, 'Daniel Ibáñez', room);
-  const M = await open(browser, 'Marta Ruiz', room);
-  const I = await open(browser, 'Iván Pérez', room);
+  const D = await open(browser, 'Ana', room);
+  const M = await open(browser, 'Marta', room);
+  const I = await open(browser, 'Iván', room);
   const d = D.page;
-  // Daniel: red circle around the hot bars, red hand text
+  // Ana: red circle around the hot bars, red hand text
   await d.locator('.sw[data-color="red"]').click();
   await d.keyboard.press('d');
   const ring: [number, number][] = [];
@@ -27,7 +27,7 @@ test('screenshots at 1440x900, 390x844 and 360x780', async ({ browser }) => {
   await d.keyboard.type('¡¡se triplica!!');
   await d.keyboard.press('Escape');
   await d.keyboard.press('Escape');
-  // Daniel: highlight the rows of the failing node
+  // Ana: highlight the rows of the failing node
   await d.locator('.sw[data-color="yellow"]').click();
   await d.keyboard.press('Shift+D');
   await drawStroke(d, [[285, 605], [700, 605], [1150, 605]]);
@@ -61,7 +61,7 @@ test('screenshots at 1440x900, 390x844 and 360x780', async ({ browser }) => {
   await d.screenshot({ path: `${OUT}/desktop-1440x900.png` });
 
   // phone
-  const P = await open(browser, 'Iván Pérez', room, { viewport: { width: 390, height: 844 } });
+  const P = await open(browser, 'Iván', room, { viewport: { width: 390, height: 844 } });
   await P.page.waitForTimeout(600);
   await P.page.screenshot({ path: `${OUT}/phone-390x844.png` });
   await P.page.locator('.panels-btn').click();
@@ -81,7 +81,7 @@ test('screenshots at 1440x900, 390x844 and 360x780', async ({ browser }) => {
     await P.page.waitForTimeout(450);
   }
   await P.page.screenshot({ path: `${OUT}/phone-390x844-toolbar-end.png` });
-  const S = await open(browser, 'Marta Ruiz', room, { viewport: { width: 360, height: 780 } });
+  const S = await open(browser, 'Marta', room, { viewport: { width: 360, height: 780 } });
   await S.page.waitForTimeout(600);
   await S.page.screenshot({ path: `${OUT}/phone-360x780.png` });
   for (const o of [D, M, I, P, S]) await o.close();

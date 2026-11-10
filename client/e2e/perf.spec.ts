@@ -33,7 +33,7 @@ async function measure(p: import('@playwright/test').Page, ms = 3000) {
 //   - the frame rate with 2,000 shapes is at least half of the empty page's, in the same browser.
 test.use({ headless: !process.env.PERF_HEADED });
 test('2,000 shapes: pan and zoom stay smooth', async ({ browser }) => {
-  const A = await open(browser, 'Daniel Ibáñez', newRoom('perf'));
+  const A = await open(browser, 'Ana', newRoom('perf'));
   const p = A.page;
   await measure(p, 500); // warm up
   const baseline = await measure(p);

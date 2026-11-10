@@ -3,8 +3,8 @@ import { camera, drawStroke, dragBox, newRoom, open, shapes, wave } from './help
 
 test('a stroke drawn in A appears in B before the mouse is released', async ({ browser }) => {
   const room = newRoom('live');
-  const A = await open(browser, 'Daniel Ibáñez', room);
-  const B = await open(browser, 'Marta Ruiz', room);
+  const A = await open(browser, 'Ana', room);
+  const B = await open(browser, 'Marta', room);
   await A.page.keyboard.press('d');
   await drawStroke(A.page, wave(600, 300), false);
   // mouse still down in A
@@ -22,8 +22,8 @@ test('a stroke drawn in A appears in B before the mouse is released', async ({ b
 
 test('attribution: names, counts, tags, hover card and history are right', async ({ browser }) => {
   const room = newRoom('attr');
-  const A = await open(browser, 'Daniel Ibáñez', room);
-  const B = await open(browser, 'Marta Ruiz', room);
+  const A = await open(browser, 'Ana', room);
+  const B = await open(browser, 'Marta', room);
   await A.page.keyboard.press('r');
   await dragBox(A.page, 450, 400, 650, 480);
   await A.page.keyboard.press('d');
@@ -33,14 +33,14 @@ test('attribution: names, counts, tags, hover card and history are right', async
 
   const rows = B.page.getByTestId('author-row');
   await expect(rows).toHaveCount(2);
-  await expect(rows.nth(0)).toContainText('Daniel Ibáñez');
+  await expect(rows.nth(0)).toContainText('Ana');
   await expect(rows.nth(0).getByTestId('author-count')).toHaveText('2');
-  await expect(rows.nth(1)).toContainText('Marta Ruiz');
+  await expect(rows.nth(1)).toContainText('Marta');
   await expect(rows.nth(1).getByTestId('author-count')).toHaveText('1');
 
   // coloured name tags
-  await expect(B.page.locator('g.name-tag', { hasText: 'Daniel I.' })).toHaveCount(2);
-  await expect(A.page.locator('g.name-tag', { hasText: 'Marta R.' })).toHaveCount(1);
+  await expect(B.page.locator('g.name-tag', { hasText: 'Ana' })).toHaveCount(2);
+  await expect(A.page.locator('g.name-tag', { hasText: 'Marta' })).toHaveCount(1);
 
   // B moves A's rectangle: history says so, hover card shows both names
   await B.page.keyboard.press('v');
@@ -48,14 +48,14 @@ test('attribution: names, counts, tags, hover card and history are right', async
   await B.page.mouse.down();
   await B.page.mouse.move(500, 470, { steps: 5 });
   await B.page.mouse.up();
-  await expect(A.page.getByTestId('history-entry').first()).toContainText('Marta movió un rectángulo de Daniel');
+  await expect(A.page.getByTestId('history-entry').first()).toContainText('Marta movió un rectángulo de Ana');
   await A.page.keyboard.press('v');
   await A.page.mouse.move(800, 520);
   await A.page.mouse.move(500, 470);
   const card = A.page.getByTestId('hovercard');
   await expect(card).toBeVisible();
-  await expect(card).toContainText('Rectángulo · dibujado por Daniel I.');
-  await expect(card).toContainText('editado por Marta R.');
+  await expect(card).toContainText('Rectángulo · dibujado por Ana');
+  await expect(card).toContainText('editado por Marta');
 
   // the eye toggle hides Marta's shapes in my view only
   await A.page.locator('[data-testid="author-row"]', { hasText: 'Marta' }).getByTestId('author-eye').click();
@@ -64,15 +64,15 @@ test('attribution: names, counts, tags, hover card and history are right', async
 
   // live cursors with names
   await B.page.mouse.move(300, 300);
-  await expect(A.page.getByTestId('remote-cursor')).toContainText('Marta R.');
+  await expect(A.page.getByTestId('remote-cursor')).toContainText('Marta');
   await A.close();
   await B.close();
 });
 
 test('sticky note text syncs while typing', async ({ browser }) => {
   const room = newRoom('note');
-  const A = await open(browser, 'Daniel Ibáñez', room);
-  const B = await open(browser, 'Marta Ruiz', room);
+  const A = await open(browser, 'Ana', room);
+  const B = await open(browser, 'Marta', room);
   await A.page.keyboard.press('n');
   await A.page.mouse.click(1000, 600);
   await expect(A.page.getByTestId('text-editor')).toBeFocused();
@@ -94,8 +94,8 @@ test('sticky note text syncs while typing', async ({ browser }) => {
 
 test('undo is per user: it only reverts my own change', async ({ browser }) => {
   const room = newRoom('undo');
-  const A = await open(browser, 'Daniel Ibáñez', room);
-  const B = await open(browser, 'Marta Ruiz', room);
+  const A = await open(browser, 'Ana', room);
+  const B = await open(browser, 'Marta', room);
   await A.page.keyboard.press('r');
   await dragBox(A.page, 400, 300, 500, 380);
   await B.page.keyboard.press('o');
@@ -116,14 +116,14 @@ test('undo is per user: it only reverts my own change', async ({ browser }) => {
 
 test('the laser pointer is live for others and never stored', async ({ browser }) => {
   const room = newRoom('laser');
-  const A = await open(browser, 'Daniel Ibáñez', room);
-  const B = await open(browser, 'Marta Ruiz', room);
+  const A = await open(browser, 'Ana', room);
+  const B = await open(browser, 'Marta', room);
   await A.page.keyboard.press('k');
   await A.page.mouse.move(500, 300);
   await A.page.mouse.down();
   for (let i = 0; i < 15; i++) await A.page.mouse.move(500 + i * 12, 300 + i * 4);
   await expect(B.page.getByTestId('laser-dot')).toHaveCount(1);
-  await expect(B.page.locator('svg.laser')).toContainText('láser · Daniel I.');
+  await expect(B.page.locator('svg.laser')).toContainText('láser · Ana');
   await A.page.mouse.up();
   expect(await shapes(A.page)).toHaveLength(0);
   expect(await A.page.evaluate(() => (window as any).__canvas.ydoc.getMap('shapes').size)).toBe(0);
@@ -139,11 +139,11 @@ test('the laser pointer is live for others and never stored', async ({ browser }
 
 test('Presentar: the others follow the presenter until they pan themselves', async ({ browser }) => {
   const room = newRoom('present');
-  const A = await open(browser, 'Daniel Ibáñez', room);
-  const B = await open(browser, 'Marta Ruiz', room);
+  const A = await open(browser, 'Ana', room);
+  const B = await open(browser, 'Marta', room);
   await A.page.getByTestId('present').click();
   await expect(A.page.getByTestId('present')).toContainText('Dejar de presentar');
-  await expect(B.page.getByTestId('banner')).toContainText('Daniel I. está presentando');
+  await expect(B.page.getByTestId('banner')).toContainText('Ana está presentando');
   // presenter scrolls and zooms
   await A.page.mouse.move(700, 450);
   await A.page.mouse.wheel(0, 900);
@@ -165,7 +165,7 @@ test('Presentar: the others follow the presenter until they pan themselves', asy
   await A.page.mouse.wheel(0, 600);
   await A.page.waitForTimeout(300);
   expect(await camera(B.page)).toEqual(bBefore);
-  // "Seguir a Daniel" follows again
+  // "Seguir a Ana" follows again
   await B.page.getByTestId('follow').click();
   await expect.poll(async () => Math.abs((await centre(A.page)).y - (await centre(B.page)).y) < 2).toBe(true);
   await A.close();
@@ -174,7 +174,7 @@ test('Presentar: the others follow the presenter until they pan themselves', asy
 
 test('strokes stay anchored to the artifact element after scrolling', async ({ browser }) => {
   const room = newRoom('anchor');
-  const A = await open(browser, 'Daniel Ibáñez', room);
+  const A = await open(browser, 'Ana', room);
   const frame = A.page.frameLocator('iframe.artifact-frame');
   const row = frame.locator('#row-billing');
   const before = (await row.boundingBox())!;
