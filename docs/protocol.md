@@ -194,7 +194,14 @@ interface Identity {
   plain client update. Without it, a reconnected client's next edit depended on clocks the room
   never received and was refused as `pending`. A process that is shutting down joins nobody
   (close `4503`), so a reconnect always lands on the next process.
-- **Client step 1** (state vector): the server answers with step 2 of the content for that vector.
+- **Client step 1** (state vector): the server answers with step 2 of the content for that
+  vector **merged with the state vector the connection was sent in full at join** (every later
+  change was broadcast to it): no state vector, empty or forged, gets the whole room a second
+  time. The first answer of a connection is free; every later one is charged by its size to the
+  connection's sync budget (`SYNC_BYTES_PER_SEC` / `SYNC_BURST_BYTES`), and a later step 1 with an
+  empty state vector closes `4429`. Nothing is computed for a peer whose outgoing buffer is over
+  `WS_MAX_BUFFERED_BYTES` (beyond the join burst): it is dropped (fv4 H1: 200 four-byte step 1
+  messages from a socket that never read buffered 3 GB in the server).
 - **Client step 2** and **client update** carry the same payload, `varUint8Array(update)`
   (y-protocols `writeSyncStep2` = `varUint8Array(encodeStateAsUpdate(doc, sv))` — there is **no**
   state vector in a step 2). Both are guarded (§5.3) and applied with the connection as
@@ -225,9 +232,10 @@ server announces `attribution: 'server'` and MUST:
    observes the content transaction and derives the created / updated / deleted shape ids from
    it alone (`transaction.changed`, its deletions), attributes them to the verified identity of
    the connection that sent it, and writes the ledger with origin `artifacts-canvas:stamper`:
-   - `attribution[shapeId] = {createdBy, createdAt, updatedBy, updatedAt}` (ms epoch;
-     `updatedAt` refreshed at most every 5 s per user; the entry is kept when the shape is
-     deleted so an undo restores the original author),
+   - `attribution[shapeId] = {createdBy, createdAt, updatedBy, updatedAt, deletedAt?}` (ms
+     epoch; `updatedAt` refreshed at most every 5 s per user; the entry is kept when the shape
+     is deleted so an undo restores the original author, with `deletedAt` set; the server
+     prunes it `ATTRIBUTION_RETENTION_DAYS` after the delete),
    - `users[userId] = {name, anonymous, color?}` for the user who made the change,
    - `history.push({t, by, verb, shapeId, shapeType, geo?, highlight?, owner?})`, verbs
      `create | move | resize | rotate | edit | style | delete | order | group | lock`,
@@ -262,10 +270,18 @@ server announces `attribution: 'server'` and MUST:
    - `shapes-schema` / `assets-schema` / `meta-schema`: §6 — for every new item at a field key,
      a deleted (`ContentDeleted`) one included (it deletes the value there: a live shape's
      `type` can never go away).
-   What the fast path cannot resolve (origin cycles, very long chains, a `type` both replaced
-   and erased in one update) is applied to a scratch copy of the content and rejected if a
-   non-content root changed, a touched value breaks §6, Yjs threw, or anything is left pending.
-   A malformed update that makes decoding throw counts as forbidden too.
+   The check is one pass, O(update) plus a binary search per room lookup: origin chains of any
+   length are followed iteratively and memoised, and a delete range walks the room's struct
+   array once. There is **no slow path**: the scratch copy of the room it used to rebuild for
+   every update it could not resolve cost O(room) per message (fv4 H2: a 46-byte update took
+   966 ms on a 7.7 MB room). What the single pass cannot resolve — an origin cycle, an item
+   with neither parent nor origin, a room item outside every root, nesting deeper than the
+   schema allows (`malformed`), a shape's `type` overwritten twice in one update
+   (`shapes-schema`; clients never change a shape's type) — is refused; no honest Yjs encoder
+   produces any of it. A malformed update that makes decoding throw counts as forbidden too.
+   Each connection also has a **CPU budget** (`CPU_MS_PER_SEC` / `CPU_BURST_MS`): the time the
+   server spends on its messages is charged to it, and a sender that keeps the event loop busy
+   is closed `4429`.
    **Whatever the apply does, the room never keeps pending state**: `applyGuarded` drops any
    parked structs/deletes in a `finally` — also when `Y.applyUpdate` throws half-way (a throw
    used to skip that check and leave the room pending, refusing every later writer as
@@ -278,9 +294,12 @@ server announces `attribution: 'server'` and MUST:
    awareness claim only blocks ids that have no clocks yet. (An id with clocks from a document
    stored before the bindings existed is bound by its first writer.)
 6. **Overwrite the awareness `user` field** of every awareness update from a connection with
-   that connection's identity (`awarenessProtocol.modifyAwarenessUpdate`), so live cursors and
-   labels cannot lie either. States for clientIds already owned by another connection are
-   dropped.
+   that connection's identity, so live cursors and labels cannot lie either. States for
+   clientIds already owned by another connection are dropped. Every state is reduced to the
+   presence schema of §6 (`cleanPresenceState`: only the known fields, typed and bounded, a
+   field that does not fit is dropped; `laser.pts` at most 60 points; a state over 16 KiB of
+   JSON is dropped unread), and the client applies the same check to what it receives (fv4 M3:
+   `{laser: {pts: null}, status: 5}` made every other viewer throw).
 
 `attribution: 'client'` exists only for development against a plain relay (e.g.
 `npx y-websocket`): the client then runs the same stamper for its own transactions, into a
@@ -311,13 +330,17 @@ strings ≤ 1024; the **style enums come from shared allow-lists**: `color` ∈ 
 `none semi solid pattern`, `dash` ∈ `solid dashed dotted draw`, `size` ∈ `s m l xl`, `font` ∈
 `draw sans serif mono`, `arrowheads` ∈ `none end both dot`; `geo` one of `GEO_KINDS`;
 `start`/`end` terminals `{x, y, bind?: {shapeId, nx, ny}}` with no other keys and a plain
-prototype; `text` a `Y.Text` (or a string) holding text; `points` a `Y.Array` (or array) of
+prototype; `text` a `Y.Text` (or a string) of **at most 10 000 characters** (`MAX_TEXT_LENGTH`,
+counted across inserts and deletes; the client renders at most that many of whatever a document
+holds — fv4 H3); `points` a `Y.Array` (or array) of
 finite numbers, **at most 300 000** (`MAX_POINTS`), counted across appends; unknown fields only
 plain JSON values, never nested types. **Forbidden keys**: `__proto__`, `constructor`,
 `prototype` are never a shape id, a field name, an asset id, a meta key, or a key inside a JSON
 value (a decoder assigns `o[key] = v`, so such a key gives the value an attacker-chosen
-prototype); map keys are 1–256 chars. `assets` values are strings; `meta` values plain JSON (no
-nested types). The client reader also needs both terminals on lines/arrows, uses the map key as
+prototype); map keys are 1–256 chars. `assets` values are **base64 data URLs of a raster image**,
+`data:image/(png|jpeg|gif|webp);base64,…`, and nothing else (`ASSET_DATA_URL`; the client
+renders nothing else either and re-encodes other pasted formats as PNG — fv4 M2: an asset
+`/oauth2/sign_out` logged every viewer out); `meta` values plain JSON (no nested types). The client reader also needs both terminals on lines/arrows, uses the map key as
 the shape id, reads only the known shape fields into a null-prototype object, falls back to the
 default for a style value outside its allow-list, and renders each shape in its own try/catch
 (one bad shape never aborts a render pass).
@@ -434,12 +457,19 @@ that is gone or expired.
   update the guard refuses, closes `4403` and is **not** applied (`checkClientUpdate`, throw
   treated as forbidden); the apply itself never leaves pending state (`applyGuarded`).
 - **Awareness hardening** (§5.4): the `user` field is overwritten with the verified
-  identity; states for clientIds already owned by another connection are dropped.
+  identity; states for clientIds already owned by another connection are dropped; every state
+  is reduced to the presence schema.
 - **Limits** (anonymous gets the stricter set): messages `120/s` burst 240 (anon 30/60) →
-  `4429`; message size 8 MiB (anon 2 MiB) → `4413`; document 20 MiB (anon 5 MiB) → `4413`;
-  room connections 50 (anon rooms 10; per anon visitor 2) → `1013`. Every penalty is **per
-  connection**: an update that would grow the document past the sender's cap is refused and
-  only that connection is closed; the room stays open for everyone else.
+  `4429`; message size 8 MiB (anon 2 MiB) → `4413`; room size 20 MiB (anon 5 MiB), **content
+  plus ledger** → `4413` (an update that only deletes always passes); room connections 50 (anon
+  rooms 10; per anon visitor 2) → `1013`; joins per user 30/min burst 20 (per anonymous visitor
+  10/min burst 6, per room for anonymous visitors 60/min burst 30) → `4429`; sync answers after
+  the first 1 MiB/s burst 4 MiB (anon 256 KiB/s, 1 MiB) → `4429`; CPU 250 ms/s burst 5 s (anon
+  60 ms/s, 1 s) → `4429`; outgoing buffer 8 MiB beyond the join burst → dropped. Every penalty
+  is **per connection** (joins: per principal): an update that would grow the room past the
+  sender's cap is refused and only that connection is closed; the room stays open for everyone
+  else. Attribution entries of shapes deleted more than `ATTRIBUTION_RETENTION_DAYS` (30) ago
+  are pruned from the ledger.
 - **Origin** (§4): WebSocket upgrades only from `ALLOWED_ORIGINS`, else `4403`. The HTTP routes
   are `GET`/`HEAD` only (no state-changing HTTP route exists).
 

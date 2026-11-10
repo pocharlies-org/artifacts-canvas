@@ -10,7 +10,7 @@ import { canvasLedgerKey, canvasObjectKey } from './paths.js';
 import type { CanvasObjectStore } from './store.js';
 import type { Identity } from './types.js';
 import { attachStamper, dropPending, encodeIntegratedState, hasPending } from '@pocharlies/artifacts-canvas-shared/stamper';
-import { bindWriters, materializeContent, materializeLedger, migrateLegacyRoots, writerOf } from '@pocharlies/artifacts-canvas-shared/ledger';
+import { bindWriters, materializeContent, materializeLedger, migrateLegacyRoots, pruneAttribution, writerOf } from '@pocharlies/artifacts-canvas-shared/ledger';
 import { MSG_SYNC, encodeLedger } from '@pocharlies/artifacts-canvas-shared/protocol';
 import type { TokenBucket } from './limits.js';
 
@@ -29,6 +29,18 @@ export interface Conn {
   /** awareness clientIds this connection has claimed (protocol §5.4 hardening) */
   clientIds: Set<number>;
   rate: TokenBucket;
+  /** bytes of sync step-2 answers after the first one (fv4 H1) */
+  syncBytes: TokenBucket;
+  /** server CPU time (ms) spent on this connection's messages (fv4 H2) */
+  cpu: TokenBucket;
+  /** sync step 1 messages answered so far (the first answer is free, whatever it costs) */
+  step1Answers: number;
+  /**
+   * The content state vector this connection was sent in full at join. Every later change
+   * is broadcast to it, so a step 1 is answered against this merged with the client's own
+   * vector: no state vector, however forged, gets the whole room again (fv4 H1).
+   */
+  joinSv: Map<number, number>;
   recheckTimer?: ReturnType<typeof setInterval>;
   closing: boolean;
 }
@@ -57,8 +69,14 @@ export class Room {
   readonly ledger = materializeLedger(new Y.Doc());
   readonly awareness = new awarenessProtocol.Awareness(this.doc);
   readonly conns = new Map<WebSocket, Conn>();
-  /** rough doc size estimate; refreshed exactly when it crosses the limit or on save */
+  /** content size: exact at load and at every save, plus the accepted updates since */
   approxBytes = 0;
+  /** rough ledger size estimate (it counts against the size cap too, fv4 M4) */
+  ledgerApproxBytes = 0;
+  /** bumped on every change of either document (cache key of the encodings below) */
+  private version = 0;
+  private stateCache: { version: number; content: Uint8Array; ledger: Uint8Array } | null = null;
+  private lastPrune = 0;
   ttlTag: string | null = null;
   private saveTimer?: ReturnType<typeof setTimeout>;
   private dirty = false;
@@ -93,12 +111,15 @@ export class Room {
       writeUpdate(e, update);
       const msg = encoding.toUint8Array(e);
       // Everyone but the sender (it has the update already).
+      this.version++;
       for (const c of this.conns.values()) if (c !== origin) sendWs(c.ws, msg);
       if (origin !== 'load') this.markDirty();
     });
     // The ledger goes to everyone, the sender included (it learns its own attribution here).
     this.ledger.on('update', (update: Uint8Array, origin: unknown) => {
       const msg = encodeLedger(update);
+      this.version++;
+      this.ledgerApproxBytes += update.byteLength;
       for (const c of this.conns.values()) sendWs(c.ws, msg);
       if (origin !== 'load') this.markDirty();
     });
@@ -119,6 +140,17 @@ export class Room {
         for (const conn of this.conns.values()) sendWs(conn.ws, msg);
       },
     );
+  }
+
+  /**
+   * The integrated state of both documents, encoded once per version: every join sends both
+   * in full, so N joins of an unchanged room cost one encoding, not N.
+   */
+  fullState(): { content: Uint8Array; ledger: Uint8Array } {
+    if (!this.stateCache || this.stateCache.version !== this.version) {
+      this.stateCache = { version: this.version, content: encodeIntegratedState(this.doc), ledger: encodeIntegratedState(this.ledger) };
+    }
+    return this.stateCache;
   }
 
   get objectKey(): string {
@@ -144,6 +176,7 @@ export class Room {
       // ledger first, so a migration below sees what the ledger already holds
       if (ledgerBytes && ledgerBytes.byteLength > 0) {
         Y.applyUpdate(this.ledger, ledgerBytes, 'load');
+        this.ledgerApproxBytes = ledgerBytes.byteLength;
         if (dropPending(this.ledger)) {
           log.warn({ room: this.name }, 'stored ledger had pending structs: dropped');
           metrics.pendingDropped.inc({ where: 'load' });
@@ -168,6 +201,7 @@ export class Room {
           this.markDirty();
         }
       }
+      this.prune();
       metrics.loads.inc({ outcome: 'ok' });
     } catch (err) {
       metrics.loads.inc({ outcome: 'error' });
@@ -204,9 +238,11 @@ export class Room {
           log.error({ room: this.name }, 'room had pending structs at save: dropped');
           metrics.pendingDropped.inc({ where: 'save' });
         }
+        if (Date.now() - this.lastPrune > 3600_000) this.prune();
         const ledgerBytes = encodeIntegratedState(this.ledger);
         const bytes = encodeIntegratedState(this.doc);
         this.approxBytes = bytes.byteLength;
+        this.ledgerApproxBytes = ledgerBytes.byteLength;
         await store.put(this.ledgerKey, ledgerBytes, this.ttlTag ?? undefined);
         await store.put(this.objectKey, bytes, this.ttlTag ?? undefined);
         metrics.saves.inc({ outcome: 'ok' });
@@ -219,6 +255,14 @@ export class Room {
       }
     });
     return this.saving;
+  }
+
+  /** Drop attribution entries of shapes deleted longer ago than the retention (fv4 M4). */
+  prune(): void {
+    this.lastPrune = Date.now();
+    const days = this.deps.cfg.attributionRetentionDays;
+    const n = pruneAttribution(this.doc, this.ledger, this.lastPrune, days * 86400_000);
+    if (n) this.deps.log.info({ room: this.name, pruned: n }, 'attribution of long-deleted shapes pruned');
   }
 
   /** Cancel the debounce and persist now (last leave / shutdown). */
@@ -297,6 +341,36 @@ export class Room {
   }
 }
 
+/** Outgoing-buffer cap of a connection and what to do when it is passed (see limitBuffered). */
+const bufferLimits = new WeakMap<WebSocket, { cap: number; onOver: () => void }>();
+
+/**
+ * Cap what the server queues for `ws` (fv4 H1): once its unsent bytes pass `cap`, the next
+ * send drops the connection (terminate: a close frame would only queue behind the backlog)
+ * instead of buffering without bound for a peer that stopped reading.
+ */
+export function limitBuffered(ws: WebSocket, cap: number, onOver: () => void): void {
+  bufferLimits.set(ws, { cap, onOver });
+}
+
+/** True while `ws` is under its outgoing-buffer cap (always for an unlimited socket). */
+export function underBufferCap(ws: WebSocket): boolean {
+  const l = bufferLimits.get(ws);
+  return !l || ws.bufferedAmount <= l.cap;
+}
+
 export function sendWs(ws: WebSocket, msg: Uint8Array): void {
-  if (ws.readyState === ws.OPEN) ws.send(msg);
+  if (ws.readyState !== ws.OPEN) return;
+  const l = bufferLimits.get(ws);
+  if (l && ws.bufferedAmount > l.cap) {
+    bufferLimits.delete(ws);
+    l.onOver();
+    try {
+      ws.terminate();
+    } catch {
+      /* already gone */
+    }
+    return;
+  }
+  ws.send(msg);
 }

@@ -105,7 +105,7 @@ export function seededRoom(clock: { t: number }): Room {
     }
   }
   users[0].transact(() => {
-    users[0].getMap('assets').set('a1', 'data:x');
+    users[0].getMap('assets').set('a1', 'data:image/png;base64,AAAA');
     users[0].getMap('meta').set('pageWidth', 1200);
   });
   sync(users[0], 'u1');
@@ -357,7 +357,7 @@ export function runFuzz(iterations: number, seed0 = 1): FuzzResult {
         const pts = m.get('points');
         if (pts instanceof Y.Array) pts.push([1, 2, 0.5]);
         else m.set('points', Y.Array.from([1, 2, 3]));
-      } else d.getMap(pick(['assets', 'meta'])).set(pick(['a1', 'pageWidth', 'k', 'constructor']), pick(['data:x', 1200, { n: 1 }, null]));
+      } else d.getMap(pick(['assets', 'meta'])).set(pick(['a1', 'pageWidth', 'k', 'constructor']), pick(['data:image/png;base64,AAAA', 'data:x', '/oauth2/sign_out', 1200, { n: 1 }, null]));
     }
     const decoded = Y.decodeUpdate(Y.encodeStateAsUpdate(d, sv));
     const structs = decoded.structs as (Y.Item | Y.GC)[];

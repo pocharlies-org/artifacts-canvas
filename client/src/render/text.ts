@@ -1,5 +1,6 @@
 import type { Font } from '../model/types';
 import { own } from '../model/colors';
+import { MAX_TEXT_LENGTH } from '@pocharlies/artifacts-canvas-shared/model';
 
 /** The bundled hand font (client/public/fonts, loaded by render/fonts.ts). */
 export const HAND_FAMILY = 'Shantell Sans';
@@ -55,10 +56,37 @@ export interface TextLayout {
   lineHeight: number;
 }
 
-/** Wrap `text` to `maxWidth` (or not at all when null). Explicit newlines are kept. */
+/**
+ * Longest prefix of `word` (at least one character) that fits in `maxWidth`. Galloping then
+ * binary search: O(log k) measurements of at most 2k characters, k = the answer. The old
+ * character-by-character shrink was O(n) measurements of O(n) characters per line — cubic
+ * in the length of one unbroken word (fv4 H3: 6000 characters froze a viewer for 42 s).
+ */
+function fittingPrefix(word: string, font: Font, size: number, maxWidth: number): number {
+  let lo = 1; // fits (or is the one character a line always takes)
+  let hi = 2;
+  while (hi <= word.length && measureWidth(word.slice(0, hi), font, size) <= maxWidth) {
+    lo = hi;
+    hi *= 2;
+  }
+  hi = Math.min(hi, word.length + 1); // first length known (or assumed) not to fit
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (measureWidth(word.slice(0, mid), font, size) <= maxWidth) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * Wrap `text` to `maxWidth` (or not at all when null). Explicit newlines are kept. At most
+ * MAX_TEXT_LENGTH characters are laid out (the server refuses longer text; a document
+ * written before that limit is shown truncated instead of freezing the tab).
+ */
 export function layoutText(text: string, font: Font, size: number, maxWidth: number | null): TextLayout {
   const lineHeight = size * LINE_HEIGHT;
   const out: string[] = [];
+  if (text.length > MAX_TEXT_LENGTH) text = text.slice(0, MAX_TEXT_LENGTH);
   for (const para of text.split('\n')) {
     if (maxWidth === null) {
       out.push(para);
@@ -69,18 +97,23 @@ export function layoutText(text: string, font: Font, size: number, maxWidth: num
     for (const word of words) {
       if (!word) continue;
       const candidate = line + word;
-      if (line && measureWidth(candidate.trimEnd(), font, size) > maxWidth) {
+      if (measureWidth(candidate.trimEnd(), font, size) <= maxWidth) {
+        line = candidate;
+        continue;
+      }
+      if (line.trim()) {
         out.push(line.trimEnd());
         line = word.trimStart();
-        // a single word longer than the width is broken by characters
-        while (line && measureWidth(line, font, size) > maxWidth && line.length > 1) {
-          let cut = line.length - 1;
-          while (cut > 1 && measureWidth(line.slice(0, cut), font, size) > maxWidth) cut--;
-          out.push(line.slice(0, cut));
-          line = line.slice(cut);
-        }
       } else {
-        line = candidate;
+        line = candidate.trimStart();
+      }
+      // a word longer than the width is broken by characters; the line kept is the rest,
+      // which fits (only fitting text is ever measured again for the next word)
+      while (line.length > 1) {
+        const cut = fittingPrefix(line, font, size, maxWidth);
+        if (cut >= line.length) break;
+        out.push(line.slice(0, cut));
+        line = line.slice(cut);
       }
     }
     out.push(line.trimEnd());

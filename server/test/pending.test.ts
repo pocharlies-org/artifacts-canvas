@@ -205,7 +205,7 @@ describe('pending state never enters the room (fv2 finding 1)', () => {
     const r = checkClientUpdate(room, newShape(1001, 's1'), { mayWriteClient: (c) => c !== 1001 });
     expect(r.bad).toBe('foreign-client');
     const ok = checkClientUpdate(room, newShape(1002, 's2'), { mayWriteClient: (c) => c !== 1001 });
-    expect(ok).toEqual({ bad: null, writers: [1002] });
+    expect(ok).toEqual({ bad: null, writers: [1002], grows: true });
   });
 
   it('a forged copy of a known struct cannot redirect an origin chain (Yjs keeps the room copy)', () => {

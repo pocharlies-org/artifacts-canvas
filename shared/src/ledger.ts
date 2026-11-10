@@ -81,3 +81,31 @@ export function bindWriters(ledger: Y.Doc, clients: number[], principal: string)
     for (const c of fresh) w.set(String(c), principal);
   }, STAMP_ORIGIN);
 }
+
+/**
+ * Forget the attribution of shapes that are gone for good (fv4 M4: create/delete cycles
+ * left a full attribution entry per shape id forever). An entry is pruned when its shape is
+ * not in `content` and was deleted more than `retentionMs` ago (`deletedAt`, written by the
+ * stamper on delete; kept until then so that an undo restores the original author). An
+ * entry for a missing shape without `deletedAt` (stored before it existed) starts its clock
+ * now. History lines are left alone (the history is capped on its own). Returns the number
+ * of pruned entries.
+ */
+export function pruneAttribution(content: Y.Doc, ledger: Y.Doc, now: number, retentionMs: number): number {
+  const shapes = content.getMap<unknown>(ROOT.shapes);
+  const attribution = ledger.getMap<Attribution>(ROOT.attribution);
+  const drop: string[] = [];
+  const start: [string, Attribution][] = [];
+  for (const [id, a] of attribution.entries()) {
+    if (shapes.has(id)) continue;
+    const at = a && typeof a === 'object' ? (a as Attribution).deletedAt : undefined;
+    if (typeof at !== 'number') start.push([id, a]);
+    else if (now - at > retentionMs) drop.push(id);
+  }
+  if (!drop.length && !start.length) return 0;
+  ledger.transact(() => {
+    for (const id of drop) attribution.delete(id);
+    for (const [id, a] of start) attribution.set(id, { ...a, deletedAt: now });
+  }, STAMP_ORIGIN);
+  return drop.length;
+}

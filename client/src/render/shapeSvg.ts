@@ -8,6 +8,7 @@ import {
 } from '../geometry/shapes';
 import { type Pt, seededRandom } from '../geometry/vec';
 import { FONT_FAMILY, escapeXml, layoutText } from './text';
+import { assetValueOk } from '@pocharlies/artifacts-canvas-shared/model';
 
 export interface RenderEnv extends GeomCtx {
   asset(id: string): string | undefined;
@@ -232,7 +233,9 @@ export function shapeMarkup(s: Shape, env: RenderEnv): string {
     }
     case 'image': {
       const href = env.asset(s.assetId);
-      if (!href) {
+      // only a raster data URL is ever put in href: any other string (a same-origin URL such
+      // as /oauth2/sign_out, an SVG) would be fetched by every viewer's browser (fv4 M2)
+      if (!href || !assetValueOk(href)) {
         return `<rect width="${n(s.w)}" height="${n(s.h)}" fill="#f3f4f6" stroke="#d1d5db"/>`;
       }
       return `<image href="${escapeXml(href)}" x="0" y="0" width="${n(s.w)}" height="${n(s.h)}" preserveAspectRatio="none"/>`;

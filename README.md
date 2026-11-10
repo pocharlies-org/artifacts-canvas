@@ -230,7 +230,12 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `MAX_CONNS_PER_ROOM` / `MAX_CONNS_PER_ROOM_ANON` / `MAX_CONNS_PER_ANON_VISITOR` | `50` / `10` / `2` | Room capacity (anon gets the stricter set); over capacity closes `1013`. |
 | `MSG_RATE_PER_SEC` / `MSG_BURST` | `120` / `240` | Per-connection message rate → `4429`. |
 | `ANON_MSG_RATE_PER_SEC` / `ANON_MSG_BURST` | `30` / `60` | Same for anonymous. |
-| `MAX_DOC_BYTES` / `ANON_MAX_DOC_BYTES` | `20 MiB` / `5 MiB` | An update that would grow the document past the sender's cap is refused and only that connection closes `4413`; the room stays open. |
+| `MAX_DOC_BYTES` / `ANON_MAX_DOC_BYTES` | `20 MiB` / `5 MiB` | Content **plus ledger**: an update that would grow the room past the sender's cap is refused and only that connection closes `4413`; the room stays open, and an update that only deletes always passes. |
+| `WS_MAX_BUFFERED_BYTES` | `8 MiB` | A peer that stops reading is dropped once the server holds this much unsent data for it (beyond the join burst). |
+| `SYNC_BYTES_PER_SEC` / `SYNC_BURST_BYTES` | `1 MiB` / `4 MiB` | Bytes of sync step-2 answers after the first one of a connection → `4429`; a later step 1 with an empty state vector closes `4429` at once. Anonymous: `ANON_SYNC_BYTES_PER_SEC` / `ANON_SYNC_BURST_BYTES` (`256 KiB` / `1 MiB`). |
+| `JOIN_RATE_PER_MIN` / `JOIN_BURST` | `30` / `20` | Joins per signed-in user → `4429`. Anonymous: `ANON_JOIN_RATE_PER_MIN` / `ANON_JOIN_BURST` (`10` / `6`) per visitor, and `ANON_ROOM_JOIN_RATE_PER_MIN` / `ANON_ROOM_JOIN_BURST` (`60` / `30`) per room. |
+| `CPU_MS_PER_SEC` / `CPU_BURST_MS` | `250` / `5000` | Server CPU time a connection's messages may use → `4429`. Anonymous: `ANON_CPU_MS_PER_SEC` / `ANON_CPU_BURST_MS` (`60` / `1000`). |
+| `ATTRIBUTION_RETENTION_DAYS` | `30` | Attribution entries of shapes deleted longer ago than this are pruned from the ledger. |
 | `MAX_MESSAGE_BYTES` / `ANON_MAX_MESSAGE_BYTES` | `8 MiB` / `2 MiB` | Message size limit → `4413`. |
 | `MAX_IMAGE_BYTES` / `ANON_MAX_IMAGE_BYTES` | `2 MiB` / `1 MiB` | Announced to the client as its paste cap. |
 | `ALLOWED_ORIGINS` | origin of `ARTIFACT_BASE_URL` | Comma-separated browser origins (`scheme://host[:port]`) allowed to open the WebSocket. A missing, `null` or foreign `Origin` is closed `4403` (cross-site WebSocket hijacking guard). |

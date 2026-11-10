@@ -1,6 +1,6 @@
 import * as Y from 'yjs';
 import {
-  ROOT, SHAPE_FIELDS, STYLE_ENUMS, keyOk, shapeFieldProblem, shapeRecordProblem, type ShapeFieldKind,
+  MAX_TEXT_LENGTH, ROOT, SHAPE_FIELDS, STYLE_ENUMS, assetValueOk, keyOk, shapeFieldProblem, shapeRecordProblem, type ShapeFieldKind,
 } from '@pocharlies/artifacts-canvas-shared/model';
 import {
   DEFAULT_STYLE, STYLE_KEYS,
@@ -45,7 +45,9 @@ export function readShape(m: unknown, key?: string): Shape | null {
   for (const [k, v] of (m as Y.Map<unknown>).entries()) {
     if (!SHAPE_FIELDS.has(k)) continue;
     if (v instanceof Y.Text) {
-      o[k] = v.toString();
+      // at most MAX_TEXT_LENGTH characters reach the renderer (the server refuses more; a
+      // longer text stored before that limit is shown truncated, still selectable/deletable)
+      o[k] = v.toString().slice(0, MAX_TEXT_LENGTH);
       fields.set(k, [o[k], 'text']);
     } else if (v instanceof Y.Array) {
       o[k] = v.toArray();
@@ -55,8 +57,9 @@ export function readShape(m: unknown, key?: string): Shape | null {
     } else {
       // an invalid style enum (or opacity) is dropped: the default applies below
       if ((Object.hasOwn(STYLE_ENUMS, k) || k === 'opacity') && shapeFieldProblem(k, v)) continue;
-      o[k] = k === 'start' || k === 'end' ? cleanTerminal(v) : v;
-      fields.set(k, [v, 'value']);
+      const val = k === 'text' && typeof v === 'string' ? v.slice(0, MAX_TEXT_LENGTH) : v;
+      o[k] = k === 'start' || k === 'end' ? cleanTerminal(val) : val;
+      fields.set(k, [val, 'value']);
     }
   }
   if (shapeRecordProblem(fields, true)) return null;
@@ -460,8 +463,11 @@ export class CanvasDoc {
     return Array.from(out);
   }
 
-  setAsset(id: string, dataUrl: string) {
+  /** Store an image asset; only raster data URLs (assetValueOk, what the server accepts). */
+  setAsset(id: string, dataUrl: string): boolean {
+    if (!assetValueOk(dataUrl)) return false;
     this.transact(() => this.assets.set(id, dataUrl), 'asset');
+    return true;
   }
 
   pageWidth(fallback: number): number {

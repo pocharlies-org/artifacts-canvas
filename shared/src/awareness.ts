@@ -10,6 +10,60 @@ export function awarenessUser(id: Identity): Record<string, unknown> {
   return u;
 }
 
+/** Most laser points a state may carry (the client publishes the last 60). */
+export const MAX_LASER_POINTS = 60;
+/** Longest awareness state accepted, as JSON (anything bigger is dropped unread). */
+export const MAX_AWARENESS_STATE_BYTES = 16 * 1024;
+const MAX_ID = 512;
+const MAX_NAME = 256;
+
+const isObj = (v: unknown): v is Record<string, unknown> =>
+  !!v && typeof v === 'object' && !Array.isArray(v) && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null);
+const num = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= 1e15;
+const str = (v: unknown, max: number): v is string => typeof v === 'string' && v.length <= max;
+
+/**
+ * The presence schema (protocol §5.4): a copy of `state` with only the fields the client
+ * uses, each with the right type and bounds; a field that does not fit is dropped (null for
+ * the nullable ones). The server applies it to every awareness state before relaying it
+ * (fv4 M3: `{laser:{pts:null}, status:5}` broke every other viewer, a 60 000-point laser
+ * froze them); the client applies it again to whatever it receives. `user` is kept only when
+ * it is well formed (the server overwrites it with the verified identity anyway).
+ */
+export function cleanPresenceState(state: unknown): Record<string, unknown> | null {
+  if (!isObj(state)) return null;
+  const out: Record<string, unknown> = {};
+  const u = state.user;
+  if (isObj(u) && str(u.id, MAX_ID) && str(u.name, MAX_NAME) && typeof u.anonymous === 'boolean') {
+    const user: Record<string, unknown> = { id: u.id, name: u.name, anonymous: u.anonymous };
+    if (typeof u.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(u.color)) user.color = u.color;
+    out.user = user;
+  }
+  if ('cursor' in state) {
+    const c = state.cursor;
+    out.cursor = isObj(c) && num(c.x) && num(c.y) ? { x: c.x, y: c.y } : null;
+  }
+  if ('status' in state) {
+    const st = state.status;
+    out.status = typeof st === 'string' && /^cursor\.[A-Za-z]{1,32}$/.test(st) ? st : null;
+  }
+  if ('laser' in state) {
+    const l = state.laser;
+    out.laser =
+      isObj(l) && num(l.now) && Array.isArray(l.pts) && l.pts.length <= MAX_LASER_POINTS &&
+      l.pts.every((p) => Array.isArray(p) && p.length === 3 && num(p[0]) && num(p[1]) && num(p[2]))
+        ? { pts: (l.pts as number[][]).map((p) => [p[0], p[1], p[2]]), now: l.now }
+        : null;
+  }
+  if ('viewport' in state) {
+    const v = state.viewport;
+    out.viewport = isObj(v) && num(v.x) && num(v.y) && num(v.w) && num(v.h) ? { x: v.x, y: v.y, w: v.w, h: v.h } : null;
+  }
+  if ('presenting' in state) out.presenting = state.presenting === true;
+  if ('following' in state) out.following = str(state.following, MAX_ID) ? state.following : null;
+  return out;
+}
+
 interface UpdateEntry {
   clientId: number;
   clock: number;
@@ -24,8 +78,9 @@ interface UpdateEntry {
  *      already belong to another connection (a client may only move its own state),
  *   2. drop states for clientIds `mayClaim` refuses (the server: a Yjs client id the ledger
  *      binds to another principal — awareness alone never takes over an id with clocks),
- *   3. overwrite the `user` field of every kept state with the connection's verified
- *      identity — live cursors and labels cannot lie.
+ *   3. keep only the presence schema of every state (cleanPresenceState: typed, bounded
+ *      fields; oversized states are dropped) and overwrite its `user` field with the
+ *      connection's verified identity — live cursors and labels cannot lie.
  *
  * Wire format (y-protocols/awareness): varUint count, then per client
  * varUint clientId, varUint clock, varString JSON state ("null" = removal).
@@ -51,10 +106,15 @@ export function sanitizeAwarenessUpdate(
       if (json === 'null') {
         state = null;
       } else {
+        if (json.length > MAX_AWARENESS_STATE_BYTES) continue; // oversized state: drop unread
         const parsed: unknown = JSON.parse(json);
         if (parsed === null) state = null;
-        else if (typeof parsed === 'object') state = parsed as Record<string, unknown>;
-        else continue; // malformed state: drop
+        else {
+          // schema-checked copy: only the presence fields, typed and bounded
+          const clean = cleanPresenceState(parsed);
+          if (!clean) continue; // not an object: drop
+          state = clean;
+        }
       }
       entries.push({ clientId, clock, state });
     }

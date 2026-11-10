@@ -95,6 +95,28 @@ limits:
   anonMaxMessageBytes: 2097152 # 2 MiB
   maxImageBytes: 2097152
   anonMaxImageBytes: 1048576
+  # A peer that stops reading is dropped once the server holds this much for it (beyond the
+  # join burst).
+  wsMaxBufferedBytes: 8388608 # 8 MiB
+  # Sync step-2 answers after the first one per connection, bytes/s and burst.
+  syncBytesPerSec: 1048576
+  syncBurstBytes: 4194304
+  anonSyncBytesPerSec: 262144
+  anonSyncBurstBytes: 1048576
+  # Joins per principal (user id / anonymous visitor) and per room for anonymous visitors.
+  joinRatePerMin: 30
+  joinBurst: 20
+  anonJoinRatePerMin: 10
+  anonJoinBurst: 6
+  anonRoomJoinRatePerMin: 60
+  anonRoomJoinBurst: 30
+  # Server CPU time (ms) a connection's messages may use per second, and the burst.
+  cpuMsPerSec: 250
+  cpuBurstMs: 5000
+  anonCpuMsPerSec: 60
+  anonCpuBurstMs: 1000
+  # Attribution of shapes deleted longer ago than this is pruned from the ledger.
+  attributionRetentionDays: 30
   # Optional key-space allowlist, e.g. ["runs/", "pub/"]. Empty = any structurally valid key.
   artifactPrefixes: []
   anonAllowedPrefixes: ["pub/"]

@@ -45,6 +45,22 @@ data:
   ANON_MAX_MESSAGE_BYTES: {{ int64 .Values.limits.anonMaxMessageBytes | quote }}
   MAX_IMAGE_BYTES: {{ int64 .Values.limits.maxImageBytes | quote }}
   ANON_MAX_IMAGE_BYTES: {{ int64 .Values.limits.anonMaxImageBytes | quote }}
+  WS_MAX_BUFFERED_BYTES: {{ int64 .Values.limits.wsMaxBufferedBytes | quote }}
+  SYNC_BYTES_PER_SEC: {{ int64 .Values.limits.syncBytesPerSec | quote }}
+  SYNC_BURST_BYTES: {{ int64 .Values.limits.syncBurstBytes | quote }}
+  ANON_SYNC_BYTES_PER_SEC: {{ int64 .Values.limits.anonSyncBytesPerSec | quote }}
+  ANON_SYNC_BURST_BYTES: {{ int64 .Values.limits.anonSyncBurstBytes | quote }}
+  JOIN_RATE_PER_MIN: {{ int64 .Values.limits.joinRatePerMin | quote }}
+  JOIN_BURST: {{ int64 .Values.limits.joinBurst | quote }}
+  ANON_JOIN_RATE_PER_MIN: {{ int64 .Values.limits.anonJoinRatePerMin | quote }}
+  ANON_JOIN_BURST: {{ int64 .Values.limits.anonJoinBurst | quote }}
+  ANON_ROOM_JOIN_RATE_PER_MIN: {{ int64 .Values.limits.anonRoomJoinRatePerMin | quote }}
+  ANON_ROOM_JOIN_BURST: {{ int64 .Values.limits.anonRoomJoinBurst | quote }}
+  CPU_MS_PER_SEC: {{ int64 .Values.limits.cpuMsPerSec | quote }}
+  CPU_BURST_MS: {{ int64 .Values.limits.cpuBurstMs | quote }}
+  ANON_CPU_MS_PER_SEC: {{ int64 .Values.limits.anonCpuMsPerSec | quote }}
+  ANON_CPU_BURST_MS: {{ int64 .Values.limits.anonCpuBurstMs | quote }}
+  ATTRIBUTION_RETENTION_DAYS: {{ int64 .Values.limits.attributionRetentionDays | quote }}
   {{- if .Values.limits.artifactPrefixes }}
   ARTIFACT_PREFIXES: {{ join "," .Values.limits.artifactPrefixes | quote }}
   {{- end }}

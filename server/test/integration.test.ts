@@ -452,7 +452,7 @@ describe('abuse limits', () => {
     const url = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/pub/fill.html`;
     const anon = new TestClient(url);
     await anon.connect();
-    anon.doc.getMap('assets').set('blob', 'x'.repeat(30_000));
+    anon.doc.getMap('assets').set('blob', 'data:image/png;base64,' + 'A'.repeat(30_000));
     await expectClose(anon, 4413);
     expect(anon.notices.some((n) => n.kind === 'too-large')).toBe(true);
     // a logged-in visitor joins, syncs and writes (no room-wide lock)
@@ -461,7 +461,7 @@ describe('abuse limits', () => {
     expect(ana.identity?.id).toBe('ana@corp');
     await new Promise((r) => setTimeout(r, 100));
     expect(ana.doc.getMap('assets').has('blob')).toBe(false); // the oversized update was not applied
-    ana.doc.getMap('assets').set('ok', 'y'.repeat(50_000)); // within the logged-in cap
+    ana.doc.getMap('assets').set('ok', 'data:image/png;base64,' + 'B'.repeat(50_000)); // within the logged-in cap
     const watcher = new TestClient(url, 'ana');
     await watcher.connect();
     await waitFor(() => watcher.doc.getMap('assets').has('ok'), 3000, 'ana write applied');
@@ -479,7 +479,7 @@ describe('abuse limits', () => {
     const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/big.html`);
     await c.connect();
     c.doc.transact(() => {
-      c.doc.getMap('shapes').set('big', shape({ type: 'note', text: 'x'.repeat(100_000) }));
+      c.doc.getMap('shapes').set('big', shape({ type: 'note', text: 'x'.repeat(9_000) }));
     });
     await expectClose(c, 4413);
     expect(c.notices.some((n) => n.kind === 'too-large')).toBe(true);

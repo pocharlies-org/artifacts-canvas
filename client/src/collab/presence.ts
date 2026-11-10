@@ -1,4 +1,6 @@
 import type { Awareness } from 'y-protocols/awareness';
+import { cleanPresenceState } from '@pocharlies/artifacts-canvas-shared/awareness';
+import { personColor } from '../model/colors';
 import type { Box } from '../geometry/vec';
 
 /** Laser points: [x, y, t] with t in ms on the sender's clock. Never stored in the document. */
@@ -33,8 +35,11 @@ export function peers(aw: Awareness): Peer[] {
   const out: Peer[] = [];
   for (const [clientId, state] of aw.getStates()) {
     if (clientId === aw.clientID) continue;
-    const s = state as PresenceState;
+    // schema-checked copy (the server checks too; a development relay or an older server may
+    // not): a malformed or oversized state never reaches the renderer (fv4 M3)
+    const s = cleanPresenceState(state) as PresenceState | null;
     if (!s || !s.user) continue;
+    if (!s.user.color) s.user.color = personColor(s.user.id, s.user.anonymous);
     out.push({ clientId, state: s });
   }
   return out;

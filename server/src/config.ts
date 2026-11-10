@@ -57,6 +57,34 @@ export interface Config {
   anonMaxDocBytes: number;
   maxMessageBytes: number;
   anonMaxMessageBytes: number;
+  /**
+   * Outgoing-buffer cap per connection (bytes not yet written to the socket). A peer that
+   * stops reading is disconnected once its buffer passes this, instead of the server holding
+   * every message for it (fv4 H1).
+   */
+  wsMaxBufferedBytes: number;
+  /**
+   * Bytes of sync step-2 answers per connection beyond the first one (which is free: a
+   * joining or reconnecting client asks for everything it lacks once). Users / anonymous.
+   */
+  syncBytesPerSec: number;
+  syncBurstBytes: number;
+  anonSyncBytesPerSec: number;
+  anonSyncBurstBytes: number;
+  /** Joins per principal (a user id, an anonymous visitor cookie) and per room for anonymous visitors. */
+  joinRatePerMin: number;
+  joinBurst: number;
+  anonJoinRatePerMin: number;
+  anonJoinBurst: number;
+  anonRoomJoinRatePerMin: number;
+  anonRoomJoinBurst: number;
+  /** Server CPU time (ms) a connection's messages may use per second, and the burst. */
+  cpuMsPerSec: number;
+  cpuBurstMs: number;
+  anonCpuMsPerSec: number;
+  anonCpuBurstMs: number;
+  /** Attribution entries of shapes deleted longer ago than this are pruned from the ledger. */
+  attributionRetentionDays: number;
   /** Advertised to the client in the wrapper config (client-side cap for pasted images). */
   maxImageBytes: number;
   anonMaxImageBytes: number;
@@ -181,6 +209,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     anonMaxDocBytes: num(env, 'ANON_MAX_DOC_BYTES', 5 * 1024 * 1024),
     maxMessageBytes: num(env, 'MAX_MESSAGE_BYTES', 8 * 1024 * 1024),
     anonMaxMessageBytes: num(env, 'ANON_MAX_MESSAGE_BYTES', 2 * 1024 * 1024),
+    wsMaxBufferedBytes: num(env, 'WS_MAX_BUFFERED_BYTES', 8 * 1024 * 1024),
+    syncBytesPerSec: num(env, 'SYNC_BYTES_PER_SEC', 1024 * 1024),
+    syncBurstBytes: num(env, 'SYNC_BURST_BYTES', 4 * 1024 * 1024),
+    anonSyncBytesPerSec: num(env, 'ANON_SYNC_BYTES_PER_SEC', 256 * 1024),
+    anonSyncBurstBytes: num(env, 'ANON_SYNC_BURST_BYTES', 1024 * 1024),
+    joinRatePerMin: num(env, 'JOIN_RATE_PER_MIN', 30),
+    joinBurst: num(env, 'JOIN_BURST', 20),
+    anonJoinRatePerMin: num(env, 'ANON_JOIN_RATE_PER_MIN', 10),
+    anonJoinBurst: num(env, 'ANON_JOIN_BURST', 6),
+    anonRoomJoinRatePerMin: num(env, 'ANON_ROOM_JOIN_RATE_PER_MIN', 60),
+    anonRoomJoinBurst: num(env, 'ANON_ROOM_JOIN_BURST', 30),
+    cpuMsPerSec: num(env, 'CPU_MS_PER_SEC', 250),
+    cpuBurstMs: num(env, 'CPU_BURST_MS', 5000),
+    anonCpuMsPerSec: num(env, 'ANON_CPU_MS_PER_SEC', 60),
+    anonCpuBurstMs: num(env, 'ANON_CPU_BURST_MS', 1000),
+    attributionRetentionDays: num(env, 'ATTRIBUTION_RETENTION_DAYS', 30),
     maxImageBytes: num(env, 'MAX_IMAGE_BYTES', 2 * 1024 * 1024),
     anonMaxImageBytes: num(env, 'ANON_MAX_IMAGE_BYTES', 1 * 1024 * 1024),
     artifactPrefixes: list(env, 'ARTIFACT_PREFIXES', []),

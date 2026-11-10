@@ -1,4 +1,9 @@
-/** Token bucket for per-connection message rate limiting. Clock injectable for tests. */
+/**
+ * Token bucket for per-connection (and per-principal) limits. Clock injectable for tests.
+ * `take(cost)` refuses when the bucket holds less than `cost`; `charge(cost)` always spends
+ * (the work was already done, e.g. CPU time measured afterwards) and reports whether the
+ * bucket is still non-negative.
+ */
 export class TokenBucket {
   private tokens: number;
   private last: number;
@@ -12,13 +17,30 @@ export class TokenBucket {
     this.last = clock();
   }
 
-  /** Consume one token; false when the bucket is empty (caller should drop the connection). */
-  take(): boolean {
+  private refill(): void {
     const now = this.clock();
     this.tokens = Math.min(this.capacity, this.tokens + ((now - this.last) / 1000) * this.refillPerSec);
     this.last = now;
-    if (this.tokens < 1) return false;
-    this.tokens -= 1;
+  }
+
+  /** Consume `cost` tokens (default one); false when the bucket holds less (nothing is taken). */
+  take(cost = 1): boolean {
+    this.refill();
+    if (this.tokens < cost) return false;
+    this.tokens -= cost;
     return true;
+  }
+
+  /** Spend `cost` tokens unconditionally; false once the bucket is in debt. */
+  charge(cost: number): boolean {
+    this.refill();
+    this.tokens -= cost;
+    return this.tokens >= 0;
+  }
+
+  /** True when the bucket is full again (an idle entry a map of buckets can forget). */
+  full(): boolean {
+    this.refill();
+    return this.tokens >= this.capacity;
   }
 }

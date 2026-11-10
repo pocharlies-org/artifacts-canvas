@@ -1,5 +1,6 @@
 import * as Y from 'yjs';
 import { CanvasDoc, newId } from '../model/doc';
+import { assetValueOk } from '@pocharlies/artifacts-canvas-shared/model';
 import { attachStamper } from '../model/stamper';
 import { DEFAULT_STYLE, STYLE_KEYS, type Identity, type Shape, type Style, type GeoKind } from '../model/types';
 import { Connection, type Status } from '../collab/connection';
@@ -534,6 +535,7 @@ export class Editor {
         created.push(this.doc.create(copy as unknown as Shape));
       }
     });
+    // setAsset keeps only raster data URLs (assetValueOk)
     for (const [aid, url] of Object.entries(this.clipboard.assets)) if (url && !this.doc.assets.has(aid)) this.doc.setAsset(aid, url);
     this.doc.endGesture();
     this.select(created);
@@ -688,6 +690,9 @@ export class Editor {
     const img = await loadImage(url);
     let dataUrl = url;
     const max = this.cfg.maxImageBytes;
+    // only png/jpeg/gif/webp data URLs are stored (server rule): anything else (svg, bmp,
+    // avif, ...) is re-encoded as PNG through a canvas
+    if (!assetValueOk(dataUrl)) dataUrl = downscale(img, 1600, 'image/png');
     if (dataUrl.length * 0.75 > max || img.naturalWidth > 2000 || img.naturalHeight > 2000) {
       dataUrl = downscale(img, 1600, file.type === 'image/png' ? 'image/png' : 'image/jpeg');
       if (dataUrl.length * 0.75 > max) dataUrl = downscale(img, 1600, 'image/jpeg', 0.8);
@@ -697,7 +702,7 @@ export class Editor {
       }
     }
     const assetId = newId('a');
-    this.doc.setAsset(assetId, dataUrl);
+    if (!this.doc.setAsset(assetId, dataUrl)) return;
     const scale = Math.min(1, 600 / img.naturalWidth, 600 / img.naturalHeight);
     const w = Math.max(20, img.naturalWidth * scale);
     const h = Math.max(20, img.naturalHeight * scale);

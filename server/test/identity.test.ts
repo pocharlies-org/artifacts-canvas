@@ -73,7 +73,7 @@ describe('sanitizeAwarenessUpdate', () => {
     const room = new awarenessProtocol.Awareness(doc);
     room.setLocalState(null);
     const out = sanitizeAwarenessUpdate(
-      encodeAwareness(7, { cursor: { x: 1 }, user: { id: 'evil', name: 'Evil' } }, 1),
+      encodeAwareness(7, { cursor: { x: 1, y: 2 }, user: { id: 'evil', name: 'Evil' } }, 1),
       new Set([7]),
       room,
       identity,
@@ -81,7 +81,7 @@ describe('sanitizeAwarenessUpdate', () => {
     expect(out).not.toBeNull();
     awarenessProtocol.applyAwarenessUpdate(room, out!, null);
     expect(room.getStates().get(7)).toMatchObject({
-      cursor: { x: 1 },
+      cursor: { x: 1, y: 2 },
       user: { id: 'ana@corp', name: 'Ana', anonymous: false },
     });
   });

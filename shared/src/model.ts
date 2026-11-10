@@ -169,6 +169,8 @@ export interface Attribution {
   createdAt: number;
   updatedBy: string;
   updatedAt: number;
+  /** when the shape was deleted (absent while it exists); the entry is pruned some time after */
+  deletedAt?: number;
 }
 
 /** A participant as recorded in the root map `users` (keyed by user id). */
@@ -237,6 +239,11 @@ export const MAX_COORD = 1e9;
 const MAX_FIELD_STRING = 1024;
 /** Most numbers a `points` list may hold (x, y, pressure triplets: 100 000 samples). */
 export const MAX_POINTS = 300_000;
+/**
+ * Longest text of a shape (UTF-16 code units, the unit of Y.Text.length). The server refuses
+ * longer text; the client renders at most this many characters of whatever a document holds.
+ */
+export const MAX_TEXT_LENGTH = 10_000;
 /** Longest map key (shape id, field name, asset id, meta key). */
 export const MAX_KEY_LENGTH = 256;
 /** Deepest nesting of a plain JSON value (unknown shape fields, meta values). */
@@ -310,8 +317,9 @@ export function pointsOk(v: unknown): boolean {
 export function shapeFieldProblem(key: string, v: unknown, kind: ShapeFieldKind = 'value'): string | null {
   if (!keyOk(key)) return 'key';
   if (key === 'text') {
-    if (kind === 'text') return null;
-    return kind === 'value' && typeof v === 'string' ? null : 'text';
+    // a Y.Text is passed as its string (or not at all for a new, empty one)
+    if (kind === 'text') return v === undefined || (typeof v === 'string' && v.length <= MAX_TEXT_LENGTH) ? null : 'text';
+    return kind === 'value' && typeof v === 'string' && v.length <= MAX_TEXT_LENGTH ? null : 'text';
   }
   if (key === 'points') {
     if (kind === 'array' || kind === 'value') return pointsOk(v) ? null : 'points';
@@ -348,9 +356,15 @@ export function shapeRecordProblem(fields: Map<string, [unknown, ShapeFieldKind]
   return null;
 }
 
-/** Values a client may store under `assets` (image data URLs) and `meta` (plain JSON). */
+/**
+ * An asset value: a base64 data URL of a raster image the browser decodes itself, nothing
+ * else. Any other string would be rendered as an `<image href>` that every viewer's browser
+ * fetches with its cookies — a same-origin URL such as `/oauth2/sign_out` logged every viewer
+ * out (fv4 M2) — and SVG could carry its own references.
+ */
+export const ASSET_DATA_URL = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]*={0,2}$/;
 export function assetValueOk(v: unknown): boolean {
-  return typeof v === 'string';
+  return typeof v === 'string' && ASSET_DATA_URL.test(v);
 }
 export function metaValueOk(v: unknown): boolean {
   return v !== undefined && plainJsonOk(v);
