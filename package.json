@@ -17,7 +17,8 @@
     "typecheck": "npm run typecheck -w shared && npm run typecheck -w client && npm run typecheck -w server",
     "test": "npm run build -w shared && npm run test -w client && npm run test -w server",
     "dev": "npm run build -w shared -w server && tsx dev/dev.ts",
-    "e2e": "npm run build -w shared && npm run build -w client && npm run build -w server && npm run e2e -w client && npm run e2e:server -w client"
+    "e2e": "npm run build -w shared && npm run build -w client && npm run build -w server && npm run e2e -w client && npm run e2e:server -w client",
+    "e2e:system": "playwright test -c e2e-system/playwright.config.ts"
   },
   "devDependencies": {
     "tsx": "^4.19.2"

@@ -37,6 +37,8 @@ y-websocket, y-protocols, lib0, [perfect-freehand](https://github.com/steveruizo
 | `client/` | The wrapper page: TypeScript + SVG, no framework, built with Vite. |
 | `server/` | The canvas service: rooms, core authz, stamper enforcement, S3 persistence. |
 | `dev/` | Local full-stack dev: the real server against a fake core authz and an in-memory S3 (`npm run dev`). |
+| `deploy/compose/` | The full system: the core's compose stack plus the canvas as its plugin (real gate, real MinIO, Dex). |
+| `e2e-system/` | Playwright suite against that full system (`npm run e2e:system`). |
 | `chart/` | Helm chart for the service. |
 | `docs/protocol.md` | The single authoritative protocol: routes, key chain, frame, WebSocket messages, attribution, document schema, authz contract, enforcement. |
 | `docs/design.md` | Product decisions and design. |
@@ -65,12 +67,72 @@ npm run typecheck      # all workspaces
 npm run test           # unit tests (vitest, client + server)
 npx playwright install chromium
 npm run e2e            # Playwright: client suite (dev stack) + server suite (real server + fake core + S3 mock)
+npm run e2e:system     # Playwright against the full system (real core, see "Full system" below)
 npm run build          # shared/dist, client/dist (the bundle), server/dist
 ```
+
+On a phone the toolbar is wider than the screen: it scrolls sideways, and a chevron with a fade on each
+side that still hides tools pages it (`docs/screenshots/phone-390x844.png`,
+`phone-390x844-toolbar-end.png`, `phone-360x780.png`; `client/e2e/phone.spec.ts` clicks every tool at
+390 and 360 px through the chevrons).
 
 Keyboard: V select, H hand (or hold Space), D pen, ⇧D highlighter, E eraser, A arrow, L line, T text, N note,
 R rectangle, O ellipse, F frame, K laser, ⌘Z / ⇧⌘Z undo/redo, ⌘A, ⌘D duplicate, ⌘G / ⇧⌘G group, ⇧L lock,
 [ / ] back/front, ⇧1 zoom to fit, ⇧0 100%, Delete, Esc.
+
+## Full system: the canvas as a plugin of the core (Docker Compose)
+
+[`deploy/compose/compose.yml`](deploy/compose/compose.yml) runs the **whole system** on a laptop: it
+`include`s the core's compose stack (MinIO + Dex + oauth2-proxy + gate + Caddy, from a checkout of
+[`pocharlies-org/artifacts`](https://github.com/pocharlies-org/artifacts)), builds the canvas image and
+adds the canvas service. Through the core's plugin variables ([`deploy/compose/canvas.env`](deploy/compose/canvas.env))
+Caddy routes `/_canvas/` to the canvas, the core bootstrap creates the S3 user `plugin-canvas` (scoped to
+`_plugins/canvas/`), and the gate's ACL cache is 2 s. The canvas asks the core's **real**
+`POST /_gate/plugin/authz` and stores in the **real** MinIO; nothing is faked. Requires Docker with
+Compose v2.24+ and Node 22+.
+
+```sh
+git clone -b feat/initial-import https://github.com/pocharlies-org/artifacts.git
+git clone -b feat/integrate https://github.com/pocharlies-org/artifacts-canvas.git
+cd artifacts-canvas/deploy/compose
+docker compose up -d --build --wait     # the core next to this repo: ../artifacts (else ARTIFACTS_CORE_DIR=...)
+```
+
+Publish with the core's CLI; it prints the canvas link next to the artifact link:
+
+```sh
+cd ../../../artifacts
+ARTIFACTS_ACCESS_KEY=minioadmin ARTIFACTS_SECRET_KEY=minioadmin \
+ARTIFACTS_WRITE_BASE=http://127.0.0.1:9000 ARTIFACTS_READ_BASE=http://127.0.0.1:8080 \
+ARTIFACTS_PLUGINS="canvas=/_canvas/" \
+  cli/publish.sh -u test@example.com,test2@example.com -t 7 report.html
+#   INDEX (deliver this link): http://127.0.0.1:8080/artifacts/u/<run>/index.html
+#     open with canvas: http://127.0.0.1:8080/_canvas/artifacts/u/<run>/index.html
+```
+
+Open the canvas link in two browsers: without a session it sends you through oauth2-proxy to the Dex
+login and back. Dex has three dev users — `test@example.com` / `test-password`,
+`test2@example.com` / `test2-password`, `test3@example.com` / `test3-password` — so with the ACL above
+the first two collaborate and the third is refused. `-g pub` publishes an anonymous `pub/` artifact (the
+dev stack enables anonymous `pub/`; visitors appear as *Anónimo NNNN*). The stack is laptop-only: fixed dev
+credentials, every port bound to `127.0.0.1`.
+
+**Full-system e2e** (Playwright, against the running stack; from the repo root, on the Docker host):
+
+```sh
+npm ci && npx playwright install chromium
+npm run e2e:system      # ARTIFACTS_CORE_DIR defaults to ../artifacts
+```
+
+It publishes with the core CLI and checks: two Dex users through the real login chain drawing together
+live (strokes before mouse-up, cursors with their names, server-stamped attribution); a user outside the
+ACL refused on the page, the frame and the WebSocket (4403); anonymous drawing on `pub/` as *Anónimo
+NNNN* and refused on `u/`; persistence in MinIO at `_plugins/canvas/<key>.ydoc` (with the artifact's `ttl`
+tag) across a reload and a canvas container restart; revocation by editing `.acl.json` (the open session
+drops with 4403 within the re-check interval, 3 s + the 2 s ACL cache); the opaque-origin artifact iframe;
+and finally the core's own `deploy/compose/e2e.sh`, which must still pass with the plugin enabled.
+
+Stop everything with `docker compose down -v` (from `deploy/compose/`).
 
 ## Production: registering with the core
 
@@ -89,7 +151,10 @@ The canvas is a core plugin (design §8): the core answers *who may see this art
    ```yaml
    plugins:
      - name: canvas
-       path: /_canvas/
+       pathPrefix: /_canvas/
+       service: canvas-artifacts-canvas   # the canvas chart's Service
+       port: 8080
+       secretName: plugin-canvas-s3
    ```
 
    The core then emits canvas links as `<read_base>/_canvas/<bucket>/<key>`; the canvas server accepts both
@@ -127,6 +192,7 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `FRAME_FETCH_TIMEOUT_MS` | `10000` | Artifact fetch for the frame route. |
 | `STATIC_DIR` | `client/dist` | Built client bundle served under `/_canvas/_/`. |
 | `CANVAS_INJECT_CONFIG` | `true` | Inject the wrapper config element (§2 of the protocol). |
+| `LOGIN_URL` | (empty) | Where a visitor **without a session** who opens the wrapper of a non-anonymous artifact is sent (`302`); `{rd}` is replaced by the URL-encoded original path, e.g. `/oauth2/sign_in?rd={rd}` (compose) or `/oauth2-artifacts/sign_in?rd={rd}` (core chart). Empty = `403`. Bearer callers always get the `403`. |
 | `SAVE_DEBOUNCE_MS` | `2000` | Persistence debounce (flushed on last leave and shutdown). |
 | `SWEEP_INTERVAL_SECONDS` | `3600` | Orphan sweep: deletes canvas objects whose artifact is gone/expired. |
 | `READYZ_CACHE_MS` | `5000` | `/readyz` caches the `HeadBucket` result. |

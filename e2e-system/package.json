@@ -1,0 +1,6 @@
+{
+  "name": "artifacts-canvas-e2e-system",
+  "private": true,
+  "type": "module",
+  "description": "Full-system Playwright suite: the canvas as a plugin of the real artifacts core (npm run e2e:system from the repo root)."
+}
