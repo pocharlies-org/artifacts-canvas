@@ -15,7 +15,9 @@ import { TEST_ORIGIN, TestClient, expectClose, waitFor } from './helpers/yclient
 let core: FakeCore;
 let staticDir: string;
 let store: MemoryCanvasObjectStore;
-let portSeq = 39100;
+// below the Linux ephemeral range (32768-60999): outgoing connections of other processes on
+// the host never hold these; startApp also skips a port that is taken anyway
+let portSeq = 23100;
 
 function makeCfg(overrides: Record<string, string> = {}): Config {
   return loadConfig({
@@ -44,11 +46,19 @@ async function http(cfg: Config, p: string, cookie?: string): Promise<Response> 
 }
 
 async function startApp(overrides: Record<string, string> = {}): Promise<App> {
-  const cfg = makeCfg(overrides);
-  const app = createApp({ config: cfg, store, logger: cfg.logLevel === 'silent' ? silentLogger : createLogger(cfg.logLevel) });
-  await app.listen();
-  apps.push(app);
-  return app;
+  for (let attempt = 0; ; attempt++) {
+    const cfg = makeCfg(overrides);
+    const app = createApp({ config: cfg, store, logger: cfg.logLevel === 'silent' ? silentLogger : createLogger(cfg.logLevel) });
+    try {
+      await app.listen();
+    } catch (err) {
+      await app.close().catch(() => undefined);
+      if (attempt < 20 && String(err).includes('EADDRINUSE') && !overrides.PORT) continue;
+      throw err;
+    }
+    apps.push(app);
+    return app;
+  }
 }
 
 import { createLogger } from '../src/logging.js';

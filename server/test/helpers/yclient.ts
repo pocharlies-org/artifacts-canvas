@@ -59,7 +59,9 @@ export class TestClient {
         encoding.writeVarUint(e, 0);
         syncProtocol.writeSyncStep1(e, this.doc);
         ws.send(encoding.toUint8Array(e));
-        resolve();
+        // IDENTITY follows the upgrade once the room is loaded: resolve when it arrived (or
+        // the server closed), so callers can assert on `identity` right away
+        waitFor(() => this.lastIdentity !== null || ws.readyState !== WebSocket.OPEN, 3000).then(resolve, () => resolve());
       });
       ws.on('error', reject);
       ws.on('close', (code) => this.closedResolve(code));
