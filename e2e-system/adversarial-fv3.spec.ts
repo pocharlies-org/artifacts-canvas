@@ -188,9 +188,11 @@ test('Z zero-length structs (anonymous on pub/, user2 on u/) and a client LEDGER
     log(`${label}`, { codes: [evil.code, evil2.code, evil3.code], victimAttribution: honest.ledger.getMap('attribution').get(sid), ledgerUnchanged: ledgerHex(honest) === before });
     expect([evil.code, evil2.code, evil3.code]).toEqual([4403, 4403, 4403]);
     expect(ledgerHex(honest)).toBe(before);
-    expect(honest.doc.getMap('shapes').has(sid)).toBe(true);
     expect(honest.ledger.getMap('attribution').get(sid)).toMatchObject({ createdBy: honest.ident!.id });
-    for (const c of [evil, evil2, evil3, honest]) c.close();
+    // the victim's shape is still in the room (the zero-length item over it was refused)
+    const probe = await joined(wsUrl(key()), victimHdr());
+    expect(probe.doc.getMap('shapes').has(sid)).toBe(true);
+    for (const c of [evil, evil2, evil3, honest, probe]) c.close();
   }
   // persisted: after the save debounce + a canvas restart a fresh client sees the true author
   await sleep(2500);

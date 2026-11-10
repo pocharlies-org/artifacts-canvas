@@ -191,7 +191,8 @@ test('c. anonymous draws on a pub/ canvas as "Anónimo NNNN"; anonymous is refus
 test('d. drawings persist in MinIO (_plugins/canvas/<key>.ydoc + .ydoc.ledger): reload and canvas restart', async ({ browser }) => {
   const objectPath = `artifacts/_plugins/canvas/${priv.key}.ydoc`;
   await waitFor(() => mc(`mc stat "local/${objectPath}" >/dev/null`).code === 0, 10_000, 'canvas object in MinIO');
-  const stat = mc(`mc stat --json "local/${objectPath}"`);
+  // --no-list: a plain stat also lists every object under the path as a prefix (the ledger)
+  const stat = mc(`mc stat --no-list --json "local/${objectPath}"`);
   const st = JSON.parse(stat.out) as { status: string; name: string; size: number };
   expect(st).toMatchObject({ status: 'success', name: 'index.html.ydoc' });
   expect(st.size).toBeGreaterThan(0);
