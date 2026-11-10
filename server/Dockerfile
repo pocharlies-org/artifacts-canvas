@@ -11,12 +11,14 @@
 
 FROM node:22-alpine AS build
 WORKDIR /src
+# shared/ is copied whole BEFORE `npm ci` because its `prepare` lifecycle script builds
+# dist/ during install (that is what lets client/server import it right after a fresh
+# clone) — `npm ci` would fail on a package.json-only copy.
 COPY package.json package-lock.json ./
-COPY shared/package.json ./shared/
+COPY shared/ ./shared/
 COPY client/package.json ./client/
 COPY server/package.json ./server/
 RUN npm ci --no-audit --no-fund
-COPY shared/ ./shared/
 COPY client/ ./client/
 COPY server/ ./server/
 RUN npm run build && npm prune --omit=dev
