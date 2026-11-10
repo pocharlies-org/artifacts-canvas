@@ -195,7 +195,7 @@ describe('fv4 H1: sync step 1 is no amplifier', () => {
   });
 
   it('a peer that stops reading is dropped once the server holds more than the cap for it', async () => {
-    const app = await startApp({ WS_MAX_BUFFERED_BYTES: String(256 * 1024) });
+    const app = await startApp({ WS_MAX_BUFFERED_BYTES: String(128 * 1024) });
     const key = 'u/h1d/index.html';
     users(key);
     const ana = new TestClient(`${base(app)}/${key}`);
@@ -203,11 +203,13 @@ describe('fv4 H1: sync step 1 is no amplifier', () => {
     const eve = await raw(app, key, 'sid=eve');
     await sleep(200);
     (eve.ws as unknown as { _socket: { pause(): void } })._socket.pause();
-    for (let i = 0; i < 60; i++) {
-      ana.doc.getMap('meta').set(`k${i}`, 'z'.repeat(40_000)); // broadcast to everyone
-      await sleep(5);
+    // ~19 MB of broadcasts: more than the kernel's socket buffers hold on any host (Linux
+    // loopback auto-tunes to several MB), so the rest queues in the server until the cap
+    for (let i = 0; i < 300 && serverConn(app, key, 'eve@corp'); i++) {
+      ana.doc.getMap('meta').set('k', `${i}`.padEnd(64_000, 'z')); // one key: the room stays small
+      await sleep(10);
     }
-    await waitFor(() => serverConn(app, key, 'eve@corp') === undefined, 5000, 'eve dropped');
+    await waitFor(() => serverConn(app, key, 'eve@corp') === undefined, 10_000, 'eve dropped');
     expect(serverConn(app, key, 'ana@corp')).toBeDefined();
     ana.close();
   });
