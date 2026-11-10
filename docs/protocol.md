@@ -26,12 +26,15 @@ stripped `/ws/`).
 | `GET /_canvas/_/assets/*`, `GET /_canvas/_/reporter.js`, `GET /_canvas/_/vendor/html-to-image.js` | no | The static bundle from `client/dist/` (build with `npm run build`; base path `/_canvas/_/`, override with `CANVAS_BASE`). `assets/*` are `max-age=31536000, immutable`, everything else `max-age=60`. They carry no artifact data, so they need no authz. |
 | `GET /_canvas/_/frame/<artifact key>` | yes | The artifact HTML with the reporter injected (§3), fetched from `ARTIFACT_BASE_URL` with the visitor's cookie (and `Authorization` when present). Upstream 3xx is refused (403) — the credentials are never sent to a redirect target. Non-HTML passes through unchanged. |
 | `WS /_canvas/_/ws/<artifact key>[?anon=NNNN]` | yes + re-check | The room of that artifact (§4). |
-| `GET /healthz`, `/readyz`, `/metrics` | no | Liveness, readiness (cached `store.ready()`), Prometheus. Also served under `/_canvas/…` (prefix stripped). |
+| `GET /healthz`, `/readyz`, `/metrics` | no | Liveness, readiness (cached `store.ready()`: a one-key list of `<CANVAS_PREFIX>/`, which the prefix-scoped `plugin-canvas` user may do — a HeadBucket would be denied), Prometheus. Also served under `/_canvas/…` (prefix stripped). |
 
 Every route that reveals anything about an artifact (wrapper, frame, ws) MUST first get
 `allowed: true` from the core's `POST /_gate/plugin/authz` for that key and the visitor's
 credentials (§7), and MUST answer exactly like the gate would for a denied artifact
-otherwise (no existence leak).
+otherwise (no existence leak). One exception mirrors the gate: when `LOGIN_URL` is set and
+the gate answers `unauthenticated` (no session; not a bearer caller), the **wrapper** answers
+`302` to `LOGIN_URL` with `{rd}` = the URL-encoded original path, so a visitor who opens a
+canvas link first logs in and comes back. Frame and ws never redirect.
 
 ### 1.1 Wrapper CSP (sent by the server)
 

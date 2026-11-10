@@ -206,6 +206,16 @@ export class HttpApp {
     const key = checked.key;
     const gate = await this.gate(cookie, key, authorization);
     if (!gate.ok) {
+      if (gate.login && cfg.loginUrl) {
+        // No session at all on an artifact that needs one: send the visitor through the
+        // core's login and back here (the gate does the same for artifact reads). Says
+        // nothing about the artifact: every unauthenticated non-pub key answers this way.
+        res.statusCode = 302;
+        res.setHeader('location', cfg.loginUrl.replace('{rd}', encodeURIComponent(req.url ?? '/')));
+        res.setHeader('cache-control', 'no-store');
+        res.end();
+        return;
+      }
       this.generic(res, gate.status);
       return;
     }
@@ -240,7 +250,7 @@ export class HttpApp {
     cookie: string,
     key: string,
     authorization = '',
-  ): Promise<{ ok: true; res: AuthzResult } | { ok: false; status: number }> {
+  ): Promise<{ ok: true; res: AuthzResult } | { ok: false; status: number; login?: boolean }> {
     const { cfg, authz, manager } = this.deps;
     const res = await authz.authorize(cookie, key, authorization);
     const state = artifactState(res, cfg);
@@ -252,7 +262,8 @@ export class HttpApp {
       void manager.expireRoom(key, 'expired');
       return { ok: false, status: 410 };
     }
-    if (!res.allowed) return { ok: false, status: 403 };
+    // `unauthenticated` is the gate's answer for a visitor with no session (docs/plugins.md §1).
+    if (!res.allowed) return { ok: false, status: 403, login: res.reason === 'unauthenticated' && !isBearer(authorization) };
     return { ok: true, res };
   }
 
@@ -353,6 +364,11 @@ export class HttpApp {
     res.setHeader('content-type', 'text/html; charset=utf-8');
     res.end(req.method === 'HEAD' ? undefined : injectReporter(html, reporter));
   }
+}
+
+/** Scripted callers (bearer token) must get the 403, never a login redirect. */
+function isBearer(authorization: string): boolean {
+  return /^bearer\s/i.test(authorization);
 }
 
 function upstream_status_for_fetch_error(err: unknown): number {

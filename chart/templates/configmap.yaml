@@ -8,6 +8,9 @@ data:
   # --- core plugin contract (docs: core repo docs/plugins.md) ---
   GATE_AUTHZ_URL: {{ .Values.core.gateAuthzUrl | quote }}
   ARTIFACT_BASE_URL: {{ .Values.core.artifactBaseUrl | quote }}
+  {{- if .Values.core.loginUrl }}
+  LOGIN_URL: {{ .Values.core.loginUrl | quote }}
+  {{- end }}
   # --- object storage (credentials come from the secret, never from here) ---
   S3_BUCKET: {{ .Values.s3.bucket | quote }}
   S3_REGION: {{ .Values.s3.region | quote }}

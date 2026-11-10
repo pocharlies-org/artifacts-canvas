@@ -375,6 +375,33 @@ describe('http routes', () => {
     expect(res.status).toBe(404); // fake core says object-missing for unknown keys -> gone semantics
   });
 
+  it('LOGIN_URL: an unauthenticated visitor on a gated key is sent to login and back', async () => {
+    const unauth = { allowed: false, reason: 'unauthenticated', user: { id: null, name: 'anonymous', anonymous: true } };
+    core.rules.set('u/run/index.html', unauth as never);
+    const app = await startApp({ LOGIN_URL: '/oauth2/sign_in?rd={rd}' });
+    const port = (app.server.address() as { port: number }).port;
+    const res = await fetch(`http://127.0.0.1:${port}/_canvas/canvas-test/u/run/index.html`, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe(`/oauth2/sign_in?rd=${encodeURIComponent('/_canvas/canvas-test/u/run/index.html')}`);
+    // a scripted caller with a bearer token gets the plain 403, never a login page
+    const bearer = await fetch(`http://127.0.0.1:${port}/_canvas/u/run/index.html`, { redirect: 'manual', headers: { authorization: 'Bearer x' } });
+    expect(bearer.status).toBe(403);
+    // a signed-in visitor who is simply not on the ACL is denied, not bounced to login
+    core.rules.set('u/run/other.html', { allowed: false, reason: 'no-acl', user: { id: 'eve@corp', name: 'eve@corp', anonymous: false } } as never);
+    const denied = await fetch(`http://127.0.0.1:${port}/_canvas/u/run/other.html`, { redirect: 'manual', headers: { cookie: 'sid=eve' } });
+    expect(denied.status).toBe(403);
+  });
+
+  it('LOGIN_URL unset: unauthenticated stays a 403; invalid LOGIN_URL refuses to start', async () => {
+    core.rules.set('u/run/index.html', { allowed: false, reason: 'unauthenticated', user: { id: null, name: 'anonymous', anonymous: true } } as never);
+    const app = await startApp();
+    const port = (app.server.address() as { port: number }).port;
+    const res = await fetch(`http://127.0.0.1:${port}/_canvas/u/run/index.html`, { redirect: 'manual' });
+    expect(res.status).toBe(403);
+    expect(() => makeCfg({ LOGIN_URL: '//evil.example/x?rd={rd}' })).toThrow(/LOGIN_URL/);
+    expect(() => makeCfg({ LOGIN_URL: '/oauth2/sign_in' })).toThrow(/\{rd\}/);
+  });
+
   it('frame serves the artifact with the reporter injected and sandbox CSP', async () => {
     core.rules.set('pub/a.html', allowAnon());
     core.artifacts.set(

@@ -1,7 +1,6 @@
 import {
   DeleteObjectCommand,
   GetObjectCommand,
-  HeadBucketCommand,
   ListObjectsV2Command,
   NoSuchKey,
   NotFound,
@@ -24,7 +23,7 @@ export interface CanvasObjectStore {
   delete(objectKey: string): Promise<void>;
   /** All object keys under `prefix` (paginated). */
   list(prefix: string): Promise<string[]>;
-  /** Cheap reachability check for readiness. */
+  /** Cheap reachability check for readiness (works with the prefix-scoped plugin user). */
   ready(): Promise<boolean>;
 }
 
@@ -95,8 +94,13 @@ export class S3CanvasObjectStore implements CanvasObjectStore {
   }
 
   async ready(): Promise<boolean> {
+    // A one-key list of our own prefix, not HeadBucket: the core's plugin-<name> user only
+    // has ListBucket restricted to `_plugins/<name>/*` (docs/plugins.md §3), so a
+    // HeadBucket (bucket-level ListBucket, no prefix) is denied and readiness never passed.
     try {
-      await this.client.send(new HeadBucketCommand({ Bucket: this.cfg.s3Bucket }));
+      await this.client.send(
+        new ListObjectsV2Command({ Bucket: this.cfg.s3Bucket, Prefix: `${this.cfg.canvasPrefix}/`, MaxKeys: 1 }),
+      );
       return true;
     } catch {
       return false;

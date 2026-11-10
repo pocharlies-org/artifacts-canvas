@@ -24,6 +24,13 @@ export interface Config {
   staticDir: string;
   /** Inject the `artifacts-canvas-config` element into the wrapper page. */
   injectConfig: boolean;
+  /**
+   * Where to send a visitor WITHOUT a session who opens the wrapper page of an artifact the
+   * gate does not open to anonymous visitors (authz reason `unauthenticated`): a URL with an
+   * `{rd}` placeholder that is replaced by the URL-encoded original path, e.g. the core's
+   * oauth2-proxy `/oauth2/sign_in?rd={rd}`. Empty = answer 403 like any other deny.
+   */
+  loginUrl: string;
 
   /** S3/MinIO persistence. */
   s3Endpoint?: string;
@@ -115,6 +122,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     frameFetchTimeoutMs: num(env, 'FRAME_FETCH_TIMEOUT_MS', 10000),
     staticDir: str(env, 'STATIC_DIR', path.resolve(here, '..', '..', 'client', 'dist')),
     injectConfig: bool(env, 'CANVAS_INJECT_CONFIG', true),
+    loginUrl: str(env, 'LOGIN_URL', ''),
     s3Endpoint: env.S3_ENDPOINT || undefined,
     s3Region: str(env, 'S3_REGION', 'us-east-1'),
     s3Bucket,
@@ -146,6 +154,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     goneReasons: new Set(list(env, 'GONE_REASONS', ['object-missing'])),
     logLevel: str(env, 'LOG_LEVEL', 'info'),
   };
+  if (cfg.loginUrl && !(/^\/[^/\\]/.test(cfg.loginUrl) || /^https?:\/\/[^/]+/.test(cfg.loginUrl))) {
+    throw new Error('LOGIN_URL must be a same-host path (/...) or an http(s) URL');
+  }
+  if (cfg.loginUrl && !cfg.loginUrl.includes('{rd}')) {
+    throw new Error('LOGIN_URL must contain the {rd} placeholder (the original path)');
+  }
   if (cfg.maxConnsPerRoomAnon > cfg.maxConnsPerRoom) {
     throw new Error('MAX_CONNS_PER_ROOM_ANON must be <= MAX_CONNS_PER_ROOM');
   }

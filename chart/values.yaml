@@ -19,6 +19,10 @@ core:
   gateAuthzUrl: "http://artifacts-core:8081/_gate/plugin/authz"
   # Internal base URL the canvas server fetches artifact HTML from (frame route).
   artifactBaseUrl: "http://artifacts-core:8080"
+  # Optional: where a visitor with no session is sent from the wrapper page, `{rd}` = the
+  # original path (URL-encoded). With the core chart: "/oauth2-artifacts/sign_in?rd={rd}".
+  # Empty = unauthenticated visitors get the plain 403.
+  loginUrl: ""
   # Namespace label selector of the core's namespace, for the NetworkPolicy.
   namespace:
     kubernetes.io/metadata.name: artifacts
