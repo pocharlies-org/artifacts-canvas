@@ -1,5 +1,5 @@
 import * as Y from 'yjs';
-import { ROOT } from '@pocharlies/artifacts-canvas-shared/model';
+import { ROOT, shapeRecordProblem, type ShapeFieldKind } from '@pocharlies/artifacts-canvas-shared/model';
 import {
   DEFAULT_STYLE, STYLE_KEYS,
   type Attribution, type HistoryEntry, type Shape, type ShapeType, type Style, type UserInfo,
@@ -22,20 +22,59 @@ export function newId(prefix = 's'): string {
 
 export type ShapeInit = Partial<Shape> & { type: ShapeType };
 
-/** Convert a shape Y.Map into a plain object. */
-export function readShape(m: Y.Map<unknown>): Shape {
+/**
+ * Convert a shape Y.Map into a plain object, or null when the entry is malformed (not a
+ * Y.Map, no valid `type`, a non-numeric geometry field, a line without terminals, ...).
+ * The server refuses such writes; this keeps a document that already holds one (or a
+ * development relay) usable: the bad entry is skipped and every good shape still renders.
+ * `key` is the entry's key in `shapes`, which is the shape id whatever the map says.
+ */
+export function readShape(m: unknown, key?: string): Shape | null {
+  if (!(m instanceof Y.Map)) return null;
   const o: Record<string, unknown> = {};
-  for (const [k, v] of m.entries()) {
-    if (v instanceof Y.Text) o[k] = v.toString();
-    else if (v instanceof Y.Array) o[k] = v.toArray();
-    else o[k] = v;
+  const fields = new Map<string, [unknown, ShapeFieldKind]>();
+  for (const [k, v] of (m as Y.Map<unknown>).entries()) {
+    if (v instanceof Y.Text) {
+      o[k] = v.toString();
+      fields.set(k, [o[k], 'text']);
+    } else if (v instanceof Y.Array) {
+      o[k] = v.toArray();
+      fields.set(k, [o[k], 'array']);
+    } else if (v instanceof Y.AbstractType) {
+      fields.set(k, [v, v instanceof Y.Map ? 'map' : 'other']);
+    } else {
+      o[k] = v;
+      fields.set(k, [v, 'value']);
+    }
   }
+  if (shapeRecordProblem(fields, true)) return null;
+  if (key !== undefined) o.id = key;
+  else if (typeof o.id !== 'string') return null;
   for (const k of STYLE_KEYS) if (o[k] === undefined) o[k] = DEFAULT_STYLE[k];
+  o.x ??= 0;
+  o.y ??= 0;
+  o.w ??= 0;
+  o.h ??= 0;
   o.rotation ??= 0;
   o.groupId ??= '';
   o.locked ??= false;
   o.index ??= 0;
+  if (o.type === 'draw') {
+    o.points ??= [];
+    o.ow ??= 0;
+    o.oh ??= 0;
+  }
+  if (o.type === 'text' || o.type === 'note' || o.type === 'geo') o.text ??= '';
+  if (o.type === 'geo') o.geo ??= 'rectangle';
+  if (o.type === 'frame') o.name ??= '';
+  if (o.type === 'image') o.assetId ??= '';
   return o as unknown as Shape;
+}
+
+/** The shape Y.Map at `id`, or undefined when absent or not a Y.Map. */
+function shapeMapOf(shapes: Y.Map<Y.Map<unknown>>, id: string): Y.Map<unknown> | undefined {
+  const m = shapes.get(id) as unknown;
+  return m instanceof Y.Map ? (m as Y.Map<unknown>) : undefined;
 }
 
 export interface ChangeSet {
@@ -157,19 +196,19 @@ export class CanvasDoc {
   get(id: string): Shape | undefined {
     const c = this.cache.get(id);
     if (c) return c;
-    const m = this.shapes.get(id);
-    if (!m) return undefined;
-    const s = readShape(m);
+    const s = readShape(this.shapes.get(id), id);
+    if (!s) return undefined;
     this.cache.set(id, s);
     return s;
   }
 
+  /** True for a readable shape (malformed entries are invisible, see readShape). */
   has(id: string) {
-    return this.shapes.has(id);
+    return this.get(id) !== undefined;
   }
 
   ids(): string[] {
-    return Array.from(this.shapes.keys());
+    return Array.from(this.shapes.keys()).filter((id) => this.get(id) !== undefined);
   }
 
   /** All shapes in paint order. */
@@ -184,7 +223,7 @@ export class CanvasDoc {
 
   maxIndex(): number {
     let m = 0;
-    for (const id of this.shapes.keys()) m = Math.max(m, (this.shapes.get(id)?.get('index') as number) ?? 0);
+    for (const id of this.shapes.keys()) m = Math.max(m, this.get(id)?.index ?? 0);
     return m;
   }
 
@@ -192,7 +231,9 @@ export class CanvasDoc {
     let m = 0;
     let first = true;
     for (const id of this.shapes.keys()) {
-      const v = (this.shapes.get(id)?.get('index') as number) ?? 0;
+      const s = this.get(id);
+      if (!s) continue;
+      const v = s.index;
       m = first ? v : Math.min(m, v);
       first = false;
     }
@@ -214,7 +255,7 @@ export class CanvasDoc {
   /** Shape count per createdBy. */
   countsByAuthor(): Map<string, number> {
     const out = new Map<string, number>();
-    for (const id of this.shapes.keys()) {
+    for (const id of this.ids()) {
       const a = this.attribution.get(id);
       const by = a?.createdBy ?? '';
       out.set(by, (out.get(by) ?? 0) + 1);
@@ -250,7 +291,7 @@ export class CanvasDoc {
   }
 
   update(id: string, patch: Partial<Shape> | Record<string, unknown>) {
-    const m = this.shapes.get(id);
+    const m = shapeMapOf(this.shapes, id);
     if (!m) return;
     this.transact(() => {
       for (const [k, v] of Object.entries(patch)) {
@@ -261,7 +302,7 @@ export class CanvasDoc {
         }
         if (YARRAY_FIELDS.has(k)) {
           const a = m.get(k) as Y.Array<number> | undefined;
-          if (a) {
+          if (a instanceof Y.Array) {
             a.delete(0, a.length);
             a.push(v as number[]);
           } else {
@@ -305,11 +346,11 @@ export class CanvasDoc {
   }
 
   appendPoints(id: string, pts: number[]) {
-    const m = this.shapes.get(id);
+    const m = shapeMapOf(this.shapes, id);
     if (!m) return;
     this.transact(() => {
-      const a = m.get('points') as Y.Array<number> | undefined;
-      if (a) a.push(pts);
+      const a = m.get('points');
+      if (a instanceof Y.Array) (a as Y.Array<number>).push(pts);
     });
   }
 

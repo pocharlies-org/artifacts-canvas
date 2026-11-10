@@ -106,7 +106,7 @@ export class AuthzClient {
         this.log.error({ artifactKey }, 'core allowed anonymous outside pub/ (refusing)');
         return done(deny('anon_outside_pub'));
       }
-      // user.id is null for anonymous; the server composes its own anon:<NNNN> identity.
+      // user.id is null for anonymous; the server composes its own anon:<visitor id> identity.
       return done({ allowed: true, reason: str(o.reason) ?? 'ok', artifact });
     }
 

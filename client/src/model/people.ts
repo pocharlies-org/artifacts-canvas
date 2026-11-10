@@ -20,7 +20,8 @@ export function displayUser(users: (id: string) => UserInfo | undefined, id: str
   const u = users(id);
   if (u) return { name: u.name, anonymous: u.anonymous, color: u.color || personColor(id, u.anonymous) };
   const anon = id.startsWith('anon:');
-  const name = anon ? `Anónimo ${id.slice(5)}` : id || '?';
+  // anonymous ids are opaque (anon:<visitor id>); only a legacy anon:NNNN carries the number
+  const name = anon ? (/^anon:\d{4}$/.test(id) ? `Anónimo ${id.slice(5)}` : 'Anónimo') : id || '?';
   return { name, anonymous: anon, color: personColor(id, anon) };
 }
 

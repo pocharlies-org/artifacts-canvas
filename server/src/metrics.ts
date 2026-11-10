@@ -57,6 +57,12 @@ export class Metrics {
     labelNames: ['outcome'],
     registers: [this.registry],
   });
+  readonly pendingDropped = new Counter({
+    name: 'canvas_pending_dropped_total',
+    help: 'Pending (unintegrated) Yjs state dropped from a room: on load, at save, or after an apply the guard let through',
+    labelNames: ['where'],
+    registers: [this.registry],
+  });
   readonly deletes = new Counter({
     name: 'canvas_deletes_total',
     help: 'Canvas objects deleted (expiry / sweep)',

@@ -10,6 +10,11 @@ import crypto from 'node:crypto';
  * `?anon=NNNN` is only a hint, used for a visitor without a cookie, and never wins over
  * another live connection: a number held by a different visitor in the room is replaced
  * by a free one.
+ *
+ * Attribution is bound to the visitor, not to the number: the identity id is
+ * `anon:<visitorId>`, an HMAC of the cookie nonce, so a later visitor who hints (or is given)
+ * the same free number shows the same "Anónimo NNNN" label but can never write as, or be
+ * credited with, the earlier visitor's shapes and history lines.
  */
 export const ANON_COOKIE = 'canvas_anon';
 const MAX_AGE_SECONDS = 30 * 24 * 3600;
@@ -53,6 +58,11 @@ export class AnonIssuer {
     const v = this.parse(cookieHeader);
     if (v) return { ...v, fresh: false };
     return { nonce: crypto.randomBytes(16).toString('base64url'), num: validNum(hint) ?? randomNum(), fresh: true };
+  }
+
+  /** Stable, non-reversible attribution id of a visitor (16 base64url chars from its nonce). */
+  visitorId(nonce: string): string {
+    return crypto.createHmac('sha256', this.key).update(`visitor-id\n${nonce}`).digest('base64url').slice(0, 16);
   }
 
   /** `Set-Cookie` value for this visitor and pseudonym. */

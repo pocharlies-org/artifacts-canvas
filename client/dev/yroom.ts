@@ -14,7 +14,7 @@ import * as decoding from 'lib0/decoding';
 import * as syncProtocol from 'y-protocols/sync';
 import * as awarenessProtocol from 'y-protocols/awareness';
 import type { WebSocket } from 'ws';
-import { attachStamper, forbiddenRootWrite } from '../src/model/stamper';
+import { attachStamper, dropPending, forbiddenRootWrite } from '../src/model/stamper';
 import { CLOSE, MSG_AWARENESS, MSG_QUERY_AWARENESS, MSG_SYNC, encodeIdentity } from '../src/collab/protocol';
 import { sanitizeAwarenessUpdate } from '@pocharlies/artifacts-canvas-shared/awareness';
 import { personColor } from '../src/model/colors';
@@ -107,6 +107,8 @@ export class Room {
           return;
         }
         Y.applyUpdate(this.doc, update, conn);
+        // same invariant as the production server: the room never keeps pending state
+        if (dropPending(this.doc)) conn.ws.close(CLOSE.forbidden, 'write not allowed');
         return;
       }
       if (type === MSG_AWARENESS) {

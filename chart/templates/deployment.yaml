@@ -7,6 +7,9 @@ metadata:
 spec:
   # Rooms are in-memory: replicas > 1 needs sticky routing per artifact key (or a shared
   # backend) or two pods would serve divergent documents for the same artifact.
+  {{- if and (gt (int .Values.deployment.replicas) 1) (not .Values.anon.cookieSecretRef.name) }}
+  {{- fail "anon.cookieSecretRef.name is required when deployment.replicas > 1 (every pod must sign and verify the same anonymous-visitor cookie)" }}
+  {{- end }}
   replicas: {{ .Values.deployment.replicas }}
   strategy:
     type: Recreate # single writer per room; no rolling overlap on the same rooms
@@ -67,6 +70,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.s3.secretRef.name }}
                   key: {{ .Values.s3.secretRef.secretAccessKeyKey }}
+            {{- end }}
+            {{- if .Values.anon.cookieSecretRef.name }}
+            - name: ANON_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.anon.cookieSecretRef.name }}
+                  key: {{ .Values.anon.cookieSecretRef.key }}
             {{- end }}
           securityContext:
             # The server writes nothing: read-only root filesystem. Node needs a writable tmp.

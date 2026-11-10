@@ -158,7 +158,8 @@ test('c. anonymous draws on a pub/ canvas as "Anónimo NNNN"; anonymous is refus
   const anon = await me(pa);
   expect(anon.anonymous).toBe(true);
   expect(anon.name).toMatch(/^Anónimo \d{4}$/);
-  expect(anon.id).toBe(`anon:${anon.name.slice('Anónimo '.length)}`);
+  // the attribution id is bound to the visitor's signed cookie, not to the number it shows
+  expect(anon.id).toMatch(/^anon:[A-Za-z0-9_-]{16}$/);
   await draw(pa, [420, 400]);
   await waitFor(async () => (await shapes(pa)).length === 1, 8_000, 'anonymous stroke applied');
   const [s] = await shapes(pa);

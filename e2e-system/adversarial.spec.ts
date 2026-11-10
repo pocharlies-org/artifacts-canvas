@@ -86,7 +86,7 @@ async function joined(url: string, headers: Record<string, string> = {}): Promis
 function geo(doc: Y.Doc, id: string): void {
   doc.transact(() => {
     const m = new Y.Map<unknown>();
-    for (const [k, v] of Object.entries({ id, type: 'geo', geo: 'rectangle', x: 100, y: 100, w: 200, h: 120, rotation: 0, color: 'red', fill: 'none', dash: 'solid', size: 'm', font: 'draw', arrowheads: 'none', opacity: 1, index: 'a1', text: '' })) m.set(k, v);
+    for (const [k, v] of Object.entries({ id, type: 'geo', geo: 'rectangle', x: 100, y: 100, w: 200, h: 120, rotation: 0, color: 'red', fill: 'none', dash: 'solid', size: 'm', font: 'draw', arrowheads: 'none', opacity: 1, index: 1, text: '' })) m.set(k, v);
     doc.getMap('shapes').set(id, m);
   });
 }
@@ -268,20 +268,25 @@ test('5. an anonymous visitor filling the document is closed alone; logged-in an
 test('6. anonymous ids are assigned by the server: a client hint never collides, never carries an e-mail', async () => {
   const a = await joined(wsUrl(pubArt.key, '?anon=1234'));
   const b = await joined(wsUrl(pubArt.key, '?anon=1234'));
-  expect(a.ident?.id).toMatch(/^anon:\d{4}$/);
-  expect(b.ident?.id).toMatch(/^anon:\d{4}$/);
+  expect(a.ident?.id).toMatch(/^anon:[A-Za-z0-9_-]{16}$/);
+  expect(b.ident?.id).toMatch(/^anon:[A-Za-z0-9_-]{16}$/);
   expect(b.ident?.id).not.toBe(a.ident?.id);
+  expect(a.ident?.name).toMatch(/^Anónimo \d{4}$/);
+  expect(b.ident?.name).toMatch(/^Anónimo \d{4}$/);
+  expect(b.ident?.name).not.toBe(a.ident?.name);
   expect(a.setCookie).toMatch(/^canvas_anon=[^;]+; Path=\/_canvas\/; Max-Age=\d+; HttpOnly; SameSite=Lax/);
   const e = await joined(wsUrl(pubArt.key, `?anon=${encodeURIComponent(USERS.user1.email)}`));
-  expect(e.ident?.id).toMatch(/^anon:\d{4}$/);
+  expect(e.ident?.id).toMatch(/^anon:[A-Za-z0-9_-]{16}$/);
+  expect(e.ident?.id).not.toContain('@');
   expect(e.ident?.name).toMatch(/^Anónimo \d{4}$/);
   // the same visitor (its server cookie) keeps its pseudonym in another tab, whatever it hints
   const a2 = await joined(wsUrl(pubArt.key, '?anon=9999'), { cookie: a.setCookie!.split(';')[0] });
   expect(a2.ident?.id).toBe(a.ident?.id);
   // a tampered cookie is a new visitor: it cannot take a's pseudonym
   const tampered = a.setCookie!.split(';')[0].replace(/.$/, (ch) => (ch === 'A' ? 'B' : 'A'));
-  const t = await joined(wsUrl(pubArt.key, `?anon=${a.ident!.id.slice(5)}`), { cookie: tampered });
+  const t = await joined(wsUrl(pubArt.key, `?anon=${a.ident!.name.slice('Anónimo '.length)}`), { cookie: tampered });
   expect(t.ident?.id).not.toBe(a.ident?.id);
+  expect(t.ident?.name).not.toBe(a.ident?.name);
   console.log(`[adv] anon ids: a=${a.ident?.id} b=${b.ident?.id} email-hint=${e.ident?.id} a-tab2=${a2.ident?.id} tampered=${t.ident?.id}`);
   for (const c of [a, b, e, a2, t]) c.close();
 });

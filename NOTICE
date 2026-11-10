@@ -1,10 +1,24 @@
 artifacts-canvas
 Copyright 2026 Daniel Ibáñez
 
-This product includes software developed by third parties under permissive licences
-(MIT): Yjs, y-websocket, y-protocols, lib0, isomorphic.js, perfect-freehand and
-html-to-image. See package-lock.json (the npm workspaces lockfile at the repository
-root) for the exact versions.
+This product includes software developed by third parties. See package-lock.json (the
+npm workspaces lockfile at the repository root) for the exact versions; each package
+ships its own licence text in node_modules/<package>/LICENSE.
+
+Runtime dependencies under the Apache License, Version 2.0
+(https://www.apache.org/licenses/LICENSE-2.0) — server only:
+  - AWS SDK for JavaScript v3 (@aws-sdk/client-s3 and its @aws-sdk/*, @smithy/* and
+    @aws/lambda-invoke-store dependencies), Copyright Amazon.com, Inc. or its affiliates.
+  - prom-client, Copyright the prom-client authors (siimon/prom-client).
+  - @opentelemetry/api (optional peer of the AWS SDK), Copyright The OpenTelemetry Authors.
+  None of these packages ships a NOTICE file of its own.
+
+Runtime dependencies under the MIT licence: Yjs, y-websocket, y-protocols, lib0,
+isomorphic.js, perfect-freehand and html-to-image (client); ws, pino and its helpers
+(@pinojs/redact, atomic-sleep, on-exit-leak-free, pino-abstract-transport,
+pino-std-serializers, process-warning, quick-format-unescaped, real-require,
+safe-stable-stringify, sonic-boom, thread-stream), bintrees, tdigest and bowser (server).
+Under ISC: split2. Under 0BSD: tslib.
 
 This product bundles the Shantell Sans font (client/public/fonts/shantell-sans-latin-400-normal.woff2
 and shantell-sans-latin-ext-400-normal.woff2), Copyright 2022 The Shantell Sans Project Authors

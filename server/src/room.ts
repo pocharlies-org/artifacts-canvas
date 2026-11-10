@@ -9,7 +9,7 @@ import type { Metrics } from './metrics.js';
 import { canvasObjectKey } from './paths.js';
 import type { CanvasObjectStore } from './store.js';
 import type { Identity } from './types.js';
-import { attachStamper } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { attachStamper, dropPending, encodeIntegratedState, hasPending } from '@pocharlies/artifacts-canvas-shared/stamper';
 import { ROOT } from '@pocharlies/artifacts-canvas-shared/model';
 import { MSG_SYNC } from '@pocharlies/artifacts-canvas-shared/protocol';
 import type { TokenBucket } from './limits.js';
@@ -24,6 +24,8 @@ export interface Conn {
   identity: Identity;
   /** anonymous visitor nonce from the server-signed cookie (anon.ts); undefined if logged in */
   anonVisitor?: string;
+  /** the pseudonym number shown for an anonymous visitor ("Anónimo NNNN") */
+  anonNum?: string;
   /** awareness clientIds this connection has claimed (protocol §5.4 hardening) */
   clientIds: Set<number>;
   rate: TokenBucket;
@@ -52,6 +54,13 @@ export class Room {
   /** rough doc size estimate; refreshed exactly when it crosses the limit or on save */
   approxBytes = 0;
   ttlTag: string | null = null;
+  /**
+   * Yjs client id -> the principal (identity id) that writes with it. A client id is bound
+   * to the first principal that adds clocks to it and nobody else may extend it while the
+   * room is loaded (a forged struct at someone else's next clock would make Yjs drop that
+   * person's real edit as "already known").
+   */
+  private readonly writers = new Map<number, string>();
   private saveTimer?: ReturnType<typeof setTimeout>;
   private dirty = false;
   private saving: Promise<void> = Promise.resolve();
@@ -131,12 +140,19 @@ export class Room {
   }
 
   async load(): Promise<void> {
-    const { store, metrics } = this.deps;
+    const { store, metrics, log } = this.deps;
     try {
       const data = await store.get(this.objectKey);
       if (data && data.byteLength > 0) {
         Y.applyUpdate(this.doc, data, 'load');
         this.approxBytes = data.byteLength;
+        // A stored document must integrate completely. Parked structs/deletes (an object
+        // written before the guard refused them) are dropped and the clean state is saved.
+        if (dropPending(this.doc)) {
+          log.warn({ room: this.name }, 'stored canvas had pending structs: dropped');
+          metrics.pendingDropped.inc({ where: 'load' });
+          this.markDirty();
+        }
       }
       metrics.loads.inc({ outcome: 'ok' });
     } catch (err) {
@@ -162,7 +178,12 @@ export class Room {
       const { store, metrics, log } = this.deps;
       const t0 = performance.now();
       try {
-        const bytes = Y.encodeStateAsUpdate(this.doc);
+        // never persist parked structs/deletes (encodeStateAsUpdate would merge them in)
+        if (dropPending(this.doc)) {
+          log.error({ room: this.name }, 'room had pending structs at save: dropped');
+          metrics.pendingDropped.inc({ where: 'save' });
+        }
+        const bytes = encodeIntegratedState(this.doc);
         this.approxBytes = bytes.byteLength;
         await store.put(this.objectKey, bytes, this.ttlTag ?? undefined);
         this.dirty = false;
@@ -186,6 +207,38 @@ export class Room {
     await this.save();
   }
 
+  /** True when the room holds structs/deletes Yjs could not integrate. */
+  hasPending(): boolean {
+    return hasPending(this.doc);
+  }
+
+  /**
+   * Back to the last good state after an update left pending state: the parked part was
+   * never integrated (no observer, client or save saw it), so dropping it IS the state
+   * before that update for everything a client or the object store has. Persisted now.
+   */
+  async recoverFromPending(): Promise<void> {
+    if (!dropPending(this.doc)) return;
+    this.deps.metrics.pendingDropped.inc({ where: 'apply' });
+    this.dirty = true;
+    await this.flush();
+  }
+
+  /** May `principal` add clocks to Yjs client id `client`? (see `writers`) */
+  mayWrite(client: number, principal: string, conn: Conn): boolean {
+    if (client === this.doc.clientID) return false;
+    const owner = this.writers.get(client);
+    if (owner !== undefined) return owner === principal;
+    // not written yet: refuse an id that another live connection announced as its own
+    for (const c of this.conns.values()) if (c !== conn && c.identity.id !== principal && c.clientIds.has(client)) return false;
+    return true;
+  }
+
+  /** Bind the client ids of an accepted update to its principal. */
+  claimWriters(clients: number[], principal: string): void {
+    for (const c of clients) if (!this.writers.has(c)) this.writers.set(c, principal);
+  }
+
   /** Live connections of one anonymous visitor (server-issued nonce). */
   countVisitor(nonce: string): number {
     let n = 0;
@@ -193,11 +246,11 @@ export class Room {
     return n;
   }
 
-  /** Live anonymous pseudonyms (the NNNN of `anon:NNNN`) -> the visitor holding them. */
+  /** Live anonymous pseudonyms (the NNNN of "Anónimo NNNN") -> the visitor holding them. */
   anonHolders(): Map<string, string> {
     const m = new Map<string, string>();
     for (const c of this.conns.values()) {
-      if (c.identity.anonymous && c.anonVisitor) m.set(c.identity.id.slice('anon:'.length), c.anonVisitor);
+      if (c.identity.anonymous && c.anonVisitor && c.anonNum) m.set(c.anonNum, c.anonVisitor);
     }
     return m;
   }

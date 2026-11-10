@@ -169,13 +169,16 @@ The canvas is a core plugin (design §8): the core answers *who may see this art
 
    ```sh
    helm install canvas ./chart -n sso \
-     --set core.publicHost=artifacts.example.com \
+     --set core.publicHost=<your artifacts host> \
      --set s3.bucket=artifacts \
      --set s3.endpoint=http://minio.minio.svc.cluster.local:9000
    ```
 
    The defaults match the core chart, so `core.publicHost` (the core's `artifactsHost`) is the only
-   required value:
+   required value. It has **no default**: rendering fails when it is empty or an `example.*`
+   placeholder (unless both `core.artifactBaseUrl` and `core.allowedOrigins` are set). With
+   `deployment.replicas` > 1, `anon.cookieSecretRef.name` is required as well (rendering fails
+   otherwise):
 
    | Value | Default | Core chart object |
    |---|---|---|
@@ -187,6 +190,7 @@ The canvas is a core plugin (design §8): the core answers *who may see this art
    | `networkPolicy.ingressNamespace` | `traefik-system` | namespace of the Traefik controller serving the core's IngressRoutes |
    | `core.namespace` | `sso` | `namespaces.sso` (the gate) |
    | `metrics.port` / `networkPolicy.metricsNamespaces` | `9091` / `[monitoring]` | internal Prometheus port, not in any route |
+   | `anon.cookieSecretRef.name` / `.key` | `""` / `anon-cookie-secret` | an operator-created Secret holding `ANON_COOKIE_SECRET` (≥ 32 random bytes); required when `deployment.replicas` > 1, recommended always (without it anonymous cookies and ids reset on every restart) |
 
    The chart ships the Deployment, Service (`http` 8080, `metrics` 9091), ConfigMap, ServiceAccount and a
    NetworkPolicy: `http` only from the ingress controller's namespace and the core's namespace, `metrics`
@@ -227,7 +231,7 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `MAX_IMAGE_BYTES` / `ANON_MAX_IMAGE_BYTES` | `2 MiB` / `1 MiB` | Announced to the client as its paste cap. |
 | `ALLOWED_ORIGINS` | origin of `ARTIFACT_BASE_URL` | Comma-separated browser origins (`scheme://host[:port]`) allowed to open the WebSocket. A missing, `null` or foreign `Origin` is closed `4403` (cross-site WebSocket hijacking guard). |
 | `METRICS_PORT` / `METRICS_HOST` | `9091` / `0.0.0.0` | Internal Prometheus listener (`/metrics` only; `0` disables it). The public listener answers `404` for `/metrics`. |
-| `ANON_COOKIE_SECRET` | (random per process) | Signs the anonymous-visitor cookie: the server assigns the *Anónimo NNNN* pseudonym, `?anon=` is only a hint. |
+| `ANON_COOKIE_SECRET` | (random per process) | Signs the anonymous-visitor cookie: the server assigns the *Anónimo NNNN* pseudonym (`?anon=` is only a hint for the number shown) and the anonymous attribution id `anon:<visitor id>` is derived from the cookie's nonce. Chart: `anon.cookieSecretRef` (a Secret reference, never a value); required with more than one replica, since every pod must verify the same cookie. |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. |
 
 ### Container image

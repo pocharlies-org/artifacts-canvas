@@ -141,7 +141,7 @@ speaks the standard y-websocket protocol: every message is `varUint type` + payl
 
 ```ts
 interface Identity {
-  id: string;          // UPN for logged-in users; "anon:NNNN" for anonymous pub/ visitors. ≤ 256 chars
+  id: string;          // UPN for logged-in users; "anon:<visitor id>" (16 base64url chars) for anonymous pub/ visitors. ≤ 256 chars
   name: string;        // display name from the verified identity; "Anónimo NNNN" for anonymous. ≤ 128 chars
   anonymous: boolean;
   color?: string;      // "#rrggbb", optional; the client derives a stable colour from id otherwise
@@ -160,7 +160,10 @@ interface Identity {
   pseudonym). `anon=NNNN` (the number the client keeps in `localStorage`,
   `artifacts-canvas:anon`) is only a **hint** for a visitor without a cookie; a number held
   by another visitor on a live connection of the room is never given out again — the
-  server picks a free one. Logged-in connections ignore both. Anonymous
+  server picks a free one. The hint only ever chooses the **number shown**: the anonymous
+  attribution id is `anon:<visitor id>`, an HMAC of the cookie's nonce, so a later visitor
+  who gets a freed number shows the same label but never writes as — or is credited with —
+  the earlier visitor's shapes and history. Logged-in connections ignore both. Anonymous
   connections are accepted only for keys inside `ANON_ALLOWED_PREFIXES` (default `pub/`);
   anything else is denied with reason `anon_outside_pub` (§7).
 - Close codes (RFC 6455 private range; the client does not reconnect on 44xx): `4403`
@@ -212,16 +215,32 @@ server announces `attribution: 'server'` and MUST:
    These stamper transactions are broadcast to every connection, including the sender.
 3. **Reject client writes outside `shapes`, `assets` and `meta`** (an allow-list: the stamper
    roots `attribution`, `users`, `history` and any unknown root are server-only): before
-   applying an update, call `forbiddenRootWrite(roomDoc, update)` (same file). It resolves
-   every inserted struct to its root — Yjs omits `parent` for an item that has a left/right
-   origin, so the origin chain is followed through the update and the room — and every
-   deletion through the room (deleting an item the room does not have yet, which would wait
-   as a pending delete for a future stamper item, is refused as `pending`). What it cannot
-   resolve (missing dependencies, origin cycles) is applied to a scratch copy of the room and
-   rejected if any server-only root changed or anything is left pending. A malformed update
-   that makes decoding throw counts as forbidden too. Then close the connection with `4403`
-   and do **not** apply the update. This applies to plain updates and to step-2 payloads
-   alike (§4.1).
+   applying an update, call `checkClientUpdate(roomDoc, update, {serverClient, mayWriteClient})`
+   (same file; `forbiddenRootWrite` is the same check returning only the reason). It resolves
+   every NEW struct to its parent type — Yjs omits `parent` (and the map key) for an item
+   that has a left/right origin, so origins are followed through the room for clocks it has
+   (a forged copy of a known struct in the update is ignored, as Yjs ignores it) and through
+   the update for new ones — and every deletion through the room. Refused:
+   - a write or delete outside the allow-list (the root's name);
+   - `pending`: anything that would not integrate completely — a struct starting beyond the
+     room's clock for its client, a hole (Skip) or non-contiguous clocks, an origin/parent
+     that neither the room nor the update has, a delete of clocks nobody wrote yet. Yjs would
+     park it and release it later, after the guard, e.g. right after the stamper's next
+     history line. **The room never holds pending state**;
+   - `server-client` (a struct carrying the stamper's client id), `foreign-client` (new
+     clocks for a client id bound to another principal or announced in another connection's
+     awareness), `overlap` (a struct that only partly overlaps the room), `malformed`;
+   - `shapes-schema` / `assets-schema` / `meta-schema`: §6.
+   What it cannot resolve (origin cycles, very long chains) is applied to a scratch copy of
+   the integrated room and rejected if a server-only root changed, a touched value breaks
+   §6, or anything is left pending. A malformed update that makes decoding throw counts as
+   forbidden too. Then close the connection with `4403` and do **not** apply the update.
+   This applies to plain updates and to step-2 payloads alike (§4.1). After every apply the
+   server asserts that the room holds no pending structs/deletes; if one ever did, the sender
+   is closed `4403` and the parked part — which no observer, client or save ever saw — is
+   dropped, which returns the room to its last good state, and that state is saved. A room
+   never persists pending state (saves encode the integrated document only) and a stored
+   object that has some is cleaned on load and saved back.
 4. **Overwrite the awareness `user` field** of every awareness update from a connection with
    that connection's identity (`awarenessProtocol.modifyAwarenessUpdate`), so live cursors
    and labels cannot lie either. States for clientIds already owned by another connection
@@ -241,6 +260,17 @@ announce it in production.
 | `attribution` | `Y.Map<Attribution>` | server | §5 |
 | `users` | `Y.Map<UserInfo>` | server | §5 |
 | `history` | `Y.Array<HistoryEntry>` | server | §5 |
+
+Enforced schema (server guard `shapes-schema`/`assets-schema`/`meta-schema`, the same rules
+the client reader applies to skip a malformed entry instead of throwing): every direct child
+of `shapes` is a `Y.Map` (never a number, string, `null`, array or text); a new shape carries a
+`type` from the list below in its first update and a live shape never loses it; `x, y, w, h,
+rotation, index, opacity, bend, ow, oh` are finite numbers within ±1e9; `locked, highlight,
+done, pen, fixedWidth` booleans; `id, groupId, name, assetId` and the style strings strings;
+`geo` one of `GEO_KINDS`; `start`/`end` terminals; `text` a `Y.Text` (or a string) holding text;
+`points` a `Y.Array` (or array) of finite numbers; unknown fields only plain JSON values, never
+nested types. `assets` values are strings; `meta` values plain JSON (no nested types). The
+client reader also needs both terminals on lines/arrows and uses the map key as the shape id.
 
 Shape map fields (types in [`shared/src/model.ts`](../shared/src/model.ts)): `id`, `type`
 (`draw | line | arrow | text | note | geo | frame | image`), `x, y, w, h, rotation`
@@ -296,8 +326,9 @@ Body: `{allowed, reason, user:{id,name,anonymous}, artifact:{key,expires,ttl}}`.
   answer.
 - `user.anonymous: true` (the gate sends `id: null`, `name: "anonymous"`) is accepted only
   for keys inside `ANON_ALLOWED_PREFIXES` (default `pub/`); anything else is denied with
-  reason `anon_outside_pub`. The server composes the `anon:<NNNN>` pseudonym itself (§4:
-  server-assigned, `?anon=` only a hint).
+  reason `anon_outside_pub`. The server composes the anonymous identity itself (§4:
+  `anon:<visitor id>` bound to its signed cookie, label `Anónimo NNNN` server-assigned,
+  `?anon=` only a hint for the number).
 - `artifact.ttl` is an **integer number of days** (or null); valid values (0–999) are copied
   onto the canvas object as an S3 tag `ttl=<n>` (design §6.3). `artifact.expires` is an ISO
   8601 datetime (ACL `expires`, else lastModified + ttl) — a past value means expired even

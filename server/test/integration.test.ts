@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import * as encoding from 'lib0/encoding';
+import { writeUpdate as syncProtocolWriteUpdate } from 'y-protocols/sync';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -55,7 +56,7 @@ const silentLogger = createLogger('silent');
 const apps: App[] = [];
 
 /** A shape as the real client model stores them: a Y.Map inside the shapes root. */
-function shape(fields: Record<string, unknown> = { type: 'rect' }): Y.Map<unknown> {
+function shape(fields: Record<string, unknown> = { type: 'geo' }): Y.Map<unknown> {
   const m = new Y.Map<unknown>();
   for (const [k, v] of Object.entries(fields)) m.set(k, v);
   return m;
@@ -109,7 +110,7 @@ describe('real client protocol: two y-websocket clients through the server', () 
     // c2 draws a shape; c1 must see it.
     c2.doc.transact(() => {
       const shape = new Y.Map<unknown>();
-      shape.set('type', 'rect');
+      shape.set('type', 'geo');
       c2.doc.getMap('shapes').set('s1', shape);
     });
     await waitFor(() => c1.doc.getMap('shapes').has('s1'), 3000, 'shapes on c1');
@@ -302,12 +303,13 @@ describe('authz enforcement', () => {
     await expectClose(c, 4403);
   });
 
-  it('anonymous pub/ visitor gets the anon:NNNN pseudonym (the hint, when free) and a signed cookie', async () => {
+  it('anonymous pub/ visitor gets the "Anónimo NNNN" pseudonym (the hint, when free), an id bound to its cookie and a signed cookie', async () => {
     core.rules.set('pub/doc.html', allowAnon());
     const app = await startApp();
     const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/pub/doc.html?anon=4321`);
     await c.connect();
-    expect(c.identity).toMatchObject({ id: 'anon:4321', name: 'Anónimo 4321', anonymous: true });
+    expect(c.identity).toMatchObject({ name: 'Anónimo 4321', anonymous: true });
+    expect(c.identity!.id).toMatch(/^anon:[A-Za-z0-9_-]{16}$/);
     expect(c.setCookie).toMatch(/^canvas_anon=[A-Za-z0-9_-]{22}\.4321\.[A-Za-z0-9_-]{27}; Path=\/_canvas\/; Max-Age=\d+; HttpOnly; SameSite=Lax$/);
   });
 
@@ -321,23 +323,27 @@ describe('authz enforcement', () => {
     // another visitor (no cookie) asking for the same number gets a different one
     const b = new TestClient(`${url}?anon=1234`);
     await b.connect();
-    expect(a.identity!.id).toBe('anon:1234');
-    expect(b.identity!.id).toMatch(/^anon:\d{4}$/);
-    expect(b.identity!.id).not.toBe('anon:1234');
+    expect(a.identity!.name).toBe('Anónimo 1234');
+    expect(b.identity!.name).toMatch(/^Anónimo \d{4}$/);
+    expect(b.identity!.name).not.toBe('Anónimo 1234');
+    expect(b.identity!.id).not.toBe(a.identity!.id);
     // the same visitor (its cookie) in a second tab keeps its pseudonym, whatever it hints
     const a2 = new TestClient(`${url}?anon=9999`, cookieA);
     await a2.connect();
-    expect(a2.identity!.id).toBe('anon:1234');
+    expect(a2.identity!.id).toBe(a.identity!.id);
+    expect(a2.identity!.name).toBe('Anónimo 1234');
     expect(a2.setCookie).toBeNull();
     // a forged/tampered cookie is just ignored (new visitor), it cannot claim 1234
     const forged = cookieA.replace(/\.1234\./, '.1234.').replace(/.$/, (ch) => (ch === 'A' ? 'B' : 'A'));
     const f = new TestClient(`${url}?anon=1234`, forged);
     await f.connect();
-    expect(f.identity!.id).not.toBe('anon:1234');
+    expect(f.identity!.id).not.toBe(a.identity!.id);
+    expect(f.identity!.name).not.toBe('Anónimo 1234');
     // non-numeric hints are ignored
     const g = new TestClient(`${url}?anon=test@example.com`);
     await g.connect();
-    expect(g.identity!.id).toMatch(/^anon:\d{4}$/);
+    expect(g.identity!.id).toMatch(/^anon:[A-Za-z0-9_-]{16}$/);
+    expect(g.identity!.name).toMatch(/^Anónimo \d{4}$/);
     // per-visitor cap counts the visitor (cookie), not the number it shows
     const app2 = await startApp({ MAX_CONNS_PER_ANON_VISITOR: '2' });
     const url2 = `ws://127.0.0.1:${(app2.server.address() as { port: number }).port}/_canvas/_/ws/pub/anon.html`;
@@ -375,7 +381,7 @@ describe('persistence', () => {
     const c1 = new TestClient(`ws://127.0.0.1:${(app1.server.address() as { port: number }).port}/_canvas/_/ws/runs/persist.html`);
     await c1.connect();
     c1.doc.transact(() => {
-      c1.doc.getMap('shapes').set('kept', shape({ type: 'rect', x: 1 }));
+      c1.doc.getMap('shapes').set('kept', shape({ type: 'geo', x: 1 }));
     });
     await waitFor(() => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/persist.html')));
     await app1.close(); // flushes on shutdown
@@ -455,7 +461,7 @@ describe('abuse limits', () => {
     const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/big.html`);
     await c.connect();
     c.doc.transact(() => {
-      c.doc.getMap('shapes').set('big', shape({ type: 'draw', points: 'x'.repeat(100_000) }));
+      c.doc.getMap('shapes').set('big', shape({ type: 'note', text: 'x'.repeat(100_000) }));
     });
     await expectClose(c, 4413);
     expect(c.notices.some((n) => n.kind === 'too-large')).toBe(true);
@@ -635,5 +641,254 @@ describe('http routes', () => {
     const ws = new TestClient(`ws://127.0.0.1:${port}/ws/runs/s.html`);
     await ws.connect();
     expect(ws.identity?.id).toBe('ana@corp');
+  });
+});
+
+/** A y-websocket SYNC update message carrying `update`. */
+function syncUpdateMsg(update: Uint8Array): Uint8Array {
+  const e = encoding.createEncoder();
+  encoding.writeVarUint(e, 0);
+  syncProtocolWriteUpdate(e, update);
+  return encoding.toUint8Array(e);
+}
+
+/** clock 1 of a fresh client without clock 0: Yjs would park it as pending */
+function gapShapeUpdate(client: number): Uint8Array {
+  const a = new Y.Doc();
+  a.clientID = client;
+  a.getMap('shapes').set('p0', shape({ type: 'geo' }));
+  const sv = Y.encodeStateVector(a);
+  a.getMap('shapes').set('p1', shape({ type: 'geo' }));
+  return Y.encodeStateAsUpdate(a, sv);
+}
+
+/** an item appended to history right after the stamper's future struct (S, N + before) */
+function afterFutureStamp(state: Y.Doc, S: number, before: number): Uint8Array {
+  const sim = new Y.Doc();
+  Y.applyUpdate(sim, Y.encodeStateAsUpdate(state));
+  sim.clientID = S;
+  sim.transact(() => {
+    for (let i = 0; i < before; i++) sim.getMap('attribution').set(`__sim${i}`, {});
+    sim.getArray('history').push([{}]);
+  });
+  const ev = new Y.Doc();
+  Y.applyUpdate(ev, Y.encodeStateAsUpdate(sim));
+  ev.clientID = 3000000 + Math.floor(Math.random() * 1e6);
+  const sv = Y.encodeStateVector(ev);
+  const h = ev.getArray('history');
+  h.insert(h.length, [{ t: Date.now(), by: 'ana@corp', verb: 'delete', shapeId: 'FORGED', shapeType: 'geo' }]);
+  return Y.encodeStateAsUpdate(ev, sv);
+}
+
+const stamperClientOf = (doc: Y.Doc) => ((doc.getArray('history') as unknown as { _start: Y.Item })._start).id.client;
+const historyShapeIds = (doc: Y.Doc) => (doc.getArray('history').toJSON() as { shapeId: string }[]).map((e) => e.shapeId);
+
+describe('fv2 regressions through the server: the room never holds pending state', () => {
+  async function room2(key: string) {
+    core.rules.set(key, allowUser('ana@corp', 'Ana'));
+    core.rulesByCookie.set(`sid=bob|${key}`, allowUser('bob@corp', 'Bob'));
+    const app = await startApp();
+    const url = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/${key}`;
+    const honest = new TestClient(url);
+    await honest.connect();
+    honest.doc.transact(() => honest.doc.getMap('shapes').set('h1', shape({ type: 'geo' })));
+    await waitFor(() => honest.doc.getArray('history').length === 1, 3000, 'first history line');
+    const attacker = async () => {
+      const a = new TestClient(url, 'sid=bob');
+      await a.connect();
+      await waitFor(() => a.doc.getArray('history').length >= 1, 3000, 'attacker synced');
+      return a;
+    };
+    return { app, url, honest, attacker };
+  }
+
+  it('A: gap write, item after the stamper next clock, victim edit, empty update: 4403 each, no forged line, nothing pending (fv2.spec A)', async () => {
+    const key = 'runs/fv2a.html';
+    const { app, honest, attacker } = await room2(key);
+    const a1 = await attacker();
+    a1.sendRaw(syncUpdateMsg(gapShapeUpdate(4000000001)));
+    await expectClose(a1, 4403);
+    const room = app.manager.get(key)!;
+    expect(room.hasPending()).toBe(false);
+    const a2 = await attacker();
+    a2.sendRaw(syncUpdateMsg(afterFutureStamp(a2.doc, stamperClientOf(a2.doc), 1)));
+    await expectClose(a2, 4403);
+    expect(room.hasPending()).toBe(false);
+    honest.doc.transact(() => honest.doc.getMap('shapes').set('h2', shape({ type: 'geo' })));
+    await waitFor(() => honest.doc.getArray('history').length === 2, 3000, 'second history line');
+    const a3 = await attacker();
+    a3.sendRaw(syncUpdateMsg(Y.encodeStateAsUpdate(new Y.Doc())));
+    await new Promise((r) => setTimeout(r, 200));
+    expect(a3.closeCode).toBeNull();
+    expect(historyShapeIds(honest.doc)).toEqual(['h1', 'h2']);
+    await room.flush();
+    const stored = new Y.Doc();
+    Y.applyUpdate(stored, store.objects.get(canvasObjectKey('_plugins/canvas', key))!.body);
+    expect(historyShapeIds(stored)).toEqual(['h1', 'h2']);
+    expect(stored.store.pendingStructs).toBeNull();
+    expect(stored.store.pendingDs).toBeNull();
+    a3.close();
+    honest.close();
+  });
+
+  it('B: a pending delete set on future stamper clocks closes 4403 and deletes nothing (fv2.spec B)', async () => {
+    const key = 'runs/fv2b.html';
+    const { app, honest, attacker } = await room2(key);
+    const a1 = await attacker();
+    const S = stamperClientOf(a1.doc);
+    const N = Y.getState(a1.doc.store, S);
+    const enc = encoding.createEncoder();
+    for (const n of [0, 1, S, 1, N, 64]) encoding.writeVarUint(enc, n);
+    a1.sendRaw(syncUpdateMsg(encoding.toUint8Array(enc)));
+    await expectClose(a1, 4403);
+    expect(app.manager.get(key)!.hasPending()).toBe(false);
+    honest.doc.transact(() => honest.doc.getMap('shapes').set('h2', shape({ type: 'geo' })));
+    await waitFor(() => honest.doc.getArray('history').length === 2, 3000, 'second history line');
+    const fresh = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/${key}`);
+    await fresh.connect();
+    await waitFor(() => fresh.doc.getArray('history').length === 2, 3000, 'fresh synced');
+    expect(historyShapeIds(fresh.doc)).toEqual(['h1', 'h2']);
+    expect(Object.keys(fresh.doc.getMap('attribution').toJSON()).sort()).toEqual(['h1', 'h2']);
+    fresh.close();
+    honest.close();
+  });
+
+  it('structs as the server stamper client, or at another connection\'s next clock, close 4403; the victim keeps editing', async () => {
+    const key = 'runs/fv2c.html';
+    const { honest, attacker } = await room2(key);
+    // as the server's stamper client id
+    const a1 = await attacker();
+    const sim = new Y.Doc();
+    Y.applyUpdate(sim, Y.encodeStateAsUpdate(a1.doc));
+    sim.clientID = stamperClientOf(a1.doc);
+    const sv = Y.encodeStateVector(sim);
+    sim.getMap('shapes').set('as-server', shape({ type: 'geo' }));
+    a1.sendRaw(syncUpdateMsg(Y.encodeStateAsUpdate(sim, sv)));
+    await expectClose(a1, 4403);
+    // at the honest client's next clock: Yjs would drop the honest edit as already known
+    const a2 = await attacker();
+    const twin = new Y.Doc();
+    Y.applyUpdate(twin, Y.encodeStateAsUpdate(a2.doc));
+    twin.clientID = honest.doc.clientID;
+    const svT = Y.encodeStateVector(twin);
+    (twin.getMap('shapes').get('h1') as Y.Map<unknown>).set('x', 666);
+    a2.sendRaw(syncUpdateMsg(Y.encodeStateAsUpdate(twin, svT)));
+    await expectClose(a2, 4403);
+    honest.doc.transact(() => (honest.doc.getMap('shapes').get('h1') as Y.Map<unknown>).set('x', 5));
+    const check = await attacker();
+    await waitFor(() => (check.doc.getMap('shapes').get('h1') as Y.Map<unknown> | undefined)?.get('x') === 5, 3000, 'honest edit applied');
+    check.close();
+    honest.close();
+  });
+
+  it('non-map values and malformed shapes under `shapes` close 4403 and never reach the room (fv2.spec C / fv2b)', async () => {
+    const key = 'runs/fv2d.html';
+    const { app, honest, attacker } = await room2(key);
+    const cases: [string, (d: Y.Doc) => void][] = [
+      ['number', (d) => d.getMap('shapes').set('bad-number', 42 as never)],
+      ['string', (d) => d.getMap('shapes').set('bad-string', 'x' as never)],
+      ['null', (d) => d.getMap('shapes').set('bad-null', null as never)],
+      ['array', (d) => d.getMap('shapes').set('bad-array', new Y.Array() as never)],
+      ['evil-geo', (d) => d.getMap('shapes').set('bad-geo', shape({ type: 'geo', geo: 'rectangle', x: 'NaN', w: -1e308, text: 12 }))],
+      ['no type', (d) => d.getMap('shapes').set('bad-notype', shape({ x: 1 }))],
+    ];
+    for (const [name, fn] of cases) {
+      const a = await attacker();
+      fn(a.doc);
+      await expectClose(a, 4403);
+      expect(name).toBeTruthy();
+    }
+    await new Promise((r) => setTimeout(r, 100));
+    const room = app.manager.get(key)!;
+    expect([...room.doc.getMap('shapes').keys()]).toEqual(['h1']);
+    expect(Object.keys(room.doc.getMap('attribution').toJSON())).toEqual(['h1']);
+    honest.close();
+  });
+
+  it('a stored document with pending structs is cleaned on load and saved back clean', async () => {
+    const key = 'runs/fv2-load.html';
+    core.rules.set(key, allowUser('ana@corp', 'Ana'));
+    const good = new Y.Doc();
+    good.getMap('shapes').set('ok', shape({ type: 'geo' }));
+    const dirty = Y.mergeUpdates([Y.encodeStateAsUpdate(good), gapShapeUpdate(4000000002)]);
+    const probe = new Y.Doc();
+    Y.applyUpdate(probe, dirty);
+    expect(probe.store.pendingStructs).not.toBeNull();
+    const objKey = canvasObjectKey('_plugins/canvas', key);
+    store.objects.set(objKey, { body: dirty });
+    const app = await startApp();
+    const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/${key}`);
+    await c.connect();
+    await waitFor(() => c.doc.getMap('shapes').has('ok'), 3000, 'loaded');
+    expect(app.manager.get(key)!.hasPending()).toBe(false);
+    await waitFor(() => store.objects.get(objKey)!.body !== dirty, 3000, 'cleaned state saved');
+    const after = new Y.Doc();
+    Y.applyUpdate(after, store.objects.get(objKey)!.body);
+    expect(after.store.pendingStructs).toBeNull();
+    expect([...after.getMap('shapes').keys()]).toEqual(['ok']);
+    // and the client can write as usual
+    c.doc.transact(() => c.doc.getMap('shapes').set('s2', shape({ type: 'geo' })));
+    await waitFor(() => c.doc.getArray('history').length === 1, 3000, 'stamped');
+    c.close();
+  });
+
+  it('safety net: a room that somehow holds pending state drops it and never persists it', async () => {
+    const key = 'runs/fv2-net.html';
+    core.rules.set(key, allowUser('ana@corp', 'Ana'));
+    const app = await startApp();
+    const room = await app.manager.getOrCreate(key, null);
+    room.doc.transact(() => room.doc.getMap('shapes').set('ok', shape({ type: 'geo' })));
+    Y.applyUpdate(room.doc, gapShapeUpdate(4000000003)); // bypassing the guard on purpose
+    expect(room.hasPending()).toBe(true);
+    await room.flush(); // save drops it before encoding
+    const objKey = canvasObjectKey('_plugins/canvas', key);
+    const saved = new Y.Doc();
+    Y.applyUpdate(saved, store.objects.get(objKey)!.body);
+    expect(saved.store.pendingStructs).toBeNull();
+    expect(room.hasPending()).toBe(false);
+    Y.applyUpdate(room.doc, gapShapeUpdate(4000000004));
+    await room.recoverFromPending();
+    expect(room.hasPending()).toBe(false);
+    const saved2 = new Y.Doc();
+    Y.applyUpdate(saved2, store.objects.get(objKey)!.body);
+    expect(saved2.store.pendingStructs).toBeNull();
+  });
+});
+
+describe('fv2 finding 4: the anonymous attribution id is bound to the signed cookie, not to the ?anon= hint', () => {
+  it('a later visitor hinting a freed number shows the same label but writes as a different id', async () => {
+    const key = 'pub/fv2-anon.html';
+    core.rules.set(key, allowAnon());
+    const app = await startApp();
+    const url = `ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/${key}`;
+    const a = new TestClient(`${url}?anon=1234`);
+    await a.connect();
+    expect(a.identity!.name).toBe('Anónimo 1234');
+    a.doc.transact(() => a.doc.getMap('shapes').set('by-a', shape({ type: 'geo' })));
+    await waitFor(() => a.doc.getMap('attribution').has('by-a'), 3000, 'a stamped');
+    const idA = a.identity!.id;
+    a.close();
+    await a.closed;
+    // the number is free again: a new visitor (no cookie) asks for it
+    const b = new TestClient(`${url}?anon=1234`);
+    await b.connect();
+    await waitFor(() => b.doc.getMap('attribution').has('by-a'), 3000, 'b synced');
+    expect(b.identity!.name).toBe('Anónimo 1234');
+    expect(b.identity!.id).not.toBe(idA);
+    b.doc.transact(() => {
+      (b.doc.getMap('shapes').get('by-a') as Y.Map<unknown>).set('x', 50);
+      b.doc.getMap('shapes').set('by-b', shape({ type: 'geo' }));
+    });
+    await waitFor(() => b.doc.getMap('attribution').has('by-b'), 3000, 'b stamped');
+    const attr = b.doc.getMap('attribution').toJSON() as Record<string, { createdBy: string; updatedBy: string }>;
+    expect(attr['by-a'].createdBy).toBe(idA);
+    expect(attr['by-b'].createdBy).toBe(b.identity!.id);
+    expect(Object.keys(b.doc.getMap('users').toJSON()).sort()).toEqual([idA, b.identity!.id].sort());
+    // the original visitor coming back with its cookie is still itself
+    const a2 = new TestClient(`${url}?anon=9999`, a.setCookie!.split(';')[0]);
+    await a2.connect();
+    expect(a2.identity!.id).toBe(idA);
+    a2.close();
+    b.close();
   });
 });

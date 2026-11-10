@@ -100,3 +100,60 @@ describe('CanvasDoc', () => {
     expect(seen).toEqual([[id], [id], [id]]);
   });
 });
+
+describe('malformed entries under `shapes` (fv2 finding 2: recovery)', () => {
+  it('a document already holding bad values still renders every good shape; nothing throws', async () => {
+    const { shapeElement } = await import('../src/render/shapeSvg');
+    const raw = new Y.Doc();
+    const d = new CanvasDoc(raw);
+    const good = d.create({ type: 'geo', geo: 'rectangle', x: 10, y: 20, w: 100, h: 50, text: 'ok' } as never);
+    const arrow = d.create({ type: 'arrow', start: { x: 0, y: 0 }, end: { x: 50, y: 0 } } as never);
+    // what an old server (or a development relay) may have stored
+    const evil = new Y.Doc();
+    Y.applyUpdate(evil, Y.encodeStateAsUpdate(raw));
+    const sv = Y.encodeStateVector(evil);
+    const map = (o: Record<string, unknown>) => {
+      const m = new Y.Map<unknown>();
+      for (const [k, v] of Object.entries(o)) m.set(k, v);
+      return m;
+    };
+    evil.transact(() => {
+      const shapes = evil.getMap('shapes');
+      shapes.set('evil-num', 42 as never);
+      shapes.set('evil-str', 'x' as never);
+      shapes.set('evil-null', null as never);
+      shapes.set('evil-arr', new Y.Array() as never);
+      shapes.set('evil-geo', map({ type: 'geo', geo: 'rectangle', x: 'NaN', w: -1e308, text: 12 }));
+      shapes.set('evil-notype', map({ x: 1, y: 1 }));
+      shapes.set('evil-type', map({ type: 'rect' }));
+      shapes.set('evil-arrow', map({ type: 'arrow' })); // no terminals
+      shapes.set('evil-id', map({ type: 'note', id: good, text: 'impostor', x: 0, y: 0, w: 10, h: 10 }));
+    });
+    Y.applyUpdate(raw, Y.encodeStateAsUpdate(evil, sv));
+    let all: ReturnType<CanvasDoc['all']> = [];
+    expect(() => (all = d.all())).not.toThrow();
+    // the impostor keeps its own key as id: it cannot shadow the good shape
+    expect(all.map((s) => s.id).sort()).toEqual([arrow, 'evil-id', good].sort());
+    expect(d.get(good)).toMatchObject({ type: 'geo', x: 10 });
+    expect(d.get('evil-id')?.id).toBe('evil-id');
+    for (const k of ['evil-num', 'evil-str', 'evil-null', 'evil-arr', 'evil-geo', 'evil-notype', 'evil-type', 'evil-arrow']) {
+      expect(d.get(k), k).toBeUndefined();
+      expect(d.has(k), k).toBe(false);
+    }
+    expect(d.ids().sort()).toEqual([arrow, 'evil-id', good].sort());
+    expect(() => d.maxIndex()).not.toThrow();
+    expect(() => d.minIndex()).not.toThrow();
+    expect(() => d.update('evil-num', { x: 1 })).not.toThrow();
+    expect(() => d.appendPoints('evil-arr', [1, 2, 3])).not.toThrow();
+    expect(() => d.delete(['evil-num', good])).not.toThrow();
+    const env = { get: () => undefined, asset: () => '' };
+    for (const s of d.all()) {
+      const svg = shapeElement(s, env);
+      expect(svg.startsWith('<g'), s.id).toBe(true);
+      expect(svg).not.toContain('NaN');
+    }
+    // drawing still works next to the bad entries
+    const later = d.create({ type: 'geo', geo: 'ellipse', x: 1, y: 1, w: 5, h: 5 } as never);
+    expect(d.get(later)).toBeTruthy();
+  });
+});

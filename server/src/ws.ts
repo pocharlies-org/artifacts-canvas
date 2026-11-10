@@ -26,7 +26,7 @@ import {
   encodeIdentity,
   encodeNotice,
 } from '@pocharlies/artifacts-canvas-shared/protocol';
-import { forbiddenRootWrite } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { checkClientUpdate, type UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
 
 export const WS_ROUTE = '/_canvas/_/ws/';
 /** Same route when the ingress controller strips the plugin prefix. */
@@ -125,7 +125,7 @@ export class WsServer {
         const anonymous = !res.identity || res.identity.anonymous;
         const visitor = anonymous ? this.anon.visitor(cookie, anonParam) : null;
         const num = visitor ? assignNum(visitor.num, visitor.nonce, existing ? existing.anonHolders() : new Map()) : '';
-        const identity = composeIdentity(res, num);
+        const identity = composeIdentity(res, num, visitor ? this.anon.visitorId(visitor.nonce) : '');
         // Capacity (protocol §7): per room (anon stricter) and per anonymous visitor. Every
         // penalty is per connection: nothing a visitor sends can lock other people out.
         if (existing) {
@@ -148,7 +148,7 @@ export class WsServer {
           (req as UpgradeReq)[SET_COOKIE] = this.anon.setCookie(visitor.nonce, num, isHttps(req));
         }
         this.wss.handleUpgrade(req, socket, head, (ws) => {
-          void this.join(ws, key.key, cookie, authorization, identity, visitor?.nonce ?? null, res.artifact?.ttl ?? null);
+          void this.join(ws, key.key, cookie, authorization, identity, visitor ? { nonce: visitor.nonce, num } : null, res.artifact?.ttl ?? null);
         });
       })
       .catch((err) => {
@@ -190,7 +190,7 @@ export class WsServer {
     cookie: string,
     authorization: string,
     identityIn: Parameters<typeof encodeIdentity>[0],
-    anonVisitor: string | null,
+    anonVisitor: { nonce: string; num: string } | null,
     ttl: number | null,
   ): Promise<void> {
     const { cfg, manager, metrics, log } = this.deps;
@@ -203,12 +203,13 @@ export class WsServer {
       return;
     }
     let identity = identityIn;
+    let anonNum: string | undefined;
     if (anonVisitor) {
       // Two upgrades may have raced for the same free pseudonym before the room existed:
-      // re-check against the live connections now that the room is loaded.
-      const num = identity.id.slice('anon:'.length);
-      const got = assignNum(num, anonVisitor, room.anonHolders());
-      if (got !== num) identity = { ...identity, id: `anon:${got}`, name: `Anónimo ${got}` };
+      // re-check against the live connections now that the room is loaded. Only the label
+      // changes; the attribution id stays bound to the visitor cookie.
+      anonNum = assignNum(anonVisitor.num, anonVisitor.nonce, room.anonHolders());
+      if (anonNum !== anonVisitor.num) identity = { ...identity, name: `Anónimo ${anonNum}` };
     }
     const conn: Conn = {
       ws,
@@ -216,7 +217,8 @@ export class WsServer {
       cookie,
       authorization,
       identity,
-      anonVisitor: anonVisitor ?? undefined,
+      anonVisitor: anonVisitor?.nonce,
+      anonNum,
       clientIds: new Set(),
       rate: identity.anonymous
         ? new TokenBucket(cfg.anonMsgRatePerSec, cfg.anonMsgBurst)
@@ -328,7 +330,8 @@ export class WsServer {
       if (conn.identity.readOnly) return;
       // Protocol §5.3: a client write to attribution/users/history closes the connection
       // and the update is NOT applied.
-      const bad = forbiddenRootWriteSafe(room.doc, update);
+      const check = checkClientUpdateSafe(room, conn, update);
+      const bad = check.bad;
       if (bad) {
         this.deps.log.warn({ room: room.name, user: conn.identity.id, root: bad }, 'forged stamper-root write');
         conn.ws.close(CLOSE.forbidden, `write to ${bad} not allowed`);
@@ -354,6 +357,17 @@ export class WsServer {
       }
       Y.applyUpdate(room.doc, update, conn);
       room.approxBytes += update.byteLength;
+      // The room must never hold pending state (a parked struct can later be released into
+      // a server-only root). The guard refuses every update that would leave some; if one
+      // still did, close the sender and drop what was parked (never persisted, never sent).
+      if (room.hasPending()) {
+        this.deps.log.error({ room: room.name, user: conn.identity.id }, 'update left pending state: sender closed, pending dropped');
+        conn.ws.close(CLOSE.forbidden, 'write not allowed');
+        this.deps.metrics.wsRejected.inc({ reason: 'pending_after_apply' });
+        void room.recoverFromPending();
+        return;
+      }
+      room.claimWriters(check.writers, conn.identity.id);
       return;
     }
     if (type === MSG_AWARENESS) {
@@ -397,12 +411,18 @@ export class WsServer {
   }
 }
 
-/** forbiddenRootWrite can throw on malformed updates; treat any throw as forbidden. */
-function forbiddenRootWriteSafe(doc: Y.Doc, update: Uint8Array): string | null {
+/**
+ * The §5.3 guard with this connection's client-id ownership; it can throw on malformed
+ * updates, and any throw counts as forbidden.
+ */
+function checkClientUpdateSafe(room: Room, conn: Conn, update: Uint8Array): UpdateCheck {
   try {
-    return forbiddenRootWrite(doc, update);
+    return checkClientUpdate(room.doc, update, {
+      serverClient: room.doc.clientID,
+      mayWriteClient: (client) => room.mayWrite(client, conn.identity.id, conn),
+    });
   } catch {
-    return 'forbidden';
+    return { bad: 'forbidden', writers: [] };
   }
 }
 

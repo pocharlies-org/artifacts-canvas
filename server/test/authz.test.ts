@@ -78,7 +78,7 @@ describe('AuthzClient (gate contract: POST /_gate/plugin/authz)', () => {
     });
     const r = await client(anon).authorize('', 'pub/doc.html');
     expect(r.allowed).toBe(true);
-    expect(r.identity).toBeUndefined(); // the server composes the anon:<NNNN> identity itself
+    expect(r.identity).toBeUndefined(); // the server composes the anon:<visitor id> identity itself
     const r2 = await client(anon).authorize('', 'runs/private.html');
     expect(r2.allowed).toBe(false);
     expect(r2.reason).toBe('anon_outside_pub');

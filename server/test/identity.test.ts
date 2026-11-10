@@ -18,9 +18,9 @@ describe('composeIdentity', () => {
     expect(composeIdentity(identified, '1234')).toMatchObject({ id: 'ana@corp', anonymous: false });
   });
 
-  it('uses the server-assigned pseudonym for anonymous visitors', () => {
-    expect(composeIdentity(anonymous, '4321')).toMatchObject({
-      id: 'anon:4321',
+  it('uses the server-assigned pseudonym for the label and the visitor id for attribution', () => {
+    expect(composeIdentity(anonymous, '4321', 'Vv0123456789abcd')).toMatchObject({
+      id: 'anon:Vv0123456789abcd',
       name: 'Anónimo 4321',
       anonymous: true,
       attribution: 'server',

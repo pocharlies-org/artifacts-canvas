@@ -76,7 +76,11 @@ describe('attribution stamper', () => {
     const room = new Y.Doc();
     const client = new Y.Doc();
     // a normal shape edit is fine
-    const ok = captureUpdate(client, () => client.getMap('shapes').set('s1', new Y.Map()));
+    const ok = captureUpdate(client, () => {
+      const m = new Y.Map<unknown>();
+      m.set('type', 'geo');
+      client.getMap('shapes').set('s1', m);
+    });
     expect(forbiddenRootWrite(room, ok)).toBeNull();
     Y.applyUpdate(room, ok);
     // forging attribution / users / history is not

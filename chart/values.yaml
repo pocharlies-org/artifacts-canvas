@@ -18,8 +18,10 @@ fullnameOverride: ""
 # Service `artifact-gate` in namespace `sso` (decision port 8081), the login proxy is
 # mounted at /oauth2-artifacts/, and the routes are served by Traefik.
 core:
-  # The artifacts host (the core chart's `artifactsHost`). EXAMPLE value: replace it.
-  publicHost: artifacts.example.com
+  # REQUIRED: the artifacts host (the core chart's `artifactsHost`), e.g. artifacts.mycorp.net.
+  # No default: rendering fails when it is empty or an example.* placeholder, unless both
+  # core.artifactBaseUrl and core.allowedOrigins are set explicitly.
+  publicHost: ""
   # The artifacts bucket (the core chart's `minio.bucket`); empty = s3.bucket.
   bucket: ""
   # Internal authz endpoint of the core's gate (never the public URL).
@@ -55,6 +57,17 @@ s3:
     name: plugin-canvas-s3
     accessKeyIdKey: access-key
     secretAccessKeyKey: secret-key
+
+# --- Anonymous visitors ---
+# ANON_COOKIE_SECRET signs the anonymous-visitor cookie (server-assigned "Anónimo NNNN"
+# pseudonym and the visitor id their attribution is bound to). Without it each pod uses a
+# random per-process key: cookies (and anonymous ids) do not survive a restart and are not
+# valid on another replica. REQUIRED when deployment.replicas > 1. Never put the value here:
+# reference an existing Secret (ExternalSecrets / operator-created), at least 32 random bytes.
+anon:
+  cookieSecretRef:
+    name: "" # e.g. artifacts-canvas-anon
+    key: anon-cookie-secret
 
 # --- Behaviour ---
 config:

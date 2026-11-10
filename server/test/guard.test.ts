@@ -9,6 +9,13 @@ import { attachStamper, forbiddenRootWrite, STAMP_ORIGIN } from '@pocharlies/art
  * deletions of items the room does not have yet, and updates with missing dependencies.
  */
 
+/** A prelim shape Y.Map with these fields (inserted together with the map). */
+function shapeMap(fields: Record<string, unknown>): Y.Map<unknown> {
+  const m = new Y.Map<unknown>();
+  for (const [k, v] of Object.entries(fields)) m.set(k, v);
+  return m;
+}
+
 /** The update a client would send for `fn`, starting from the room state. */
 function clientUpdate(room: Y.Doc, fn: (d: Y.Doc) => void): Uint8Array {
   const c = new Y.Doc();
@@ -43,7 +50,7 @@ describe('forbiddenRootWrite', () => {
   it('accepts ordinary client edits of shapes, assets and meta', () => {
     const room = seededRoom();
     const cases: [string, (d: Y.Doc) => void][] = [
-      ['new shape', (d) => d.getMap('shapes').set('s3', new Y.Map())],
+      ['new shape', (d) => d.getMap('shapes').set('s3', shapeMap({ type: 'note', x: 1, y: 2 }))],
       ['overwrite shape field', (d) => (d.getMap('shapes').get('s1') as Y.Map<unknown>).set('type', 'note')],
       ['append points (origin-only items)', (d) => ((d.getMap('shapes').get('s1') as Y.Map<unknown>).get('points') as Y.Array<number>).push([1, 2, 3])],
       ['edit text in the middle', (d) => ((d.getMap('shapes').get('s1') as Y.Map<unknown>).get('text') as Y.Text).insert(2, 'XX')],
@@ -114,6 +121,7 @@ describe('forbiddenRootWrite', () => {
       forbiddenRootWrite(room, clientUpdate(room, (d) => {
         const m = new Y.Map<unknown>();
         d.getMap('shapes').set('s9', m);
+        m.set('type', 'text');
         const t = new Y.Text();
         m.set('text', t);
         t.insert(0, 'abc');
@@ -142,7 +150,7 @@ describe('forbiddenRootWrite', () => {
     const c = new Y.Doc();
     Y.applyUpdate(c, Y.encodeStateAsUpdate(room));
     const sv0 = Y.encodeStateVector(c);
-    c.getMap('shapes').set('dep', 'x'); // update A (the dependency)
+    c.getMap('shapes').set('dep', shapeMap({ type: 'geo' })); // update A (the dependency)
     const sv1 = Y.encodeStateVector(c);
     const a = Y.encodeStateAsUpdate(c, sv0);
     c.getArray('history').push([{ forged: true }]); // update B: history item after A in the same client

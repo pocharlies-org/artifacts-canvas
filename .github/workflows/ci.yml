@@ -22,8 +22,15 @@ jobs:
       - run: npm run typecheck
       - run: npm run test
       - run: npm run build
-      - name: helm chart renders
-        run: helm template chart/
+      - name: helm chart lints and renders
+        run: |
+          helm lint chart/ -f chart/ci/ci-values.yaml
+          helm template chart/ -f chart/ci/ci-values.yaml >/dev/null
+          # required values fail the render
+          ! helm template chart/ >/dev/null 2>&1
+          ! helm template chart/ --set core.publicHost=artifacts.example.com >/dev/null 2>&1
+          ! helm template chart/ -f chart/ci/ci-values.yaml --set deployment.replicas=2 >/dev/null 2>&1
+          helm template chart/ -f chart/ci/ci-values.yaml --set deployment.replicas=2 --set anon.cookieSecretRef.name=canvas-anon | grep -q 'name: ANON_COOKIE_SECRET'
       - run: npx playwright install --with-deps chromium
       - run: npm run e2e
         env:

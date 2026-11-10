@@ -186,3 +186,88 @@ export const DEFAULT_STYLE: Style = {
   arrowheads: 'end',
   opacity: 1,
 };
+
+// ---------- minimal shape schema (shared by the server guard and the client reader) ----------
+
+export const SHAPE_TYPES: readonly ShapeType[] = ['draw', 'line', 'arrow', 'text', 'note', 'geo', 'frame', 'image'];
+
+/** Geometry/order fields: finite numbers within ±MAX_COORD. */
+export const SHAPE_NUMBER_FIELDS: ReadonlySet<string> = new Set(['x', 'y', 'w', 'h', 'rotation', 'index', 'opacity', 'bend', 'ow', 'oh']);
+const SHAPE_BOOLEAN_FIELDS: ReadonlySet<string> = new Set(['locked', 'highlight', 'done', 'pen', 'fixedWidth']);
+const SHAPE_STRING_FIELDS: ReadonlySet<string> = new Set(['id', 'groupId', 'name', 'assetId', 'color', 'fill', 'dash', 'size', 'font', 'arrowheads']);
+export const MAX_COORD = 1e9;
+const MAX_FIELD_STRING = 1024;
+
+/**
+ * How a shape field is stored: a plain JSON value, or a nested Yjs type. Callers map their
+ * own Yjs values to this tag, so this module stays free of a yjs import.
+ */
+export type ShapeFieldKind = 'value' | 'text' | 'array' | 'map' | 'other';
+
+const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= MAX_COORD;
+
+function terminalOk(v: unknown): boolean {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const t = v as Record<string, unknown>;
+  if (!finite(t.x) || !finite(t.y)) return false;
+  if (t.bind === undefined || t.bind === null) return true;
+  if (typeof t.bind !== 'object' || Array.isArray(t.bind)) return false;
+  const b = t.bind as Record<string, unknown>;
+  return typeof b.shapeId === 'string' && finite(b.nx) && finite(b.ny);
+}
+
+/** A point list value (plain array, or the elements of the `points` Y.Array). */
+export function pointsOk(v: unknown): boolean {
+  return Array.isArray(v) && v.every((n) => finite(n));
+}
+
+/**
+ * Problem with one field of a shape (`key` = field name, `v` = value; for a nested Yjs type
+ * pass `kind` and, for `array`, its elements as `v`), or null when it is acceptable.
+ * Unknown fields are allowed as plain JSON values (forward compatibility), never as Yjs types.
+ */
+export function shapeFieldProblem(key: string, v: unknown, kind: ShapeFieldKind = 'value'): string | null {
+  if (key === 'text') {
+    if (kind === 'text') return null;
+    return kind === 'value' && typeof v === 'string' ? null : 'text';
+  }
+  if (key === 'points') {
+    if (kind === 'array' || kind === 'value') return pointsOk(v) ? null : 'points';
+    return 'points';
+  }
+  if (kind !== 'value') return key;
+  if (key === 'type') return typeof v === 'string' && (SHAPE_TYPES as readonly string[]).includes(v) ? null : 'type';
+  if (key === 'geo') return typeof v === 'string' && (GEO_KINDS as readonly string[]).includes(v) ? null : 'geo';
+  if (SHAPE_NUMBER_FIELDS.has(key)) return finite(v) ? null : key;
+  if (SHAPE_BOOLEAN_FIELDS.has(key)) return typeof v === 'boolean' ? null : key;
+  if (SHAPE_STRING_FIELDS.has(key)) return typeof v === 'string' && v.length <= MAX_FIELD_STRING ? null : key;
+  if (key === 'start' || key === 'end') return terminalOk(v) ? null : key;
+  return null;
+}
+
+/**
+ * Problem with a whole shape record (field -> [value, kind]), or null. `type` is required;
+ * with `requireTerminals` (the client reader) lines and arrows also need both terminals,
+ * which the renderer reads unconditionally.
+ */
+export function shapeRecordProblem(fields: Map<string, [unknown, ShapeFieldKind]>, requireTerminals = true): string | null {
+  const type = fields.get('type');
+  if (!type) return 'type';
+  for (const [k, [v, kind]] of fields) {
+    const p = shapeFieldProblem(k, v, kind);
+    if (p) return p;
+  }
+  if (requireTerminals && (type[0] === 'line' || type[0] === 'arrow')) {
+    if (!fields.has('start')) return 'start';
+    if (!fields.has('end')) return 'end';
+  }
+  return null;
+}
+
+/** Values a client may store under `assets` (image data URLs) and `meta` (plain JSON). */
+export function assetValueOk(v: unknown): boolean {
+  return typeof v === 'string';
+}
+export function metaValueOk(v: unknown): boolean {
+  return v === null || ['string', 'number', 'boolean', 'object'].includes(typeof v);
+}

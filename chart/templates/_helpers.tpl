@@ -48,12 +48,23 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- default .Values.s3.bucket .Values.core.bucket -}}
 {{- end -}}
 
+{{/*
+core.publicHost, validated: required (no default) and never an example.* placeholder.
+*/}}
+{{- define "artifacts-canvas.publicHost" -}}
+{{- $h := required "core.publicHost is required: the artifacts host (the core chart's artifactsHost)" .Values.core.publicHost -}}
+{{- if regexMatch "(^|\\.)example\\.(com|net|org)$" (lower $h) -}}
+{{- fail (printf "core.publicHost %q is an example placeholder: set the real artifacts host" $h) -}}
+{{- end -}}
+{{- $h -}}
+{{- end -}}
+
 {{/* Frame-route base URL: core.artifactBaseUrl, else the core's edge https://<publicHost>/<bucket>. */}}
 {{- define "artifacts-canvas.artifactBaseUrl" -}}
 {{- if .Values.core.artifactBaseUrl -}}
 {{- .Values.core.artifactBaseUrl -}}
 {{- else -}}
-{{- printf "https://%s/%s" (required "core.publicHost is required (the artifacts host) unless core.artifactBaseUrl is set" .Values.core.publicHost) (include "artifacts-canvas.bucket" .) -}}
+{{- printf "https://%s/%s" (include "artifacts-canvas.publicHost" .) (include "artifacts-canvas.bucket" .) -}}
 {{- end -}}
 {{- end -}}
 
@@ -62,7 +73,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if .Values.core.allowedOrigins -}}
 {{- join "," .Values.core.allowedOrigins -}}
 {{- else -}}
-{{- printf "https://%s" (required "core.publicHost is required (the artifacts host) unless core.allowedOrigins is set" .Values.core.publicHost) -}}
+{{- printf "https://%s" (include "artifacts-canvas.publicHost" .) -}}
 {{- end -}}
 {{- end -}}
 
