@@ -11,6 +11,8 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { expect, test, type BrowserContext, type Page } from '@playwright/test';
 import WebSocket from 'ws';
+import * as Y from 'yjs';
+import * as decoding from 'lib0/decoding';
 import { BASE, USERS, container, editorReady, newContext, openWithLogin, publish, waitFor, wsCloses } from './lib';
 
 test.describe.configure({ mode: 'serial' });
@@ -68,6 +70,25 @@ test('P5: dozens of paused sockets of one ACL member on a ~20 MB room: memory fl
   await sleep(4000);
   expect((await wsCloses(owner.page)).filter((c) => c >= 4400 && c < 4500)).toEqual([]);
   const viewer = await join(browser, P.canvas, 'user3');
+  // an honest reader outside any browser (a 34 000-shape page re-renders slowly): what the
+  // server relays, and how fast
+  const viewerCookie = (await viewer.ctx.cookies()).map((c) => `${c.name}=${c.value}`).join('; ');
+  const reader = new Y.Doc();
+  const readerWs = new WebSocket(P.canvas.replace(/^http/, 'ws').replace('/_canvas/', '/_canvas/_/ws/'), { headers: { cookie: viewerCookie, origin: BASE }, maxPayload: 256 << 20 });
+  readerWs.on('message', (d: Buffer) => {
+    const dec = decoding.createDecoder(new Uint8Array(d));
+    if (decoding.readVarUint(dec) !== 0) return;
+    if (decoding.readVarUint(dec) !== 0) Y.applyUpdate(reader, decoding.readVarUint8Array(dec));
+  });
+  await waitFor(() => reader.getMap('shapes').size >= n, 60_000, 'reader synced');
+  /** ms from the owner's edit to the reader having it */
+  const editLatency = async (text: string) => {
+    const t = Date.now();
+    const id = await owner.page.evaluate((text) => (window as any).__canvas.editor.doc.create({ type: 'note', x: 50, y: 50, w: 200, h: 200, text }), text);
+    await waitFor(() => reader.getMap('shapes').has(id), 30_000, 'the reader gets the edit');
+    return { id, ms: Date.now() - t };
+  };
+  const baseline = (await editLatency('before the attack')).ms;
   const att = await join(browser, P.canvas, 'user2');
   const cookie = (await att.ctx.cookies()).map((c) => `${c.name}=${c.value}`).join('; ');
   await att.page.close();
@@ -100,17 +121,16 @@ test('P5: dozens of paused sockets of one ACL member on a ~20 MB room: memory fl
     await sleep(1000);
     peak = Math.max(peak, mem());
   }
-  // an honest edit during the attack reaches the other user at once
-  const t0 = Date.now();
-  const id = await owner.page.evaluate(() => (window as any).__canvas.editor.doc.create({ type: 'note', x: 50, y: 50, w: 200, h: 200, text: 'during the attack' }));
-  await waitFor(async () => (await viewer.page.evaluate((id) => !!(window as any).__canvas.editor.doc.get(id), id)), 10_000, 'viewer sees the edit');
-  const editMs = Date.now() - t0;
+  // an honest edit during the attack reaches the other users as fast as before it
+  const { id, ms: editMs } = await editLatency('during the attack');
+  await waitFor(async () => (await viewer.page.evaluate((id) => !!(window as any).__canvas.editor.doc.get(id), id)), 30_000, 'the viewer tab gets the edit');
   // the paused sockets answer no ping: dropped within two ping rounds (WS_PING_INTERVAL_MS 30 s)
   await waitFor(() => metric('canvas_ws_rejected_total', 'reason="idle"') - idle0 >= 8, 120_000, 'paused sockets dropped');
   const after = mem();
   for (const s of socks) s.terminate();
   const accepted = metric('canvas_ws_rejected_total', 'reason="idle"') - idle0;
-  log('P5', { joinMB: Math.round(joinBytes / 1e4) / 100, opened, accepted, memBeforeMiB: Math.round(m0), memPeakMiB: Math.round(peak), memAfterDropMiB: Math.round(after), editMs });
+  readerWs.close();
+  log('P5', { joinMB: Math.round(joinBytes / 1e4) / 100, opened, accepted, memBeforeMiB: Math.round(m0), memPeakMiB: Math.round(peak), memAfterDropMiB: Math.round(after), editMsBefore: baseline, editMsDuring: editMs });
   // before, at the old 1 GiB limit: 575.8 MiB -> 646.5 MiB (+71) with the room loaded, then the
   // container was OOM-killed (restarts=2); without a limit +400 MiB (960.9 MiB -> 1.353 GiB)
   expect(peak - m0).toBeLessThan(150);
@@ -118,7 +138,7 @@ test('P5: dozens of paused sockets of one ACL member on a ~20 MB room: memory fl
   expect(inspect('{{.RestartCount}}')).toBe(restarts0);
   expect(inspect('{{.State.StartedAt}}')).toBe(started0);
   expect(inspect('{{.State.OOMKilled}}')).toBe('false');
-  expect(editMs).toBeLessThan(5000);
+  expect(editMs).toBeLessThan(Math.max(1000, 3 * baseline));
   expect(await owner.page.evaluate(() => (window as any).__canvas.editor.status)).toBe('synced');
   expect(await viewer.page.evaluate(() => (window as any).__canvas.editor.status)).toBe('synced');
 });
