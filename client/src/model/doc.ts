@@ -211,14 +211,36 @@ export class CanvasDoc {
     this.undoManager.stopCapturing();
   }
 
-  undo() {
+  /**
+   * Undo / redo one step. Yjs' UndoManager can throw while it redoes an item whose
+   * neighbours a concurrent edit split or removed (fv6 L-B: `TypeError: Cannot read
+   * properties of undefined (reading 'client')` in getItemCleanStart, ~1 in 30 000 random
+   * concurrent operations). The throw happens inside Yjs' own transaction, which still
+   * commits what it did and runs the afterTransaction handlers (fixSelfOrigins included), so
+   * every document stays consistent; only that undo step is lost (it was popped). The throw
+   * never reaches the UI: the step is reported as not done.
+   */
+  undo(): boolean {
     this.undoManager.stopCapturing();
-    this.undoManager.undo();
+    return this.safeStep(() => this.undoManager.undo(), 'undo');
   }
 
-  redo() {
+  redo(): boolean {
     this.undoManager.stopCapturing();
-    this.undoManager.redo();
+    return this.safeStep(() => this.undoManager.redo(), 'redo');
+  }
+
+  /** Steps that threw inside Yjs (fv6 L-B), for tests and diagnostics. */
+  undoErrors = 0;
+
+  private safeStep(step: () => unknown, what: string): boolean {
+    try {
+      return step() !== null;
+    } catch (err) {
+      this.undoErrors++;
+      console.warn(`canvas: ${what} step dropped (Yjs threw):`, err);
+      return false;
+    }
   }
 
   canUndo() {
