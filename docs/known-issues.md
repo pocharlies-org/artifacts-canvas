@@ -1,5 +1,17 @@
 # Known issues
 
+The findings of the sixth independent verification (fv6) are fixed: H-1 (no bound on the rooms
+loaded at once: one ACL member opening and filling rooms OOM-killed the pod in a loop; now a
+loaded-room memory budget derived from the V8 heap limit, a per-principal share, idle rooms
+evicted first, and a room left loaded by a socket that closed during the load), M-A (unlimited
+minting of anonymous principals with HEAD requests, and a full re-encode of the room for every
+join after a version bump; now a mint rate per IP and per route, joins refused while their
+principal is in CPU debt, encodes shared as snapshot + tail and charged server-wide), L-A (paused
+sockets held the outgoing budget and honest joins were refused; now stalled peers are dropped
+first), L-B (Yjs undo/redo threw to the UI) and L-C (the room's sync step 1 encoded the whole
+room). Their regressions live in `server/test/fv6.test.ts` (with the verifier's attackers in
+`server/test/fv6/`), `client/tests/fv6.test.ts` and `e2e-system/adversarial-fv6.spec.ts`.
+
 The findings of the fifth independent verification (fv5) are fixed: H-1 (slow readers held
 the server's memory), M-1 (offline paste/undo/paste refused), M-2 (a keystroke while
 reconnecting refused as pending), M-3 (the editor let more than 10 000 characters through),
@@ -23,8 +35,11 @@ meant to become one GitHub issue.
   flushed, the first tab to reconnect delivers other people's unsaved structs in its own
   step 2: the ledger credits it with `createdBy` of the victim's shape, `writers[victim id]` is
   bound to it, and the victim's next edit is closed `4403` (no auto-reconnect). Bounded by
-  `SAVE_DEBOUNCE_MS` (2 s by default) and by needing a crash; with H1 fixed an attacker can no
-  longer cause the crash at will (protocol §11). PoC: `poc7-crash-relay.ts`.
+  `SAVE_DEBOUNCE_MS` (2 s by default) and by needing a crash. fv6 found a way to cause one at
+  will (Q4: open and fill rooms until the pod is OOM-killed); with the loaded-room memory budget
+  that is refused (shown on the full system under the chart's 2 GiB limit, no restart) and no
+  other way is known: the crash has to come from outside (a node failure, a kill) (protocol
+  §11). PoC: `poc7-crash-relay.ts`.
   Suggested fix: save the ledger more often than the content, or write ahead the `writers`
   bindings; on reload, refuse relayed structs for client ids the relaying principal never
   bound instead of binding them to it.

@@ -27,6 +27,8 @@ data:
   AUTHZ_RECHECK_SECONDS: {{ int64 .Values.config.authzRecheckSeconds | quote }}
   FRAME_FETCH_TIMEOUT_MS: {{ int64 .Values.config.frameFetchTimeoutMs | quote }}
   SAVE_DEBOUNCE_MS: {{ int64 .Values.config.saveDebounceMs | quote }}
+  SAVE_CPU_MS_PER_SEC: {{ int64 .Values.config.saveCpuMsPerSec | quote }}
+  SAVE_CPU_BURST_MS: {{ int64 .Values.config.saveCpuBurstMs | quote }}
   SWEEP_INTERVAL_SECONDS: {{ int64 .Values.config.sweepIntervalSeconds | quote }}
   READYZ_CACHE_MS: {{ int64 .Values.config.readyzCacheMs | quote }}
   LOG_LEVEL: {{ .Values.config.logLevel | quote }}
@@ -52,6 +54,7 @@ data:
   WS_OUTGOING_BUDGET_BYTES: {{ int64 .Values.limits.wsOutgoingBudgetBytes | quote }}
   WS_JOIN_MIN_BYTES_PER_SEC: {{ int64 .Values.limits.wsJoinMinBytesPerSec | quote }}
   WS_PING_INTERVAL_MS: {{ int64 .Values.limits.wsPingIntervalMs | quote }}
+  WS_STALL_MS: {{ int64 .Values.limits.wsStallMs | quote }}
   SYNC_BYTES_PER_SEC: {{ int64 .Values.limits.syncBytesPerSec | quote }}
   SYNC_BURST_BYTES: {{ int64 .Values.limits.syncBurstBytes | quote }}
   ANON_SYNC_BYTES_PER_SEC: {{ int64 .Values.limits.anonSyncBytesPerSec | quote }}
@@ -65,6 +68,10 @@ data:
   ANON_IP_JOIN_RATE_PER_MIN: {{ int64 .Values.limits.anonIpJoinRatePerMin | quote }}
   ANON_IP_JOIN_BURST: {{ int64 .Values.limits.anonIpJoinBurst | quote }}
   CLIENT_IP_HOPS: {{ int64 .Values.limits.clientIpHops | quote }}
+  ANON_MINT_RATE_PER_MIN: {{ int64 .Values.limits.anonMintRatePerMin | quote }}
+  ANON_MINT_BURST: {{ int64 .Values.limits.anonMintBurst | quote }}
+  ANON_IP_MINT_RATE_PER_MIN: {{ int64 .Values.limits.anonIpMintRatePerMin | quote }}
+  ANON_IP_MINT_BURST: {{ int64 .Values.limits.anonIpMintBurst | quote }}
   CPU_MS_PER_SEC: {{ int64 .Values.limits.cpuMsPerSec | quote }}
   CPU_BURST_MS: {{ int64 .Values.limits.cpuBurstMs | quote }}
   ANON_CPU_MS_PER_SEC: {{ int64 .Values.limits.anonCpuMsPerSec | quote }}
@@ -75,6 +82,12 @@ data:
   ANON_CPU_TOTAL_BURST_MS: {{ int64 .Values.limits.anonCpuTotalBurstMs | quote }}
   CPU_SHED_MIN_BYTES: {{ int64 .Values.limits.cpuShedMinBytes | quote }}
   ATTRIBUTION_RETENTION_DAYS: {{ int64 .Values.limits.attributionRetentionDays | quote }}
+  # loaded-room memory budget: derived by the server from the V8 heap limit unless set
+  {{- if .Values.limits.roomMemoryBudgetBytes }}
+  ROOM_MEMORY_BUDGET_BYTES: {{ int64 .Values.limits.roomMemoryBudgetBytes | quote }}
+  {{- end }}
+  ROOM_MEMORY_PRINCIPAL_SHARE: {{ .Values.limits.roomMemoryPrincipalShare | quote }}
+  ROOM_MEMORY_ANON_SHARE: {{ .Values.limits.roomMemoryAnonShare | quote }}
   {{- if .Values.limits.artifactPrefixes }}
   ARTIFACT_PREFIXES: {{ join "," .Values.limits.artifactPrefixes | quote }}
   {{- end }}

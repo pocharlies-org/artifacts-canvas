@@ -177,8 +177,8 @@ interface Identity {
   forbidden (authz denied, revoked, or a forbidden write, §5), `4404` artifact gone, `4410`
   artifact expired, `4413` document/message too large, `4429` rate-limited, `4503`
   restarting (client reconnects), `1013` try again later (room, principal or server capacity,
-  join rate, server CPU; the client reconnects with backoff — a join is never refused with the
-  terminal `4429`, fv5 M-6). `4401`
+  join rate, server CPU, server memory; the client reconnects with backoff — a join is never
+  refused with the terminal `4429`, fv5 M-6). `4401`
   (unauthenticated) is reserved and unused in v1 — the gate denies unauthenticated visitors
   as `4403`/`4404`. Send a NOTICE before closing when there is something to tell the user.
 - Re-check authz every `AUTHZ_RECHECK_SECONDS` (default 300; the chart ships 300) and on ACL
@@ -306,7 +306,17 @@ server announces `attribution: 'server'` and MUST:
    their own budget). The server as a whole has one too (`CPU_TOTAL_MS_PER_SEC`, and
    `ANON_CPU_TOTAL_MS_PER_SEC` for all anonymous connections together): while it is used up,
    messages bigger than `CPU_SHED_MIN_BYTES` are refused with `1013` (the client reconnects and
-   resends), small ones still pass. One message costs at most O(its size), and its size is
+   resends), small ones still pass, and so are joins that would load a room or encode it in
+   full (fv6 M-A); a principal in debt has its new joins refused with `1013` until its budget
+   refilled. Loading a room counts against the server-wide budgets. A join gets the room as an
+   encoded snapshot plus the updates broadcast since (the snapshot is shared by every join and
+   encoded again only once those updates outgrow it: 256 messages, or a quarter of its size), so
+   a client that changes the room before every join no longer makes every join encode it.
+   Debounced saves (which encode the whole room too) share a server-wide CPU budget
+   (`SAVE_CPU_MS_PER_SEC` 50 ms/s, burst 1 s): a save that is due waits while it is used up, so
+   tiny edits in many big rooms cannot keep the server busy saving; the flush on last leave and
+   on shutdown never waits. A visitor cookie whose join budget is used up, or whose principal is
+   in CPU debt, is refused before the core is asked. One message costs at most O(its size), and its size is
    capped (§10): about 3 s of guard on this hardware at the 8 MiB cap.
    **Whatever the apply does, the room never keeps pending state**: `applyGuarded` drops any
    parked structs/deletes in a `finally` — also when `Y.applyUpdate` throws half-way (a throw
@@ -496,21 +506,38 @@ that is gone or expired.
   → `1013`; connections per logged-in user 8 and per anonymous visitor 2, **over all rooms** →
   `1013`; joins per user 30/min burst 20, per anonymous visitor cookie 10/min burst 6, per room
   for anonymous joins **without** a visitor cookie 60/min burst 30 (a refusal sets the cookie,
-  so the retry of an honest browser has a bucket of its own), per client IP for anonymous joins
-  30/min burst 20 when `CLIENT_IP_HOPS` says where the IP comes from → `1013`; sync answers
-  after the first 1 MiB/s burst 4 MiB (anon 256 KiB/s, 1 MiB) → `4429`; CPU per principal
-  250 ms/s burst 5 s (anon 60 ms/s, 1 s) → `4429`; CPU of the whole server 600 ms/s burst 6 s
-  (all anonymous connections 150 ms/s, 1.5 s) → messages over 16 KiB `1013`; awareness one state
-  per connection, 50 per room → dropped. **Outgoing data** (fv5 H-1): a peer's buffer over
-  8 MiB beyond its join payload → dropped on the next send, or by a timer after
-  `WS_SLOW_CONSUMER_MS` (10 s); the join payload must drain at `WS_JOIN_MIN_BYTES_PER_SEC`
-  (32 KiB/s, 30 s floor); a peer that answers no WebSocket ping for two `WS_PING_INTERVAL_MS`
-  (30 s) rounds and drains nothing → dropped; everything held for all peers together (join
-  frames counted once per room version) over `WS_OUTGOING_BUDGET_BYTES` (256 MiB) → new joins
-  `1013` and the peers holding most are dropped. Every penalty is per connection or per
-  principal: an update that would grow the room past the sender's cap is refused and only that
-  connection is closed; the room stays open for everyone else. Attribution entries of shapes deleted more than `ATTRIBUTION_RETENTION_DAYS` (30) ago
-  are pruned from the ledger.
+  within the mint rate, so the retry of an honest browser has a bucket of its own), per client
+  IP for anonymous joins 30/min burst 20 when `CLIENT_IP_HOPS` says where the IP comes from →
+  `1013`; **new anonymous visitors** (visitor cookies, each a principal with budgets of its own)
+  minted at most 120/min burst 60 by the wrapper page and as many by cookieless joins, and
+  10/min burst 10 per client IP (fv6 M-A: one client minted 1 000 visitors with HEAD requests)
+  → the page without a cookie, the join `1013`; sync answers after the first 1 MiB/s burst
+  4 MiB (anon 256 KiB/s, 1 MiB) → `4429`; CPU per principal 250 ms/s burst 5 s (anon 60 ms/s,
+  1 s) → `4429`, and its new joins `1013` while in debt; CPU of the whole server 600 ms/s burst
+  6 s (all anonymous connections 150 ms/s, 1.5 s) → messages over 16 KiB, and joins that would
+  load or encode a room, `1013`; awareness one state per connection, 50 per room → dropped.
+  **Outgoing data** (fv5 H-1): a peer's buffer over 8 MiB beyond its join payload → dropped on
+  the next send, or by a timer after `WS_SLOW_CONSUMER_MS` (10 s); the join payload must drain
+  at `WS_JOIN_MIN_BYTES_PER_SEC` (32 KiB/s, 30 s floor); a peer that answers no WebSocket ping
+  for two `WS_PING_INTERVAL_MS` (30 s) rounds and drains nothing → dropped; everything held for
+  all peers together (join frames counted once per room snapshot) over
+  `WS_OUTGOING_BUDGET_BYTES` (256 MiB) → peers that stopped reading (`WS_STALL_MS`, 3 s without
+  draining 32 KiB/s while holding more than 256 KiB) are dropped first, then principals holding
+  more than an eighth of the budget, then the biggest holders; a join is refused `1013` only
+  when it does not fit once the stalled peers are gone (fv6 L-A: paused sockets held the budget
+  and honest joins were refused), or when its principal already holds more than an eighth. A
+  join of a principal that holds nothing may go 25% over the budget (a peer that just stopped
+  reading is known as stalled only after `WS_STALL_MS`); the sweep, every second, brings the
+  total back under it.
+  **Loaded rooms** (fv6 H-1, §11): a join that would load a room past 90% of the room memory
+  budget (derived from the V8 heap limit, `ROOM_MEMORY_BUDGET_BYTES`), and an update that would
+  grow the loaded rooms past it, → `1013` (`busy`); rooms with no connection are evicted first;
+  one principal keeps at most half of it loaded, the rooms only anonymous visitors hold at most
+  half; at most 4 rooms load at once. Joins to rooms already loaded are never refused for
+  memory. Every penalty is per connection or per principal: an update that would grow the room
+  past the sender's cap is refused and only that connection is closed; the room stays open for
+  everyone else. Attribution entries of shapes deleted more than `ATTRIBUTION_RETENTION_DAYS`
+  (30) ago are pruned from the ledger.
 - **Origin** (§4): WebSocket upgrades only from `ALLOWED_ORIGINS`, else `4403`. The HTTP routes
   are `GET`/`HEAD` only (no state-changing HTTP route exists).
 
@@ -527,15 +554,39 @@ that is gone or expired.
   the tabs (found by the fv5 honest-edit fuzzer). The canvas client rewrites the origins of
   every item of its undo/redo transactions to the place the item took before the update is
   encoded (`fixSelfOrigins`, client/src/model/doc.ts). Another Yjs client is not protected.
-- Memory: a loaded room costs about 22x its encoded size (content + ledger), so the memory limit
-  is sized from `MAX_DOC_BYTES` (chart `values.yaml`, "Memory"); the number of rooms loaded at
-  once is not capped by the server.
+  Yjs' undo/redo can also throw (`TypeError ... reading 'client'` in `getItemCleanStart`) when
+  it redoes an item a concurrent edit split or removed (fv6 L-B, ~1 in 30 000 random concurrent
+  operations): `CanvasDoc.undo/redo` catch it, the step is lost, the documents stay consistent
+  (the throwing transaction still commits what it did, with the origin rewrite).
+- Memory (fv6 H-1): a loaded room costs `ROOM_COST_FACTOR` (24) x its encoded size (content +
+  ledger) plus 32 KiB, an estimate measured on Node 22 with the join frames encoded: geo shapes
+  with a text label 21.6x, geo shapes one per transaction 22.1x, tiny maps 15.6x, texts with
+  every other character deleted 17.5x, strokes grown two numbers at a time 4.2x. The server
+  keeps the estimate of the loaded rooms under a budget derived from the V8 heap limit
+  (`heap_size_limit` − 192 MiB − `WS_OUTGOING_BUDGET_BYTES` − 24 x `MAX_MESSAGE_BYTES`, at least
+  64 MiB; `ROOM_MEMORY_BUDGET_BYTES` overrides it), so it follows `--max-old-space-size` (920 MiB
+  with the chart's 1536 under its 2Gi limit, logged at start and exported as
+  `canvas_room_memory_budget_bytes`). Loads stop at 90% of it (after evicting rooms nobody is connected
+  to), growth at 100%, both with `1013` `busy`; a principal keeps at most
+  `ROOM_MEMORY_PRINCIPAL_SHARE` (half) loaded — each room's cost split between the principals
+  connected to it, never less than 1.25 rooms at the principal's size cap, a quarter for an
+  anonymous visitor — and the rooms only anonymous visitors hold share
+  `ROOM_MEMORY_ANON_SHARE` (half) of it. The estimate is between saves an upper bound (every
+  accepted update counts in full until the next save measures the room again), and content
+  that costs more than 24x its encoded size would be under-counted: none of the shapes measured
+  does. An update's growth counts more for the ledger the stamper writes with it: the room's own
+  ledger/content ratio, between 0.3 and 1.6 (measured at most 1.53, for tiny shapes). A room at `MAX_DOC_BYTES` costs 480 MiB, so the default
+  budget holds one full room plus ~18 MiB of others; size the pod with the chart's formula.
 
 - A client that relays someone else's structs (e.g. a tab reconnecting after a server CRASH that
   lost unsaved edits of other people) delivers them in its own step 2: the stamper attributes
   them to the relaying connection, and the relayed client ids get bound to it, so the original
   author's tab is refused `foreign-client` when it reconnects. After a graceful restart nothing
   is lost (the server flushes on shutdown). The ledger is never forged either way: it only ever
-  records verified identities.
+  records verified identities. No client is known to be able to crash the server on purpose:
+  the one way six verifications found (fv6 Q4, loading rooms until the pod was OOM-killed in a
+  loop) is refused by the memory budget above, checked on the full system under the chart's
+  2 GiB limit (no restart). A crash from outside (a node failure, a kill) still loses up to
+  `SAVE_DEBOUNCE_MS` of edits and can relay them as above.
 - An id with clocks from a stored document that predates the persisted `writers` bindings is
   bound to its first writer after the upgrade.
