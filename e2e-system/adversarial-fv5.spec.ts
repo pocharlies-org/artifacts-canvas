@@ -53,7 +53,9 @@ test('P5: dozens of paused sockets of one ACL member on a ~20 MB room: memory fl
   const started0 = inspect('{{.State.StartedAt}}');
   const P = publish({ users: [USERS.user1.email, USERS.user2.email, USERS.user3.email] }, `fv5-p5-${Date.now().toString(36)}`);
   const owner = await join(browser, P.canvas, 'user1');
-  const n = 40_000;
+  // ~17 MB of content + ledger: a big room just under the 20 MiB cap (the cap counts an upper
+  // bound until the next save, so 40 000 shapes can be refused near the end)
+  const n = 34_000;
   for (let b = 0; b < n; b += 4000) {
     await owner.page.evaluate(([b, n]) => {
       const d = (window as any).__canvas.editor.doc;

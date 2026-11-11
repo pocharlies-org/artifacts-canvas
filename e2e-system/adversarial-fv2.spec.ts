@@ -188,8 +188,14 @@ for (const [label, keyOf, attacker] of [
 
     const e2 = await joined(wsUrl(key), attacker());
     await until(() => e2.ledger.getArray('history').length > 0);
+    await until(() => e2.step1s >= 1);
     e2.send(afterFuture(e2, stamperClient(e2.ledger), 1, { t: Date.now(), by: USERS.user1.email, verb: 'delete', shapeId: `FORGED-${label}`, shapeType: 'geo' }));
-    expect(await e2.closeCode(), 'item after the future history line').toBe(4403);
+    // closed 4403 (`foreign-client` when the stamper id is this process's ledger), else — a
+    // stamper id from an earlier process, its next clock missing — never applied and answered
+    // with a resync request (fv5 M-2)
+    const c2 = await e2.closeCode(1500);
+    expect(c2 === 4403 || (c2 === null && e2.step1s >= 2), `item after the future history line (close ${c2}, step 1s ${e2.step1s})`).toBe(true);
+    e2.close();
 
     geo(honest.doc, `h2-${label}`);
     await until(() => honest.ledger.getArray('history').length > before);

@@ -41,6 +41,8 @@ class Raw {
   ident: { id: string; name: string; anonymous: boolean } | null = null;
   code: number | null = null;
   synced = false;
+  /** sync step 1 messages from the server (the join's, then any resync request) */
+  step1s = 0;
   notices: string[] = [];
   setCookie: string | null = null;
   closed: Promise<number>;
@@ -65,6 +67,7 @@ class Raw {
         if (t === 0) {
           const st = decoding.readVarUint(dec);
           if (st !== 0) { Y.applyUpdate(this.doc, decoding.readVarUint8Array(dec), 'server'); this.synced = true; }
+          else this.step1s++;
         } else if (t === 102) Y.applyUpdate(this.ledger, decoding.readVarUint8Array(dec), 'server');
         else if (t === 100) this.ident = JSON.parse(decoding.readVarString(dec));
         else if (t === 101) this.notices.push(JSON.parse(decoding.readVarString(dec)).kind);
@@ -113,7 +116,7 @@ test.afterAll(async () => {
   for (const c of ctxs) await c.close().catch(() => undefined);
 });
 
-test('1. forged stamper-root writes (history append/insert, attribution/users overwrite, new key) close 4403 and change nothing', async () => {
+test('1. forged stamper-root writes (history append/insert, attribution/users overwrite, new key) are refused and change nothing', async () => {
   for (const [label, key, attacker, q] of [
     ['logged-in user2', shared.key, { cookie: cookies.user2! }, ''],
     ['anonymous on pub/', pubArt.key, {}, '?anon=4242'],
@@ -143,10 +146,14 @@ test('1. forged stamper-root writes (history append/insert, attribution/users ov
       // items carry real ledger origins (an append after the last history line has no parent)
       await until(() => a.ledger.getArray('history').length > 0);
       Y.applyUpdate(a.doc, Y.encodeStateAsUpdate(a.ledger), 'server');
+      const step1s = a.step1s;
       fn(a.doc);
       const code = await Promise.race([a.closed, sleep(3000).then(() => null)]);
+      const asked = a.step1s > step1s;
       a.close();
-      expect(code, `${label}: ${vname}`).toBe(4403);
+      // closed 4403, or — a write whose origin is a ledger clock the content document lacks is
+      // `pending` — never applied and answered with a resync request (fv5 M-2)
+      expect(code === 4403 || (code === null && asked), `${label}: ${vname} (close ${code}, resync request ${asked})`).toBe(true);
     }
     await sleep(500);
     const fresh = await joined(wsUrl(key), { cookie: cookies.user1! });
@@ -154,7 +161,7 @@ test('1. forged stamper-root writes (history append/insert, attribution/users ov
     expect(fresh.ledger.getMap('attribution').toJSON()).toEqual(before.attr);
     expect(fresh.ledger.getMap('users').toJSON()).toEqual(before.users);
     expect(fresh.ledger.getArray('history').toJSON()).toEqual(before.history);
-    console.log(`[adv] ${label}: 6 forged writes -> 4403 each, stamper roots unchanged (history ${before.history.length} lines)`);
+    console.log(`[adv] ${label}: 6 forged writes refused, stamper roots unchanged (history ${before.history.length} lines)`);
     fresh.close();
     honest.close();
   }
