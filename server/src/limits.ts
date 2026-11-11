@@ -38,6 +38,17 @@ export class TokenBucket {
     return this.tokens >= 0;
   }
 
+  /** Tokens held now (negative while in debt). */
+  level(): number {
+    this.refill();
+    return this.tokens;
+  }
+
+  /** Capacity of the bucket (its burst). */
+  get burst(): number {
+    return this.capacity;
+  }
+
   /** True when the bucket is full again (an idle entry a map of buckets can forget). */
   full(): boolean {
     this.refill();

@@ -34,6 +34,8 @@ export class TestClient {
   setCookie: string | null = null;
   /** answer the server's sync step 1 with a step 2, like the stock y-websocket client */
   answerStep1 = true;
+  /** sync step 1 messages received from the server (the join's, plus any resync request) */
+  step1Received = 0;
 
   constructor(
     private readonly url: string,
@@ -69,7 +71,10 @@ export class TestClient {
         waitFor(() => this.lastIdentity !== null || ws.readyState !== WebSocket.OPEN, 3000).then(resolve, () => resolve());
       });
       ws.on('error', reject);
-      ws.on('close', (code) => this.closedResolve(code));
+      ws.on('close', (code) => {
+        this.closeCode = code;
+        this.closedResolve(code);
+      });
       ws.on('message', (data: ArrayBuffer) => this.onMessage(new Uint8Array(data)));
 
       this.doc.on('update', (update: Uint8Array, origin: unknown) => {
@@ -105,7 +110,7 @@ export class TestClient {
         Y.applyUpdate(this.doc, decoding.readVarUint8Array(dec), 'server');
       } else if (syncType === syncProtocol.messageYjsUpdate) {
         Y.applyUpdate(this.doc, decoding.readVarUint8Array(dec), 'server');
-      } else if (syncType === syncProtocol.messageYjsSyncStep1 && this.answerStep1) {
+      } else if (syncType === syncProtocol.messageYjsSyncStep1 && (this.step1Received++, this.answerStep1)) {
         // what y-websocket does: answer the server's state vector with what it lacks
         const e = encoding.createEncoder();
         encoding.writeVarUint(e, 0);

@@ -17,7 +17,7 @@ import { AnonIssuer, assignNum } from './anon.js';
 import { normalizeOrigin } from './config.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
 import type { RoomManager } from './rooms.js';
-import { Room, limitBuffered, sendWs, underBufferCap, type Conn } from './room.js';
+import { Room, bufferCap, limitBuffered, sendWs, underBufferCap, type Conn } from './room.js';
 import {
   CLOSE,
   MSG_AWARENESS,
@@ -28,7 +28,7 @@ import {
   encodeLedger,
   encodeNotice,
 } from '@pocharlies/artifacts-canvas-shared/protocol';
-import { applyGuarded, checkClientUpdate, type UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { SPLIT_COST_BYTES, applyGuarded, checkClientUpdate, type UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
 
 export const WS_ROUTE = '/_canvas/_/ws/';
 /** Same route when the ingress controller strips the plugin prefix. */
@@ -44,6 +44,13 @@ export interface WsDeps {
   anon?: AnonIssuer;
 }
 
+/** The next piece of the join payload goes out once the socket buffers less than this. */
+const JOIN_LOW_WATER = 256 * 1024;
+/** How often the slow-consumer / join-deadline / budget sweep runs. */
+const SWEEP_MS = 1000;
+/** Floor of the join deadline (see WS_JOIN_MIN_BYTES_PER_SEC). */
+const JOIN_MIN_MS = 30_000;
+
 /** Request property carrying the Set-Cookie of the upgrade response (see the 'headers' hook). */
 const SET_COOKIE = Symbol('canvas-set-cookie');
 type UpgradeReq = IncomingMessage & { [SET_COOKIE]?: string };
@@ -51,16 +58,35 @@ type UpgradeReq = IncomingMessage & { [SET_COOKIE]?: string };
 export class WsServer {
   readonly wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
   readonly anon: AnonIssuer;
-  /** join buckets per principal (`u:<id>`, `a:<visitor>`) and per room for anonymous visitors (`r:<key>`) */
+  /**
+   * join buckets per principal (`u:<id>`, `a:<visitor>`), per room for anonymous joins without
+   * a visitor cookie (`r:<key>`) and per client IP for anonymous joins (`i:<ip>`)
+   */
   private readonly joins = new Map<string, TokenBucket>();
+  /** per principal (`u:<id>` / `a:<visitor>`): live connections and the CPU bucket they share */
+  private readonly principals = new Map<string, { conns: number; cpu: TokenBucket }>();
+  /** server CPU of all connections, and of all anonymous ones (fv5 M-5) */
+  private readonly cpuAll: TokenBucket;
+  private readonly cpuAnon: TokenBucket;
+  private readonly sweepTimer: ReturnType<typeof setInterval>;
+  private lastPing = Date.now();
 
   constructor(private readonly deps: WsDeps) {
-    this.anon = deps.anon ?? new AnonIssuer(deps.cfg.anonCookieSecret);
+    const { cfg } = deps;
+    this.anon = deps.anon ?? new AnonIssuer(cfg.anonCookieSecret);
+    this.cpuAll = new TokenBucket(cfg.cpuTotalMsPerSec, cfg.cpuTotalBurstMs);
+    this.cpuAnon = new TokenBucket(cfg.anonCpuTotalMsPerSec, cfg.anonCpuTotalBurstMs);
+    this.sweepTimer = setInterval(() => this.sweep(), Math.min(SWEEP_MS, cfg.wsPingIntervalMs));
+    this.sweepTimer.unref?.();
     // The anonymous-visitor cookie rides on the 101 response of the upgrade.
     this.wss.on('headers', (headers: string[], req: UpgradeReq) => {
       const c = req[SET_COOKIE];
       if (c) headers.push(`Set-Cookie: ${c}`);
     });
+  }
+
+  close(): void {
+    clearInterval(this.sweepTimer);
   }
 
   /** Exact match against ALLOWED_ORIGINS; a missing or `null` Origin never matches. */
@@ -125,45 +151,69 @@ export class WsServer {
           return;
         }
         const existing = this.deps.manager.get(key.key);
+        const { cfg } = this.deps;
         // Anonymous pseudonym: assigned by the server (anon.ts); ?anon= is only a hint.
         const anonymous = !res.identity || res.identity.anonymous;
         const visitor = anonymous ? this.anon.visitor(cookie, anonParam) : null;
         const num = visitor ? assignNum(visitor.num, visitor.nonce, existing ? existing.anonHolders() : new Map()) : '';
         const identity = composeIdentity(res, num, visitor ? this.anon.visitorId(visitor.nonce) : '');
-        // Joins per principal (fv4 H1): every join is answered with the whole content and
-        // ledger, so reconnecting in a loop is an amplifier too. Anonymous visitors (who can
-        // drop their cookie and come back as a new one) also share one bucket per room.
-        if (!this.joinAllowed(visitor ? null : identity.id, visitor?.nonce ?? null, key.key)) {
-          this.deps.metrics.wsRejected.inc({ reason: 'join_rate' });
-          this.wss.handleUpgrade(req, socket, head, (ws) => {
-            sendWs(ws, encodeNotice({ kind: 'rate-limited' }));
-            ws.close(CLOSE.rateLimited, 'too many joins');
-          });
-          return;
-        }
-        // Capacity (protocol §7): per room (anon stricter) and per anonymous visitor. Every
-        // penalty is per connection: nothing a visitor sends can lock other people out.
-        if (existing) {
-          if (existing.conns.size >= this.deps.cfg.maxConnsPerRoom) {
-            this.rejectCapacity(socket, req, head, 'room full');
-            return;
-          }
-          if (visitor) {
-            if (existing.countAnon() >= this.deps.cfg.maxConnsPerRoomAnon) {
-              this.rejectCapacity(socket, req, head, 'room anon capacity');
-              return;
-            }
-            if (existing.countVisitor(visitor.nonce) >= this.deps.cfg.maxConnsPerAnonVisitor) {
-              this.rejectCapacity(socket, req, head, 'anon visitor capacity');
-              return;
-            }
-          }
-        }
+        const principal = visitor ? `a:${visitor.nonce}` : `u:${identity.id}`;
+        // A visitor without a cookie gets one with ANY answer (also a refusal), so the retry
+        // of an honest browser comes back as a returning visitor with a bucket of its own.
         if (visitor && (visitor.fresh || num !== visitor.num)) {
           (req as UpgradeReq)[SET_COOKIE] = this.anon.setCookie(visitor.nonce, num, isHttps(req));
         }
+        // Joins per principal (fv4 H1): every join is answered with the whole content and
+        // ledger, so reconnecting in a loop is an amplifier too. fv5 M-6: anonymous joins
+        // WITHOUT a visitor cookie (a fresh visitor each time) share one bucket per room, so
+        // a cookieless client draining it no longer locks out returning visitors (who have
+        // their own bucket); with a known client IP, every anonymous join also takes from a
+        // bucket per IP. A refused join closes with 1013: the client retries (never 4429).
+        if (!this.joinAllowed(visitor ? null : identity.id, visitor, key.key, clientIp(req, cfg.clientIpHops))) {
+          this.refuseBusy(req, socket, head, 'join_rate', 'too many joins');
+          return;
+        }
+        // Capacity (protocol §7): per room (anon stricter), per principal over the whole
+        // process (fv5 H-1: one user held 49 paused sockets), and the process-wide outgoing
+        // budget. Every refusal is retryable (1013) and per connection: nothing a visitor
+        // sends can lock other people out for good.
+        if ((this.principals.get(principal)?.conns ?? 0) >= (visitor ? cfg.maxConnsPerAnonVisitor : cfg.maxConnsPerUser)) {
+          this.refuseBusy(req, socket, head, 'principal_conns', 'too many connections');
+          return;
+        }
+        if (existing) {
+          if (existing.conns.size >= cfg.maxConnsPerRoom) {
+            this.refuseBusy(req, socket, head, 'capacity', 'room full');
+            return;
+          }
+          if (visitor) {
+            if (existing.countAnon() >= cfg.maxConnsPerRoomAnon) {
+              this.refuseBusy(req, socket, head, 'capacity', 'room anon capacity');
+              return;
+            }
+            if (existing.countVisitor(visitor.nonce) >= cfg.maxConnsPerAnonVisitor) {
+              this.refuseBusy(req, socket, head, 'capacity', 'anon visitor capacity');
+              return;
+            }
+          }
+        }
+        // what this join adds: nothing if a join of the same room version holds the frames
+        // already (they are shared), else the room's size; refused only while something is held
+        // (a room bigger than the budget can still be joined by one peer at a time)
+        const held = this.outgoing().total;
+        const joinEstimate = existing && !existing.framesInFlight(this.inFlightFrames()) ? existing.approxBytes + existing.ledgerApproxBytes : 0;
+        if (held > 0 && held + joinEstimate > cfg.wsOutgoingBudgetBytes) {
+          this.refuseBusy(req, socket, head, 'outgoing_budget', 'server busy');
+          return;
+        }
         this.wss.handleUpgrade(req, socket, head, (ws) => {
-          void this.join(ws, key.key, cookie, authorization, identity, visitor ? { nonce: visitor.nonce, num } : null, res.artifact?.ttl ?? null);
+          // the connection counts against its principal from the upgrade until it closes
+          const p = this.principalOf(principal, !!visitor);
+          p.conns++;
+          ws.once('close', () => this.releasePrincipal(principal));
+          // nothing the client sends is read before join() listens (the room may still load)
+          ws.pause();
+          void this.join(ws, key.key, cookie, authorization, identity, visitor ? { nonce: visitor.nonce, num } : null, res.artifact?.ttl ?? null, principal);
         });
       })
       .catch((err) => {
@@ -172,8 +222,8 @@ export class WsServer {
       });
   };
 
-  /** Take one join from the principal's bucket (and the room's anonymous bucket). */
-  private joinAllowed(userId: string | null, visitorNonce: string | null, room: string): boolean {
+  /** Take one join from every bucket that applies (all or nothing). */
+  private joinAllowed(userId: string | null, visitor: { nonce: string; fresh: boolean } | null, room: string, ip: string | null): boolean {
     const { cfg } = this.deps;
     if (this.joins.size > 10_000) for (const [k, b] of this.joins) if (b.full()) this.joins.delete(k);
     const bucket = (k: string, perMin: number, burst: number) => {
@@ -182,15 +232,171 @@ export class WsServer {
       return b;
     };
     if (userId !== null) return bucket(`u:${userId}`, cfg.joinRatePerMin, cfg.joinBurst).take();
-    const roomBucket = bucket(`r:${room}`, cfg.anonRoomJoinRatePerMin, cfg.anonRoomJoinBurst);
-    const own = bucket(`a:${visitorNonce}`, cfg.anonJoinRatePerMin, cfg.anonJoinBurst);
-    return own.take() && roomBucket.take();
+    const take: TokenBucket[] = [];
+    if (ip !== null) take.push(bucket(`i:${ip}`, cfg.anonIpJoinRatePerMin, cfg.anonIpJoinBurst));
+    if (!visitor || visitor.fresh) take.push(bucket(`r:${room}`, cfg.anonRoomJoinRatePerMin, cfg.anonRoomJoinBurst));
+    else take.push(bucket(`a:${visitor.nonce}`, cfg.anonJoinRatePerMin, cfg.anonJoinBurst));
+    if (!take.every((b) => b.level() >= 1)) return false;
+    for (const b of take) b.take();
+    return true;
   }
 
-  private rejectCapacity(socket: Duplex, req: IncomingMessage, head: Buffer, why: string): void {
-    this.deps.metrics.wsRejected.inc({ reason: 'capacity' });
-    this.deps.log.debug({ why }, 'ws refused: capacity');
-    this.wss.handleUpgrade(req, socket, head, (ws) => ws.close(1013, why));
+  /** Refuse an upgrade for capacity or rate: notice `busy`, close 1013 (the client retries). */
+  private refuseBusy(req: IncomingMessage, socket: Duplex, head: Buffer, reason: string, why: string): void {
+    this.deps.metrics.wsRejected.inc({ reason });
+    this.deps.log.debug({ why }, 'ws refused: busy');
+    this.wss.handleUpgrade(req, socket, head, (ws) => {
+      sendWs(ws, encodeNotice({ kind: 'busy' }));
+      ws.close(CLOSE.tryAgain, why);
+      // a peer that does not read the close frame is not kept for the 30 s close handshake
+      setTimeout(() => ws.terminate(), 1000).unref?.();
+    });
+  }
+
+  private principalOf(key: string, anonymous: boolean): { conns: number; cpu: TokenBucket } {
+    const { cfg } = this.deps;
+    let p = this.principals.get(key);
+    if (!p) {
+      p = {
+        conns: 0,
+        cpu: anonymous ? new TokenBucket(cfg.anonCpuMsPerSec, cfg.anonCpuBurstMs) : new TokenBucket(cfg.cpuMsPerSec, cfg.cpuBurstMs),
+      };
+      this.principals.set(key, p);
+    }
+    return p;
+  }
+
+  private releasePrincipal(key: string): void {
+    const p = this.principals.get(key);
+    if (!p) return;
+    p.conns = Math.max(0, p.conns - 1);
+    // the CPU bucket outlives the connections until it refilled: reconnecting does not reset it
+    if (p.conns === 0 && p.cpu.full()) this.principals.delete(key);
+  }
+
+  /**
+   * Bytes held for every peer: outgoing buffers and backlogs, with the join frames still in
+   * flight (shared by every join of a room version) counted once.
+   */
+  private outgoing(): { total: number; conns: { conn: Conn; bytes: number }[] } {
+    let total = 0;
+    const frames = new Set<Uint8Array>();
+    const conns: { conn: Conn; bytes: number }[] = [];
+    for (const room of this.deps.manager.rooms.values()) {
+      for (const conn of room.conns.values()) {
+        const b = conn.ws.bufferedAmount + conn.backlogBytes;
+        let own = b;
+        if (conn.joinFrames && b > 0) {
+          let shared = 0;
+          for (const f of conn.joinFrames) {
+            frames.add(f);
+            shared += f.byteLength;
+          }
+          own = Math.max(0, b - shared);
+        }
+        total += own;
+        conns.push({ conn, bytes: b });
+      }
+    }
+    for (const f of frames) total += f.byteLength;
+    return { total, conns };
+  }
+
+  /** Every join frame some connection still has in flight. */
+  private inFlightFrames(): Set<Uint8Array> {
+    const out = new Set<Uint8Array>();
+    for (const room of this.deps.manager.rooms.values()) for (const c of room.conns.values()) if (c.joinFrames) for (const f of c.joinFrames) out.add(f);
+    return out;
+  }
+
+  /** Terminate a connection now (a close frame would only queue behind its backlog). */
+  private drop(conn: Conn, reason: string): void {
+    if (conn.closing) return;
+    this.deps.metrics.wsRejected.inc({ reason });
+    this.deps.log.warn(
+      { room: conn.artifactKey, user: conn.identity.id, buffered: conn.ws.bufferedAmount + conn.backlogBytes, reason },
+      'ws dropped',
+    );
+    conn.closing = true;
+    conn.backlog = [];
+    conn.backlogBytes = 0;
+    try {
+      conn.ws.terminate();
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /**
+   * Timer-driven limits (fv5 H-1), every second: a connection over its outgoing cap for
+   * longer than WS_SLOW_CONSUMER_MS, or whose join payload has not drained by its deadline,
+   * is dropped; every WS_PING_INTERVAL_MS each peer is pinged, and one that answered no ping
+   * for two rounds while draining nothing is dropped; while all peers together hold more than
+   * WS_OUTGOING_BUDGET_BYTES, the ones holding most are dropped.
+   */
+  private sweep(): void {
+    const { cfg, metrics } = this.deps;
+    const now = Date.now();
+    const ping = now - this.lastPing >= cfg.wsPingIntervalMs;
+    if (ping) this.lastPing = now;
+    for (const room of this.deps.manager.rooms.values()) {
+      for (const conn of room.conns.values()) {
+        if (conn.closing) continue;
+        const ws = conn.ws;
+        const buffered = ws.bufferedAmount + conn.backlogBytes;
+        if (conn.joinFrames && !conn.joining && buffered <= JOIN_LOW_WATER) conn.joinFrames = null;
+        if (buffered > bufferCap(ws)) {
+          if (!conn.overSince) conn.overSince = now;
+          else if (now - conn.overSince >= cfg.wsSlowConsumerMs) {
+            this.drop(conn, 'slow_consumer');
+            continue;
+          }
+        } else conn.overSince = 0;
+        if ((conn.joining || conn.joinFrames) && now - conn.joinStarted > joinDeadlineMs(conn.joinBytes, cfg.wsJoinMinBytesPerSec)) {
+          this.drop(conn, 'join_timeout');
+          continue;
+        }
+        if (ping) {
+          if (conn.awaitingPong) {
+            // no pong since the last round: alive only if it drained something meanwhile
+            if (ws.bufferedAmount < conn.pingBuffered) conn.missedPongs = 0;
+            else if (++conn.missedPongs >= 2) {
+              this.drop(conn, 'idle');
+              continue;
+            }
+          }
+          conn.awaitingPong = true;
+          conn.pingBuffered = ws.bufferedAmount;
+          try {
+            ws.ping();
+          } catch {
+            /* closing */
+          }
+        }
+      }
+    }
+    for (const [k, p] of this.principals) if (p.conns === 0 && p.cpu.full()) this.principals.delete(k);
+    const out = this.outgoing();
+    if (out.total > cfg.wsOutgoingBudgetBytes) {
+      let total = out.total;
+      for (const { conn, bytes } of out.conns.sort((a, b) => b.bytes - a.bytes)) {
+        if (total <= cfg.wsOutgoingBudgetBytes || bytes < 1024 * 1024) break;
+        this.drop(conn, 'outgoing_budget');
+        total -= bytes;
+      }
+    }
+    metrics.outgoingBytes.set(out.total);
+  }
+
+  /** Resolves once the connection buffers less than JOIN_LOW_WATER (or is gone). */
+  private drained(conn: Conn): Promise<void> {
+    return new Promise((resolve) => {
+      const tick = () => {
+        if (conn.closing || conn.ws.readyState !== conn.ws.OPEN || conn.ws.bufferedAmount <= JOIN_LOW_WATER) resolve();
+        else setTimeout(tick, 20);
+      };
+      tick();
+    });
   }
 
   /**
@@ -222,11 +428,14 @@ export class WsServer {
     identityIn: Parameters<typeof encodeIdentity>[0],
     anonVisitor: { nonce: string; num: string } | null,
     ttl: number | null,
+    principal: string,
   ): Promise<void> {
     const { cfg, manager, metrics, log } = this.deps;
     let room: Room;
     try {
       room = await manager.getOrCreate(artifactKey, ttl);
+      // evicted (last leave) while this join waited for it: join the room that replaces it
+      if (room.disposed || manager.get(artifactKey) !== room) room = await manager.getOrCreate(artifactKey, ttl);
     } catch (err) {
       if (manager.closing) {
         // restarting: the client reconnects (4503) to the next process
@@ -238,6 +447,7 @@ export class WsServer {
       ws.close(1011, 'storage error');
       return;
     }
+    if (ws.readyState !== ws.OPEN) return; // gone while the room loaded
     let identity = identityIn;
     let anonNum: string | undefined;
     if (anonVisitor) {
@@ -247,6 +457,8 @@ export class WsServer {
       anonNum = assignNum(anonVisitor.num, anonVisitor.nonce, room.anonHolders());
       if (anonNum !== anonVisitor.num) identity = { ...identity, name: `Anónimo ${anonNum}` };
     }
+    const t0 = performance.now();
+    const ledgerFrame = room.ledgerFrame();
     const conn: Conn = {
       ws,
       artifactKey,
@@ -262,73 +474,63 @@ export class WsServer {
       syncBytes: identity.anonymous
         ? new TokenBucket(cfg.anonSyncBytesPerSec, cfg.anonSyncBurstBytes)
         : new TokenBucket(cfg.syncBytesPerSec, cfg.syncBurstBytes),
-      cpu: identity.anonymous
-        ? new TokenBucket(cfg.anonCpuMsPerSec, cfg.anonCpuBurstMs)
-        : new TokenBucket(cfg.cpuMsPerSec, cfg.cpuBurstMs),
+      cpu: this.principalOf(principal, identity.anonymous).cpu,
+      principal,
+      resync: new TokenBucket(0.5, 20),
       step1Answers: 0,
-      joinSv: Y.decodeStateVector(Y.encodeStateVector(room.doc)),
+      joinSv: new Map(),
       closing: false,
+      joining: true,
+      backlog: [],
+      backlogBytes: 0,
+      // until the content frame is encoded, the room's last known size stands for it
+      joinBytes: ledgerFrame.byteLength + room.approxBytes,
+      joinStarted: Date.now(),
+      joinFrames: [ledgerFrame],
+      overSince: 0,
+      awaitingPong: false,
+      pingBuffered: 0,
+      missedPongs: 0,
     };
-    const full = room.fullState();
     // A peer that stops reading is dropped once the server holds more than the cap for it
-    // beyond the join burst below (fv4 H1: 200 tiny requests from a paused socket buffered
-    // 661 MB in the server); a tab still downloading a big room is not cut off.
-    limitBuffered(ws, cfg.wsMaxBufferedBytes + full.content.byteLength + full.ledger.byteLength, () => {
+    // beyond the join payload: on its next send, and by the sweep once it stays over the cap
+    // (fv4 H1, fv5 H-1); a tab still downloading a big room is not cut off.
+    const onOver = () => {
       metrics.wsRejected.inc({ reason: 'slow_consumer' });
       log.warn({ room: artifactKey, user: identity.id, buffered: ws.bufferedAmount }, 'ws dropped: outgoing buffer over the cap');
-    });
+    };
+    limitBuffered(ws, cfg.wsMaxBufferedBytes + conn.joinBytes, onOver);
     room.conns.set(ws, conn);
     metrics.wsAccepted.inc({ anonymous: identity.anonymous ? 'true' : 'false' });
     metrics.connections.inc({ anonymous: identity.anonymous ? 'true' : 'false' });
     log.info({ room: artifactKey, user: identity.id, anon: identity.anonymous }, 'ws joined');
 
-    // IDENTITY MUST be the first message (protocol §4.1).
-    sendWs(ws, encodeIdentity(identity));
-    // The ledger (read-only for clients) before the content, so shapes arrive with authors.
-    sendWs(ws, encodeLedger(full.ledger));
-    // The content: the full state (step 2), then the server's state vector (step 1) so the
-    // client answers with a step 2 holding what the room lacks — the edits it made while
-    // disconnected. That answer is a plain client update and goes through the guard; the
-    // content document holds no server-only root a client could echo back.
-    const e = encoding.createEncoder();
-    encoding.writeVarUint(e, MSG_SYNC);
-    encoding.writeVarUint(e, syncProtocol.messageYjsSyncStep2);
-    encoding.writeVarUint8Array(e, full.content);
-    sendWs(ws, encoding.toUint8Array(e));
-    const e1 = encoding.createEncoder();
-    encoding.writeVarUint(e1, MSG_SYNC);
-    syncProtocol.writeSyncStep1(e1, room.doc);
-    sendWs(ws, encoding.toUint8Array(e1));
-    const states = room.awareness.getStates();
-    if (states.size) {
-      const a = encoding.createEncoder();
-      encoding.writeVarUint(a, MSG_AWARENESS);
-      encoding.writeVarUint8Array(
-        a,
-        awarenessProtocol.encodeAwarenessUpdate(room.awareness, Array.from(states.keys())),
-      );
-      sendWs(ws, encoding.toUint8Array(a));
-    }
-
     ws.on('message', (data: ArrayBuffer | Buffer) => {
       if (conn.closing) return;
-      const t0 = performance.now();
+      const buf = new Uint8Array(data as ArrayBuffer);
+      // fv5 M-5: while the server-wide CPU budget (or the anonymous share of it) is used up,
+      // only small messages are processed; a big one is refused with 1013 and resent by the
+      // client after it reconnected (y-websocket syncs what the room lacks).
+      if (buf.byteLength > cfg.cpuShedMinBytes && (this.cpuAll.level() < 0 || (identity.anonymous && this.cpuAnon.level() < 0))) {
+        metrics.wsRejected.inc({ reason: 'cpu_shed' });
+        sendWs(ws, encodeNotice({ kind: 'busy' }));
+        this.closeConn(conn, CLOSE.tryAgain, 'server busy');
+        return;
+      }
+      const t1 = performance.now();
       try {
-        this.onMessage(conn, room, new Uint8Array(data as ArrayBuffer));
+        this.onMessage(conn, room, buf);
       } catch (err) {
         log.warn({ err: String(err), room: artifactKey }, 'bad message');
         this.closeConn(conn, 1003, 'bad message');
       }
-      // CPU budget (fv4 H2): the time the server spent on this connection's messages is
-      // charged to it; a sender that keeps the event loop busy is closed, whatever it sends.
-      const spent = performance.now() - t0;
-      if (!conn.closing && !conn.cpu.charge(spent)) {
-        log.warn({ room: artifactKey, user: identity.id, ms: Math.round(spent) }, 'ws closed: cpu budget used up');
-        sendWs(ws, encodeNotice({ kind: 'rate-limited' }));
-        this.closeConn(conn, CLOSE.rateLimited, 'cpu budget');
-        metrics.wsRejected.inc({ reason: 'cpu_budget' });
-      }
+      this.chargeCpu(conn, room, performance.now() - t1);
     });
+    ws.on('pong', () => {
+      conn.awaitingPong = false;
+      conn.missedPongs = 0;
+    });
+    ws.resume();
 
     // Re-check authorization periodically (protocol §4): revoked drops the connection;
     // expired/gone drop the whole room and delete the canvas object.
@@ -338,6 +540,8 @@ export class WsServer {
 
     ws.on('close', () => {
       conn.closing = true;
+      conn.backlog = [];
+      conn.backlogBytes = 0;
       if (conn.recheckTimer) clearInterval(conn.recheckTimer);
       room.conns.delete(ws);
       awarenessProtocol.removeAwarenessStates(room.awareness, Array.from(conn.clientIds), null);
@@ -351,6 +555,68 @@ export class WsServer {
         /* ignore */
       }
     });
+
+    // The join payload, one piece at a time (fv5 H-1): each big frame is shared by every join
+    // of the same room version and goes out only once the previous one drained, so a peer
+    // that does not read never gets the next one queued (nor encoded).
+    // IDENTITY MUST be the first message (protocol §4.1). The ledger (read-only for clients)
+    // before the content, so shapes arrive with authors.
+    sendWs(ws, encodeIdentity(identity));
+    sendWs(ws, ledgerFrame);
+    this.chargeCpu(conn, room, performance.now() - t0, false);
+    await this.drained(conn);
+    if (conn.closing || ws.readyState !== ws.OPEN) return;
+    // The content: the full state (step 2), then the server's state vector (step 1) so the
+    // client answers with a step 2 holding what the room lacks — the edits it made while
+    // disconnected. That answer is a plain client update and goes through the guard; the
+    // content document holds no server-only root a client could echo back.
+    const t2 = performance.now();
+    const content = room.contentFrames();
+    conn.joinSv = content.sv;
+    conn.joinFrames = [ledgerFrame, content.step2];
+    conn.joinBytes = ledgerFrame.byteLength + content.step2.byteLength;
+    limitBuffered(ws, cfg.wsMaxBufferedBytes + conn.joinBytes, onOver);
+    sendWs(ws, content.step2);
+    sendWs(ws, content.step1);
+    const states = room.awareness.getStates();
+    if (states.size) {
+      const a = encoding.createEncoder();
+      encoding.writeVarUint(a, MSG_AWARENESS);
+      encoding.writeVarUint8Array(a, awarenessProtocol.encodeAwarenessUpdate(room.awareness, Array.from(states.keys())));
+      sendWs(ws, encoding.toUint8Array(a));
+    }
+    // what the room broadcast meanwhile, in order (older than the frames above: Yjs skips it)
+    conn.joining = false;
+    const backlog = conn.backlog;
+    conn.backlog = [];
+    conn.backlogBytes = 0;
+    for (const m of backlog) sendWs(ws, m);
+    this.chargeCpu(conn, room, performance.now() - t2, false);
+    if (conn.deferredStep1 && !conn.closing) {
+      const sv = conn.deferredStep1;
+      conn.deferredStep1 = undefined;
+      const t3 = performance.now();
+      this.answerStep1(conn, room, sv);
+      this.chargeCpu(conn, room, performance.now() - t3, false);
+    }
+  }
+
+  /**
+   * CPU budget (fv4 H2, fv5 M-5): the time the server spent for a connection is charged to its
+   * principal (shared by all its connections) and to the server-wide budgets; a principal in
+   * debt has its connection closed, whatever it sends.
+   */
+  private chargeCpu(conn: Conn, room: Room, spent: number, closeInDebt = true): void {
+    this.cpuAll.charge(spent);
+    if (conn.identity.anonymous) this.cpuAnon.charge(spent);
+    // the join's own work (encoding a room version) is charged but never cuts the join short:
+    // a principal in debt is closed on its next message
+    if (!conn.cpu.charge(spent) && closeInDebt && !conn.closing) {
+      this.deps.log.warn({ room: room.name, user: conn.identity.id, ms: Math.round(spent) }, 'ws closed: cpu budget used up');
+      sendWs(conn.ws, encodeNotice({ kind: 'rate-limited' }));
+      this.closeConn(conn, CLOSE.rateLimited, 'cpu budget');
+      this.deps.metrics.wsRejected.inc({ reason: 'cpu_budget' });
+    }
   }
 
   /** Close once (later messages of a closing connection are ignored). */
@@ -393,10 +659,21 @@ export class WsServer {
         return;
       }
       const update = decoding.readVarUint8Array(dec);
+      if (syncType === syncProtocol.messageYjsSyncStep2) conn.resyncAsked = false;
       if (conn.identity.readOnly) return;
       // Protocol §5.3: a write the content guard refuses closes the connection and the
       // update is NOT applied.
       const check = checkClientUpdateSafe(room, conn, update);
+      if (check.bad === 'pending') {
+        // fv5 M-2: an honest tab that reconnects with offline edits can send a fresh edit
+        // before its step-2 answer (y-websocket sends local updates as soon as the socket is
+        // open); that edit depends on structs the room does not have yet. It is not applied
+        // (the room never holds pending state) and the connection stays open: the server
+        // asks with a step 1 for what it lacks, and the client's step-2 answer carries the
+        // edit too. A connection that keeps sending updates that never integrate is closed.
+        this.askResync(conn, room);
+        return;
+      }
       const bad = check.bad;
       if (bad) {
         this.deps.log.warn({ room: room.name, user: conn.identity.id, root: bad }, 'forbidden content write');
@@ -412,8 +689,11 @@ export class WsServer {
       // bound; every save — at most SAVE_DEBOUNCE_MS after a change — makes them exact again,
       // deletes included). Nothing O(room) runs here: no scratch copy, no re-encoding per
       // message (fv4 H2). An update that adds nothing (deletes only) always passes.
+      // fv5 L-2: deletes that split live items grow the encoded room too (every split becomes
+      // structs of its own), so they count against the cap with SPLIT_COST_BYTES per split.
       const limit = conn.identity.anonymous ? cfg.anonMaxDocBytes : cfg.maxDocBytes;
-      if (check.grows && room.approxBytes + room.ledgerApproxBytes + update.byteLength > limit) {
+      const growth = update.byteLength + check.splits * SPLIT_COST_BYTES;
+      if (check.grows && room.approxBytes + room.ledgerApproxBytes + growth > limit) {
         sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
         this.closeConn(conn, CLOSE.tooLarge, 'document too large');
         this.deps.metrics.wsRejected.inc({ reason: 'doc_too_large' });
@@ -427,7 +707,7 @@ export class WsServer {
       try {
         outcome = applyGuarded(room.doc, update, conn);
       } finally {
-        room.approxBytes += update.byteLength;
+        room.approxBytes += growth;
         if (!outcome || outcome.threw || outcome.droppedPending) room.markDirty();
       }
       if (outcome.threw || outcome.droppedPending) {
@@ -454,8 +734,14 @@ export class WsServer {
       const update = decoding.readVarUint8Array(dec);
       // Protocol §5.4: the `user` field is forced to the verified identity; states for
       // clientIds owned by other connections are dropped.
-      const fixed = sanitizeAwarenessUpdate(update, conn.clientIds, room.awareness, conn.identity, (id) =>
-        room.mayClaimAwareness(id, conn.identity.id),
+      // fv5 M-7: one state per connection (its own client id), at most MAX_AWARENESS_PER_ROOM per room.
+      const fixed = sanitizeAwarenessUpdate(
+        update,
+        conn.clientIds,
+        room.awareness,
+        conn.identity,
+        (id) => room.mayClaimAwareness(id, conn.identity.id),
+        { maxClaims: 1, roomMax: cfg.maxAwarenessPerRoom },
       );
       if (fixed) awarenessProtocol.applyAwarenessUpdate(room.awareness, fixed, conn);
       return;
@@ -485,6 +771,12 @@ export class WsServer {
    *   - Nothing is computed for a peer whose outgoing buffer is over the cap.
    */
   private answerStep1(conn: Conn, room: Room, sv: Uint8Array): void {
+    if (conn.joining) {
+      // its join state vector is not known yet: answered right after the content frame
+      Y.decodeStateVector(sv); // malformed = bad message, now
+      conn.deferredStep1 = sv;
+      return;
+    }
     const clientSv = Y.decodeStateVector(sv);
     const emptySv = clientSv.size === 0;
     if (conn.step1Answers > 0 && emptySv) {
@@ -514,6 +806,20 @@ export class WsServer {
     encoding.writeVarUint(e, syncProtocol.messageYjsSyncStep2);
     encoding.writeVarUint8Array(e, diff);
     sendWs(conn.ws, encoding.toUint8Array(e));
+  }
+
+  /** Ask the client for what the room lacks (sync step 1), at most one request outstanding. */
+  private askResync(conn: Conn, room: Room): void {
+    this.deps.metrics.pendingResync.inc();
+    if (conn.resyncAsked) return; // the answer to the outstanding request carries this edit too
+    if (!conn.resync.take()) {
+      this.deps.log.warn({ room: room.name, user: conn.identity.id }, 'updates that never integrate: closed');
+      this.closeConn(conn, CLOSE.forbidden, 'write to pending not allowed');
+      this.deps.metrics.wsRejected.inc({ reason: 'forbidden_write' });
+      return;
+    }
+    conn.resyncAsked = true;
+    sendWs(conn.ws, room.step1Frame());
   }
 
   private async recheck(conn: Conn, room: Room): Promise<void> {
@@ -547,8 +853,25 @@ function checkClientUpdateSafe(room: Room, conn: Conn, update: Uint8Array): Upda
       mayWriteClient: (client) => room.mayWrite(client, conn.identity.id, conn),
     });
   } catch {
-    return { bad: 'forbidden', writers: [], grows: false };
+    return { bad: 'forbidden', writers: [], grows: false, splits: 0 };
   }
+}
+
+/** Join deadline: the payload at WS_JOIN_MIN_BYTES_PER_SEC, never less than 30 s. */
+function joinDeadlineMs(bytes: number, minBytesPerSec: number): number {
+  return Math.max(JOIN_MIN_MS, (bytes / minBytesPerSec) * 1000);
+}
+
+/**
+ * The client IP when the deployment says where it comes from (CLIENT_IP_HOPS): 0 = the TCP
+ * peer, n = the n-th address from the right of X-Forwarded-For; -1 = unknown (null).
+ */
+export function clientIp(req: IncomingMessage, hops: number): string | null {
+  if (hops < 0) return null;
+  if (hops === 0) return req.socket?.remoteAddress ?? null;
+  const xf = req.headers['x-forwarded-for'];
+  const list = (Array.isArray(xf) ? xf.join(',') : xf ?? '').split(',').map((s) => s.trim()).filter((s) => s !== '');
+  return list.length >= hops ? list[list.length - hops] : req.socket?.remoteAddress ?? null;
 }
 
 function isHttps(req: IncomingMessage): boolean {

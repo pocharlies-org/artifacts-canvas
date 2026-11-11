@@ -21,7 +21,11 @@ export const MSG_IDENTITY = 100;
 export const MSG_NOTICE = 101;
 export const MSG_LEDGER = 102;
 
-export type NoticeKind = 'revoked' | 'expired' | 'readonly' | 'rate-limited' | 'too-large' | 'shutdown';
+/**
+ * `busy`: the server is over a capacity budget (connections, outgoing bytes, CPU) and closed
+ * the connection with 1013; the client reconnects by itself.
+ */
+export type NoticeKind = 'revoked' | 'expired' | 'readonly' | 'rate-limited' | 'too-large' | 'shutdown' | 'busy';
 
 export interface Notice {
   kind: NoticeKind;
@@ -37,6 +41,8 @@ export const CLOSE = {
   tooLarge: 4413,
   rateLimited: 4429,
   serverRestart: 4503,
+  /** RFC 6455 "try again later": y-websocket reconnects (not in the terminal 4400-4499 range). */
+  tryAgain: 1013,
 } as const;
 
 export function encodeIdentity(id: Identity): Uint8Array {

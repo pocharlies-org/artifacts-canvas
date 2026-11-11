@@ -64,6 +64,12 @@ export function cleanPresenceState(state: unknown): Record<string, unknown> | nu
   return out;
 }
 
+/** Caps of sanitizeAwarenessUpdate: states per connection and per room. */
+export interface AwarenessLimits {
+  maxClaims: number;
+  roomMax: number;
+}
+
 interface UpdateEntry {
   clientId: number;
   clock: number;
@@ -78,6 +84,7 @@ interface UpdateEntry {
  *      already belong to another connection (a client may only move its own state),
  *   2. drop states for clientIds `mayClaim` refuses (the server: a Yjs client id the ledger
  *      binds to another principal — awareness alone never takes over an id with clocks),
+ *   2b. with `limits`: at most `maxClaims` states per connection and `roomMax` per room,
  *   3. keep only the presence schema of every state (cleanPresenceState: typed, bounded
  *      fields; oversized states are dropped) and overwrite its `user` field with the
  *      connection's verified identity — live cursors and labels cannot lie.
@@ -92,6 +99,7 @@ export function sanitizeAwarenessUpdate(
   roomAwareness: awarenessProtocol.Awareness,
   identity: Identity,
   mayClaim?: (clientId: number) => boolean,
+  limits?: AwarenessLimits,
 ): Uint8Array | null {
   const dec = decoding.createDecoder(update);
   let count: number;
@@ -123,9 +131,28 @@ export function sanitizeAwarenessUpdate(
   }
 
   const roomStates = roomAwareness.getStates();
-  const kept = entries.filter(
+  let kept = entries.filter(
     (e) => (claimedClientIds.has(e.clientId) || !roomStates.has(e.clientId)) && (!mayClaim || mayClaim(e.clientId)),
   );
+  if (limits) {
+    // fv5 M-7: one anonymous message announced 72 000 fresh client ids, each a valid
+    // presence state; every viewer kept and walked them all. A connection holds at most
+    // `maxClaims` states (one: its own client id) and the room at most `roomMax`; a state
+    // for an id the connection does not hold yet counts as a new claim, a removal of an id
+    // it does not hold is dropped.
+    let held = claimedClientIds.size;
+    let total = roomStates.size;
+    const seen = new Set<number>();
+    kept = kept.filter((e) => {
+      if (seen.has(e.clientId)) return false;
+      seen.add(e.clientId);
+      if (claimedClientIds.has(e.clientId)) return true;
+      if (e.state === null || held >= limits.maxClaims || total >= limits.roomMax) return false;
+      held++;
+      total++;
+      return true;
+    });
+  }
   if (kept.length === 0) return null;
 
   const enc = encoding.createEncoder();

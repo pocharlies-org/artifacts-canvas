@@ -226,13 +226,14 @@ describe('fv4 H1: sync step 1 is no amplifier', () => {
       c.close();
     }
     expect(codes.slice(0, 3)).toEqual([null, null, null]);
-    expect(codes.slice(3)).toEqual([4429, 4429]);
+    // retryable (fv5 M-6): 1013 "try again later", never the terminal 4429
+    expect(codes.slice(3)).toEqual([1013, 1013]);
     // another user is not affected
     const bob = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob.connect();
     expect(await Promise.race([bob.closed, sleep(300).then(() => null)])).toBeNull();
     bob.close();
-    // anonymous: per visitor, and dropping the cookie does not reset the room's bucket
+    // anonymous without a cookie: dropping the cookie does not reset the room's bucket
     core.rules.set('pub/joins.html', allowAnon());
     const anonCodes: (number | null)[] = [];
     for (let i = 0; i < 4; i++) {
@@ -241,7 +242,7 @@ describe('fv4 H1: sync step 1 is no amplifier', () => {
       anonCodes.push(await Promise.race([c.closed, sleep(300).then(() => null)]));
       c.close();
     }
-    expect(anonCodes.filter((c) => c === 4429).length).toBe(1);
+    expect(anonCodes.filter((c) => c === 1013).length).toBe(1);
   });
 });
 
@@ -256,11 +257,15 @@ describe('fv4 H2: the guard is O(update), never O(room)', () => {
     const room = app.manager.get(key)!;
     const probe = new Y.Doc();
     Y.applyUpdate(probe, Y.encodeStateAsUpdate(room.doc));
+    let craftClient = 70_000;
     const craft = (id: string) => {
       let upd: Uint8Array | null = null;
       const on = (u: Uint8Array, o: unknown) => {
         if (o === 'x') upd = u;
       };
+      // a fresh writer id per craft: the refused ones never reach the room, so a reused id
+      // would leave a clock gap (refused as `pending`, which no longer closes: fv5 M-2)
+      probe.clientID = ++craftClient;
       probe.on('update', on);
       probe.transact(() => {
         const m = probe.getMap('shapes').get(id) as Y.Map<unknown>;

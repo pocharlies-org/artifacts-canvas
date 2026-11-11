@@ -48,7 +48,12 @@ export interface Config {
   /** Abuse limits. Anonymous visitors get the stricter set. */
   maxConnsPerRoom: number;
   maxConnsPerRoomAnon: number;
+  /** Live connections of one anonymous visitor (cookie), over all rooms of the process. */
   maxConnsPerAnonVisitor: number;
+  /** Live connections of one logged-in user, over all rooms of the process (fv5 H-1). */
+  maxConnsPerUser: number;
+  /** Awareness (presence) states one room relays at most; each connection holds one (fv5 M-7). */
+  maxAwarenessPerRoom: number;
   msgRatePerSec: number;
   msgBurst: number;
   anonMsgRatePerSec: number;
@@ -64,6 +69,20 @@ export interface Config {
    */
   wsMaxBufferedBytes: number;
   /**
+   * A connection whose outgoing buffer stays over its cap this long is dropped by a timer,
+   * not only on its next send (fv5 H-1: a paused socket in a quiet room was kept forever).
+   */
+  wsSlowConsumerMs: number;
+  /**
+   * Bytes the server may hold for all connections together (outgoing buffers, the join
+   * payloads in flight counted once per room version). A join that would pass it is refused
+   * with 1013 (try again), and the slowest connections are dropped while it is passed.
+   */
+  wsOutgoingBudgetBytes: number;
+  /** The join payload (ledger + content) must reach the peer at least this fast (bytes/s), with a 30 s floor. */
+  wsJoinMinBytesPerSec: number;
+  /** WebSocket ping interval; a peer that answers no ping for two intervals and drains nothing is dropped. */
+  wsPingIntervalMs: number;  /**
    * Bytes of sync step-2 answers per connection beyond the first one (which is free: a
    * joining or reconnecting client asks for everything it lacks once). Users / anonymous.
    */
@@ -71,18 +90,39 @@ export interface Config {
   syncBurstBytes: number;
   anonSyncBytesPerSec: number;
   anonSyncBurstBytes: number;
-  /** Joins per principal (a user id, an anonymous visitor cookie) and per room for anonymous visitors. */
+  /**
+   * Joins per principal (a user id, an anonymous visitor cookie); per room for anonymous joins
+   * that bring no visitor cookie; per client IP for anonymous joins when the IP is known
+   * (clientIpHops). A refused join closes with 1013 (the client retries), never 4429 (fv5 M-6).
+   */
   joinRatePerMin: number;
   joinBurst: number;
   anonJoinRatePerMin: number;
   anonJoinBurst: number;
   anonRoomJoinRatePerMin: number;
   anonRoomJoinBurst: number;
-  /** Server CPU time (ms) a connection's messages may use per second, and the burst. */
+  anonIpJoinRatePerMin: number;
+  anonIpJoinBurst: number;
+  /**
+   * Where the client IP comes from: -1 = unknown (no per-IP limit), 0 = the TCP peer, n > 0 =
+   * the n-th address from the right of X-Forwarded-For (n trusted proxies append to it).
+   */
+  clientIpHops: number;
+  /**
+   * Server CPU time (ms) one PRINCIPAL's messages may use per second, and the burst (shared by
+   * all its connections: fv5 M-5, 20 connections of one user each had their own budget).
+   */
   cpuMsPerSec: number;
   cpuBurstMs: number;
   anonCpuMsPerSec: number;
   anonCpuBurstMs: number;
+  /** Server CPU time (ms/s, burst) of all connections together, and of all anonymous ones. */
+  cpuTotalMsPerSec: number;
+  cpuTotalBurstMs: number;
+  anonCpuTotalMsPerSec: number;
+  anonCpuTotalBurstMs: number;
+  /** While a total CPU budget is used up, messages bigger than this are refused (1013, retry). */
+  cpuShedMinBytes: number;
   /** Attribution entries of shapes deleted longer ago than this are pruned from the ledger. */
   attributionRetentionDays: number;
   /** Advertised to the client in the wrapper config (client-side cap for pasted images). */
@@ -159,6 +199,14 @@ export function normalizeOrigin(raw: string): string {
   }
   return u.origin;
 }
+/** An integer >= -1 (for "off" switches), or the default. */
+function intOrOff(env: NodeJS.ProcessEnv, name: string, def: number): number {
+  const v = env[name];
+  if (v === undefined || v === '') return def;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < -1 || n > 16) throw new Error(`${name} must be an integer -1..16, got "${v}"`);
+  return n;
+}
 function list(env: NodeJS.ProcessEnv, name: string, def: string[]): string[] {
   const v = env[name];
   if (v === undefined || v === '') return def;
@@ -201,6 +249,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxConnsPerRoom: num(env, 'MAX_CONNS_PER_ROOM', 50),
     maxConnsPerRoomAnon: num(env, 'MAX_CONNS_PER_ROOM_ANON', 10),
     maxConnsPerAnonVisitor: num(env, 'MAX_CONNS_PER_ANON_VISITOR', 2),
+    maxConnsPerUser: num(env, 'MAX_CONNS_PER_USER', 8),
+    maxAwarenessPerRoom: num(env, 'MAX_AWARENESS_PER_ROOM', 50),
     msgRatePerSec: num(env, 'MSG_RATE_PER_SEC', 120),
     msgBurst: num(env, 'MSG_BURST', 240),
     anonMsgRatePerSec: num(env, 'ANON_MSG_RATE_PER_SEC', 30),
@@ -210,6 +260,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxMessageBytes: num(env, 'MAX_MESSAGE_BYTES', 8 * 1024 * 1024),
     anonMaxMessageBytes: num(env, 'ANON_MAX_MESSAGE_BYTES', 2 * 1024 * 1024),
     wsMaxBufferedBytes: num(env, 'WS_MAX_BUFFERED_BYTES', 8 * 1024 * 1024),
+    wsSlowConsumerMs: num(env, 'WS_SLOW_CONSUMER_MS', 10_000),
+    wsOutgoingBudgetBytes: num(env, 'WS_OUTGOING_BUDGET_BYTES', 256 * 1024 * 1024),
+    wsJoinMinBytesPerSec: num(env, 'WS_JOIN_MIN_BYTES_PER_SEC', 32 * 1024),
+    wsPingIntervalMs: num(env, 'WS_PING_INTERVAL_MS', 30_000),
     syncBytesPerSec: num(env, 'SYNC_BYTES_PER_SEC', 1024 * 1024),
     syncBurstBytes: num(env, 'SYNC_BURST_BYTES', 4 * 1024 * 1024),
     anonSyncBytesPerSec: num(env, 'ANON_SYNC_BYTES_PER_SEC', 256 * 1024),
@@ -220,10 +274,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     anonJoinBurst: num(env, 'ANON_JOIN_BURST', 6),
     anonRoomJoinRatePerMin: num(env, 'ANON_ROOM_JOIN_RATE_PER_MIN', 60),
     anonRoomJoinBurst: num(env, 'ANON_ROOM_JOIN_BURST', 30),
+    anonIpJoinRatePerMin: num(env, 'ANON_IP_JOIN_RATE_PER_MIN', 30),
+    anonIpJoinBurst: num(env, 'ANON_IP_JOIN_BURST', 20),
+    clientIpHops: intOrOff(env, 'CLIENT_IP_HOPS', -1),
     cpuMsPerSec: num(env, 'CPU_MS_PER_SEC', 250),
     cpuBurstMs: num(env, 'CPU_BURST_MS', 5000),
     anonCpuMsPerSec: num(env, 'ANON_CPU_MS_PER_SEC', 60),
     anonCpuBurstMs: num(env, 'ANON_CPU_BURST_MS', 1000),
+    cpuTotalMsPerSec: num(env, 'CPU_TOTAL_MS_PER_SEC', 600),
+    cpuTotalBurstMs: num(env, 'CPU_TOTAL_BURST_MS', 6000),
+    anonCpuTotalMsPerSec: num(env, 'ANON_CPU_TOTAL_MS_PER_SEC', 150),
+    anonCpuTotalBurstMs: num(env, 'ANON_CPU_TOTAL_BURST_MS', 1500),
+    cpuShedMinBytes: num(env, 'CPU_SHED_MIN_BYTES', 16 * 1024),
     attributionRetentionDays: num(env, 'ATTRIBUTION_RETENTION_DAYS', 30),
     maxImageBytes: num(env, 'MAX_IMAGE_BYTES', 2 * 1024 * 1024),
     anonMaxImageBytes: num(env, 'ANON_MAX_IMAGE_BYTES', 1 * 1024 * 1024),
@@ -250,6 +312,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (cfg.maxConnsPerRoomAnon > cfg.maxConnsPerRoom) {
     throw new Error('MAX_CONNS_PER_ROOM_ANON must be <= MAX_CONNS_PER_ROOM');
+  }
+  if (cfg.anonCpuTotalMsPerSec > cfg.cpuTotalMsPerSec) {
+    throw new Error('ANON_CPU_TOTAL_MS_PER_SEC must be <= CPU_TOTAL_MS_PER_SEC');
   }
   if (cfg.anonMaxDocBytes > cfg.maxDocBytes) {
     throw new Error('ANON_MAX_DOC_BYTES must be <= MAX_DOC_BYTES');

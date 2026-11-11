@@ -731,18 +731,25 @@ describe('fv2 regressions through the server: the room never holds pending state
     return { app, url, honest, attacker };
   }
 
-  it('A: gap write, item after the stamper next clock, victim edit, empty update: 4403 each, no forged line, nothing pending (fv2.spec A)', async () => {
+  it('A: gap write, item after the stamper next clock, victim edit, empty update: never applied, no forged line, nothing pending (fv2.spec A)', async () => {
     const key = 'runs/fv2a.html';
     const { app, honest, attacker } = await room2(key);
     const a1 = await attacker();
+    // an update that would wait as pending is dropped and answered with a sync step 1 (the
+    // connection stays open: fv5 M-2, an honest reconnect can send one); never applied
+    const step1Before = a1.step1Received;
     a1.sendRaw(syncUpdateMsg(gapShapeUpdate(4000000001)));
-    await expectClose(a1, 4403);
+    await waitFor(() => a1.step1Received > step1Before, 3000, 'resync request');
     const room = app.manager.get(key)!;
     expect(room.hasPending()).toBe(false);
+    expect(Y.getState(room.doc.store, 4000000001)).toBe(0);
     const a2 = await attacker();
+    const step1Before2 = a2.step1Received;
     a2.sendRaw(syncUpdateMsg(afterFutureStamp(a2, stamperClientOf(a2.ledger), 1)));
-    await expectClose(a2, 4403);
+    await waitFor(() => a2.step1Received > step1Before2, 3000, 'resync request');
     expect(room.hasPending()).toBe(false);
+    a1.close();
+    a2.close();
     honest.doc.transact(() => honest.doc.getMap('shapes').set('h2', shape({ type: 'geo' })));
     await waitFor(() => honest.ledger.getArray('history').length === 2, 3000, 'second history line');
     const a3 = await attacker();
@@ -763,7 +770,7 @@ describe('fv2 regressions through the server: the room never holds pending state
     honest.close();
   });
 
-  it('B: a pending delete set on future stamper clocks closes 4403 and deletes nothing (fv2.spec B)', async () => {
+  it('B: a pending delete set on future stamper clocks deletes nothing; a connection that keeps sending pending state is closed 4403 (fv2.spec B)', async () => {
     const key = 'runs/fv2b.html';
     const { app, honest, attacker } = await room2(key);
     const a1 = await attacker();
@@ -771,7 +778,18 @@ describe('fv2 regressions through the server: the room never holds pending state
     const N = Y.getState(a1.ledger.store, S);
     const enc = encoding.createEncoder();
     for (const n of [0, 1, S, 1, N, 64]) encoding.writeVarUint(enc, n);
-    a1.sendRaw(syncUpdateMsg(encoding.toUint8Array(enc)));
+    const pendingDelete = syncUpdateMsg(encoding.toUint8Array(enc));
+    a1.sendRaw(pendingDelete);
+    await waitFor(() => a1.step1Received >= 2, 3000, 'resync request');
+    expect(a1.closeCode).toBeNull();
+    expect(app.manager.get(key)!.hasPending()).toBe(false);
+    // the resync budget (20 requests per connection, +1 every 2 s) bounds a sender that keeps
+    // answering the requests with nothing that integrates
+    for (let i = 0; i < 30 && a1.closeCode === null; i++) {
+      const n = a1.step1Received;
+      a1.sendRaw(pendingDelete);
+      await waitFor(() => a1.step1Received > n || a1.closeCode !== null, 3000, 'resync request or close');
+    }
     await expectClose(a1, 4403);
     expect(app.manager.get(key)!.hasPending()).toBe(false);
     honest.doc.transact(() => honest.doc.getMap('shapes').set('h2', shape({ type: 'geo' })));

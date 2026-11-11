@@ -78,6 +78,7 @@ export class RoomManager {
     await room.flush();
     if (room.conns.size === 0 && this.rooms.get(name) === room) {
       this.rooms.delete(name);
+      room.dispose();
       this.deps.metrics.rooms.set(this.rooms.size);
     }
   }
@@ -96,6 +97,7 @@ export class RoomManager {
         room.closeAll(4404, 'artifact gone');
       }
       this.rooms.delete(name);
+      room.dispose();
       this.deps.metrics.rooms.set(this.rooms.size);
     }
     try {
@@ -166,6 +168,7 @@ export class RoomManager {
       }
     }
     await Promise.all(all.map((r) => r.flush()));
+    for (const r of all) r.dispose();
     this.rooms.clear();
     this.deps.metrics.rooms.set(0);
   }

@@ -75,6 +75,7 @@ export function createApp(deps: AppDeps): App {
       );
     },
     async close(): Promise<void> {
+      wsApp.close();
       await manager.shutdown('shutdown');
       await new Promise<void>((resolve) => server.close(() => resolve()));
       if (metricsServer) await new Promise<void>((resolve) => metricsServer.close(() => resolve()));

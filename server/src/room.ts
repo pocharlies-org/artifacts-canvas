@@ -1,6 +1,7 @@
 import * as Y from 'yjs';
 import * as encoding from 'lib0/encoding';
 import * as awarenessProtocol from 'y-protocols/awareness';
+import * as syncProtocol from 'y-protocols/sync';
 import { writeUpdate } from 'y-protocols/sync';
 import type { WebSocket } from 'ws';
 import type { Config } from './config.js';
@@ -31,8 +32,33 @@ export interface Conn {
   rate: TokenBucket;
   /** bytes of sync step-2 answers after the first one (fv4 H1) */
   syncBytes: TokenBucket;
-  /** server CPU time (ms) spent on this connection's messages (fv4 H2) */
+  /** server CPU time (ms) spent on the messages of this connection's PRINCIPAL (shared, fv5 M-5) */
   cpu: TokenBucket;
+  /** `u:<user id>` or `a:<visitor nonce>`: the key of the per-principal limits */
+  principal: string;
+  /** server step-1 requests answering a `pending` update (fv5 M-2), per connection */
+  resync: TokenBucket;
+  /** a step-1 request is outstanding (cleared by the client's next step 2) */
+  resyncAsked?: boolean;
+  /**
+   * Join in progress (fv5 H-1): the payload goes out piece by piece, each once the previous
+   * one drained; room broadcasts meanwhile wait in `backlog` (sent after the payload, in order).
+   */
+  joining: boolean;
+  backlog: Uint8Array[];
+  backlogBytes: number;
+  /** a sync step 1 the client sent while joining (answered once its join state vector is known) */
+  deferredStep1?: Uint8Array;
+  /** size of the join payload and when it started; `joinFrames` = the shared frames still in flight */
+  joinBytes: number;
+  joinStarted: number;
+  joinFrames: Uint8Array[] | null;
+  /** since when the outgoing buffer has been over the cap (0 = it is not) */
+  overSince: number;
+  /** ping/pong liveness: a ping is outstanding, how much was buffered then, missed rounds */
+  awaitingPong: boolean;
+  pingBuffered: number;
+  missedPongs: number;
   /** sync step 1 messages answered so far (the first answer is free, whatever it costs) */
   step1Answers: number;
   /**
@@ -76,6 +102,8 @@ export class Room {
   /** bumped on every change of either document (cache key of the encodings below) */
   private version = 0;
   private stateCache: { version: number; content: Uint8Array; ledger: Uint8Array } | null = null;
+  private ledgerFrameCache: { version: number; frame: Uint8Array } | null = null;
+  private contentFramesCache: { version: number; step2: Uint8Array; step1: Uint8Array; sv: Map<number, number> } | null = null;
   private lastPrune = 0;
   ttlTag: string | null = null;
   private saveTimer?: ReturnType<typeof setTimeout>;
@@ -112,7 +140,7 @@ export class Room {
       const msg = encoding.toUint8Array(e);
       // Everyone but the sender (it has the update already).
       this.version++;
-      for (const c of this.conns.values()) if (c !== origin) sendWs(c.ws, msg);
+      for (const c of this.conns.values()) if (c !== origin) sendConn(c, msg);
       if (origin !== 'load') this.markDirty();
     });
     // The ledger goes to everyone, the sender included (it learns its own attribution here).
@@ -120,7 +148,7 @@ export class Room {
       const msg = encodeLedger(update);
       this.version++;
       this.ledgerApproxBytes += update.byteLength;
-      for (const c of this.conns.values()) sendWs(c.ws, msg);
+      for (const c of this.conns.values()) sendConn(c, msg);
       if (origin !== 'load') this.markDirty();
     });
 
@@ -137,7 +165,7 @@ export class Room {
         encoding.writeVarUint(e, 1 /* MSG_AWARENESS */);
         encoding.writeVarUint8Array(e, awarenessProtocol.encodeAwarenessUpdate(this.awareness, changed));
         const msg = encoding.toUint8Array(e);
-        for (const conn of this.conns.values()) sendWs(conn.ws, msg);
+        for (const conn of this.conns.values()) sendConn(conn, msg);
       },
     );
   }
@@ -151,6 +179,49 @@ export class Room {
       this.stateCache = { version: this.version, content: encodeIntegratedState(this.doc), ledger: encodeIntegratedState(this.ledger) };
     }
     return this.stateCache;
+  }
+
+  /**
+   * The join frames, each encoded ONCE per room version and shared by every join of that
+   * version (fv5 H-1: every join encoded its own copy of the whole room into its socket's
+   * buffer, so N slow readers held N copies). The ledger frame (MSG_LEDGER + full ledger):
+   */
+  ledgerFrame(): Uint8Array {
+    if (!this.ledgerFrameCache || this.ledgerFrameCache.version !== this.version) {
+      this.ledgerFrameCache = { version: this.version, frame: encodeLedger(encodeIntegratedState(this.ledger)) };
+    }
+    return this.ledgerFrameCache.frame;
+  }
+
+  /** The content frames: full state (sync step 2), the room's sync step 1, and its state vector. */
+  contentFrames(): { step2: Uint8Array; step1: Uint8Array; sv: Map<number, number> } {
+    if (!this.contentFramesCache || this.contentFramesCache.version !== this.version) {
+      const e = encoding.createEncoder();
+      encoding.writeVarUint(e, MSG_SYNC);
+      encoding.writeVarUint(e, syncProtocol.messageYjsSyncStep2);
+      encoding.writeVarUint8Array(e, encodeIntegratedState(this.doc));
+      const e1 = encoding.createEncoder();
+      encoding.writeVarUint(e1, MSG_SYNC);
+      syncProtocol.writeSyncStep1(e1, this.doc);
+      this.contentFramesCache = {
+        version: this.version,
+        step2: encoding.toUint8Array(e),
+        step1: encoding.toUint8Array(e1),
+        sv: Y.decodeStateVector(Y.encodeStateVector(this.doc)),
+      };
+    }
+    return this.contentFramesCache;
+  }
+
+  /** True when the CURRENT version's join frames are among `frames` (a join in flight holds them). */
+  framesInFlight(frames: Set<Uint8Array>): boolean {
+    const l = this.ledgerFrameCache;
+    return !!l && l.version === this.version && frames.has(l.frame);
+  }
+
+  /** A sync step 1 with the room's current state vector (asks a client for what the room lacks). */
+  step1Frame(): Uint8Array {
+    return this.contentFrames().step1;
   }
 
   get objectKey(): string {
@@ -226,7 +297,9 @@ export class Room {
    */
   save(): Promise<void> {
     this.saving = this.saving.then(async () => {
-      if (!this.dirty) return;
+      // a disposed room is gone (evicted after its last save, or expired and deleted): never
+      // written back
+      if (!this.dirty || this.disposed) return;
       const { store, metrics, log } = this.deps;
       const t0 = performance.now();
       this.dirty = false;
@@ -330,6 +403,24 @@ export class Room {
     return n;
   }
 
+  /**
+   * Release the room once it is evicted: the awareness instance runs a 3 s interval that
+   * referenced the room's documents forever (every evicted room stayed in memory: found while
+   * sizing the memory limit for fv5 H-1). Idempotent.
+   */
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = undefined;
+    this.awareness.destroy();
+    this.stateCache = null;
+    this.ledgerFrameCache = null;
+    this.contentFramesCache = null;
+  }
+
+  disposed = false;
+
   closeAll(code: number, reason: string): void {
     for (const c of this.conns.values()) {
       try {
@@ -357,6 +448,38 @@ export function limitBuffered(ws: WebSocket, cap: number, onOver: () => void): v
 export function underBufferCap(ws: WebSocket): boolean {
   const l = bufferLimits.get(ws);
   return !l || ws.bufferedAmount <= l.cap;
+}
+
+/**
+ * Send to a joined connection; while its join payload is still going out the message waits
+ * in its backlog (counted against its cap: a backlog over the cap drops the connection).
+ */
+export function sendConn(c: Conn, msg: Uint8Array): void {
+  if (c.closing) return;
+  if (c.joining) {
+    c.backlog.push(msg);
+    c.backlogBytes += msg.byteLength;
+    const l = bufferLimits.get(c.ws);
+    if (l && c.backlogBytes > l.cap) {
+      bufferLimits.delete(c.ws);
+      l.onOver();
+      c.closing = true;
+      c.backlog = [];
+      c.backlogBytes = 0;
+      try {
+        c.ws.terminate();
+      } catch {
+        /* already gone */
+      }
+    }
+    return;
+  }
+  sendWs(c.ws, msg);
+}
+
+/** The outgoing-buffer cap set by limitBuffered (Infinity when none). */
+export function bufferCap(ws: WebSocket): number {
+  return bufferLimits.get(ws)?.cap ?? Infinity;
 }
 
 export function sendWs(ws: WebSocket, msg: Uint8Array): void {
