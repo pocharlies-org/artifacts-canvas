@@ -303,6 +303,11 @@ function terminalOk(v: unknown): boolean {
   return typeof b.shapeId === 'string' && b.shapeId.length <= MAX_FIELD_STRING && finite(b.nx) && finite(b.ny);
 }
 
+/** One number of a point list (finite, within the coordinate bound). */
+export function pointNumberOk(n: unknown): boolean {
+  return finite(n);
+}
+
 /** A point list value (plain array, or the elements of the `points` Y.Array). */
 export function pointsOk(v: unknown): boolean {
   return Array.isArray(v) && v.length <= MAX_POINTS && v.every((n) => finite(n));

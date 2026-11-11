@@ -1,7 +1,8 @@
 import * as Y from 'yjs';
 import * as decoding from 'lib0/decoding';
+import * as binary from 'lib0/binary';
 import { CONTENT_ROOTS, MAX_POINTS, MAX_TEXT_LENGTH, ROOT, keyOk } from './model.js';
-import { assetValueOk, metaValueOk, pointsOk, shapeFieldProblem, shapeRecordProblem, SHAPE_TYPES } from './model.js';
+import { assetValueOk, metaValueOk, pointNumberOk, shapeFieldProblem, shapeRecordProblem, SHAPE_TYPES } from './model.js';
 import type { Attribution, GeoKind, HistoryEntry, HistoryVerb, ShapeFieldKind, ShapeType, UserInfo } from './model.js';
 
 /**
@@ -271,9 +272,22 @@ export interface UpdateCheck {
   bad: string | null;
   /** client ids the update adds new clocks to (to be bound to the sender once applied) */
   writers: number[];
-  /** the update adds new structs (it can grow the document); false = deletes only */
+  /**
+   * the update can grow the encoded document: it adds new structs, or its deletes split live
+   * items (each split becomes structs of its own: fv5 L-2, deleting every other character of
+   * a text grew the room ~8x with "deletes only"); false = it only removes whole items
+   */
   grows: boolean;
+  /** item boundaries the delete set creates in live room items (see SPLIT_COST_BYTES) */
+  splits: number;
 }
+
+/**
+ * Upper bound of what one split of a live item adds to the encoded room (a struct header with
+ * its origin ids, plus its delete-set range). The server charges `splits x SPLIT_COST_BYTES`
+ * on top of the update's own size against the document size cap.
+ */
+export const SPLIT_COST_BYTES = 24;
 
 /**
  * Server-side guard of the CONTENT document (protocol §5.3). Returns null when a client may
@@ -320,7 +334,7 @@ export function forbiddenRootWrite(doc: Y.Doc, update: Uint8Array, opts: GuardOp
 
 /** forbiddenRootWrite plus the client ids the update writes with. */
 export function checkClientUpdate(doc: Y.Doc, update: Uint8Array, opts: GuardOptions = {}): UpdateCheck {
-  if (hasPending(doc)) return { bad: 'room-pending', writers: [], grows: false };
+  if (hasPending(doc)) return { bad: 'room-pending', writers: [], grows: false, splits: 0 };
   return fastCheck(doc, update, opts);
 }
 
@@ -413,12 +427,19 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
   const serverClient = opts.serverClient ?? doc.clientID;
   const decoded = Y.decodeUpdate(update);
   const writers: number[] = [];
-  const no = (bad: string) => ({ bad, writers, grows: false });
+  const no = (bad: string): UpdateCheck => ({ bad, writers, grows: false, splits: 0 });
   // One struct block per client. Yjs keeps only the LAST block of a client that appears in
   // several (and an empty block wipes the earlier ones), while decodeUpdate lists all of
   // them: what this check sees would not be what Yjs integrates.
   const blocks = decoding.readVarUint(decoding.createDecoder(update));
   if (blocks !== new Set((decoded.structs as Y.Item[]).map((s) => s.id.client)).size) return no('malformed');
+  // The delete set as it is on the wire (fv5 M-4): Yjs applies every range as listed, but
+  // decodeUpdate neither sorts nor merges the ranges, and Y.isDeleted() binary-searches them.
+  // Unsorted ranges hid "this update also deletes its own new `type`" (a shape left with no
+  // type); one 1-character range repeated 60 000 times subtracted 60 000 characters from the
+  // text-length count while deleting one. Honest encoders write every client once, its
+  // ranges sorted and disjoint: anything else is refused.
+  if (!deleteSetCanonical(update)) return no('malformed');
 
   // NEW structs (Item / GC) per client, in clock order; fully known ones are skipped by Yjs
   // after it resolved their dependencies (kept apart for the dependency check).
@@ -666,10 +687,15 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
   const typeParents = new Set<string>();
   /** shape maps (parent key) whose `type` a ContentDeleted item at that key overwrites */
   const typeErased = new Map<string, Y.ID | undefined>();
-  /** new numbers per `points` Y.Array (parent key) */
-  const pointsAdded = new Map<string, { id: Y.ID | undefined; n: number }>();
-  /** characters added (and, below, deleted) per `text` Y.Text (parent key) */
+  /**
+   * Resulting length per `points` Y.Array / `text` Y.Text (parent key), as a delta to the
+   * room's: + the new elements the update leaves alive (an element it inserts and deletes
+   * again — an offline paste the UndoManager undid, a backspaced keystroke — adds nothing:
+   * fv5 M-1), - the live room elements it deletes (below).
+   */
+  const pointsDelta = new Map<string, { id: Y.ID | undefined; n: number }>();
   const textDelta = new Map<string, { id: Y.ID | undefined; n: number }>();
+  const liveLength = (s: Y.Item) => s.length - deletedIn(decoded.ds, s.id.client, s.id.clock, s.length);
   for (const s of items) {
     const loc = locOfItem(s);
     if (loc === MISSING) {
@@ -695,22 +721,20 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
       else typeParents.add(loc.parent);
     }
     if (loc.root === ROOT.shapes && loc.keys.length === 3 && loc.keys[1] === 'points') {
-      const cur = pointsAdded.get(loc.parent) ?? { id: loc.parentId, n: 0 };
-      cur.n += s.length;
-      pointsAdded.set(loc.parent, cur);
+      const cur = pointsDelta.get(loc.parent) ?? { id: loc.parentId, n: 0 };
+      cur.n += liveLength(s);
+      pointsDelta.set(loc.parent, cur);
     }
     if (loc.root === ROOT.shapes && loc.keys.length === 3 && loc.keys[1] === 'text' && s.content instanceof Y.ContentString) {
       const cur = textDelta.get(loc.parent) ?? { id: loc.parentId, n: 0 };
-      cur.n += s.length;
+      cur.n += liveLength(s);
       textDelta.set(loc.parent, cur);
     }
   }
   if (pending) return no('pending');
-  for (const { id, n } of pointsAdded.values()) {
-    if (roomArrayLength(id) + n > MAX_POINTS) return no('shapes-schema');
-  }
 
   const dsHas = (id: Y.ID) => Y.isDeleted(decoded.ds, id);
+  let splits = 0;
   for (const [client, ranges] of decoded.ds.clients) {
     const roomClock = Y.getState(doc.store, client);
     const structs = doc.store.clients.get(client) as (Y.Item | Y.GC)[] | undefined;
@@ -736,13 +760,19 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
           const loc = locOfRoomItem(item);
           if (loc === UNRESOLVED) return no('malformed');
           if (!CLIENT_WRITABLE_ROOTS.has(loc.root)) return no(loc.root);
-          if (loc.root === ROOT.shapes && loc.keys.length === 3 && loc.keys[1] === 'text' && item.content instanceof Y.ContentString) {
-            // a delete of room text: the part of the item inside the range leaves the text
-            const from = Math.max(clock, item.id.clock);
-            const to = Math.min(r.clock + r.len, item.id.clock + item.length);
-            const cur = textDelta.get(loc.parent) ?? { id: loc.parentId, n: 0 };
-            cur.n -= to - from;
-            textDelta.set(loc.parent, cur);
+          const from = Math.max(clock, item.id.clock);
+          const to = Math.min(r.clock + r.len, item.id.clock + item.length);
+          // a range that starts or ends inside a live item splits it (fv5 L-2)
+          if (from > item.id.clock) splits++;
+          if (to < item.id.clock + item.length) splits++;
+          if (loc.root === ROOT.shapes && loc.keys.length === 3 && (loc.keys[1] === 'text' || loc.keys[1] === 'points')) {
+            // a delete of room text / points: the part of the item inside the range leaves it
+            const delta = loc.keys[1] === 'text' ? (item.content instanceof Y.ContentString ? textDelta : null) : pointsDelta;
+            if (delta) {
+              const cur = delta.get(loc.parent) ?? { id: loc.parentId, n: 0 };
+              cur.n -= to - from;
+              delta.set(loc.parent, cur);
+            }
           }
           // deleting the current `type` of a live shape needs a replacement in the same update
           if (loc.root === ROOT.shapes && loc.keys.length === 2 && loc.keys[1] === 'type') {
@@ -760,6 +790,9 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
   for (const { id, n } of textDelta.values()) {
     if (n > 0 && roomTextLength(id) + n > MAX_TEXT_LENGTH) return no('shapes-schema');
   }
+  for (const { id, n } of pointsDelta.values()) {
+    if (n > 0 && roomArrayLength(id) + n > MAX_POINTS) return no('shapes-schema');
+  }
   // a `type` overwritten by a deleted item: refused unless the shape itself goes away in this
   // update. With a live replacement in the same update too, the winner would depend on the
   // order the items integrate in: refused as well (clients never change a shape's type).
@@ -773,7 +806,130 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
   for (const m of newShapeMaps) {
     if (!dsHas(m.id) && !typeParents.has(idKey(m.id))) return no('shapes-schema');
   }
-  return { bad: null, writers, grows: fresh.size > 0 };
+  return { bad: null, writers, grows: fresh.size > 0 || splits > 0, splits };
+}
+
+/** Clocks of [clock, clock + len) of `client` that the (canonical: sorted, disjoint) delete set deletes. */
+function deletedIn(ds: ReturnType<typeof Y.decodeUpdate>["ds"], client: number, clock: number, len: number): number {
+  const ranges = ds.clients.get(client);
+  if (!ranges || !ranges.length) return 0;
+  // first range that ends after `clock`
+  let lo = 0;
+  let hi = ranges.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (ranges[mid].clock + ranges[mid].len <= clock) lo = mid + 1;
+    else hi = mid;
+  }
+  let n = 0;
+  const end = clock + len;
+  for (let i = lo; i < ranges.length && ranges[i].clock < end; i++) {
+    n += Math.min(end, ranges[i].clock + ranges[i].len) - Math.max(clock, ranges[i].clock);
+  }
+  return n;
+}
+
+/**
+ * Is the delete set of `update` (Yjs update format v1) canonical: every client listed once,
+ * its ranges non-empty, sorted by clock and disjoint, and nothing after it? The struct
+ * section is skipped exactly the way Yjs' decodeUpdate reads it (lazyStructReaderGenerator:
+ * info 10 = Skip, BITS5 != 0 = Item, else GC), so the delete set read here is the one Yjs
+ * applies. Any parse failure counts as not canonical.
+ */
+export function deleteSetCanonical(update: Uint8Array): boolean {
+  try {
+    const dec = new Y.UpdateDecoderV1(decoding.createDecoder(update));
+    const rest = dec.restDecoder;
+    const blocks = decoding.readVarUint(rest);
+    for (let b = 0; b < blocks; b++) {
+      const n = decoding.readVarUint(rest);
+      dec.readClient();
+      decoding.readVarUint(rest); // first clock
+      for (let i = 0; i < n; i++) {
+        const info = dec.readInfo();
+        if (info === 10) {
+          decoding.readVarUint(rest);
+          continue;
+        }
+        if ((binary.BITS5 & info) === 0) {
+          dec.readLen(); // GC
+          continue;
+        }
+        if ((info & binary.BIT8) === binary.BIT8) dec.readLeftID();
+        if ((info & binary.BIT7) === binary.BIT7) dec.readRightID();
+        const cantCopyParentInfo = (info & (binary.BIT7 | binary.BIT8)) === 0;
+        if (cantCopyParentInfo) {
+          if (dec.readParentInfo()) dec.readString();
+          else dec.readLeftID();
+          if ((info & binary.BIT6) === binary.BIT6) dec.readString();
+        }
+        skipContent(dec, info & binary.BITS5);
+      }
+    }
+    const clients = decoding.readVarUint(rest);
+    const seen = new Set<number>();
+    for (let c = 0; c < clients; c++) {
+      dec.resetDsCurVal();
+      const client = decoding.readVarUint(rest);
+      if (seen.has(client)) return false;
+      seen.add(client);
+      const n = decoding.readVarUint(rest);
+      let end = -1;
+      for (let i = 0; i < n; i++) {
+        const clock = dec.readDsClock();
+        const len = dec.readDsLen();
+        if (!(len > 0) || clock < end) return false;
+        end = clock + len;
+      }
+    }
+    return !decoding.hasContent(rest);
+  } catch {
+    return false;
+  }
+}
+
+/** Read past one item content of ref `ref` (Yjs contentRefs, update format v1). */
+function skipContent(dec: Y.UpdateDecoderV1, ref: number): void {
+  switch (ref) {
+    case 1: // ContentDeleted
+      dec.readLen();
+      return;
+    case 2: { // ContentJSON
+      const n = dec.readLen();
+      for (let i = 0; i < n; i++) dec.readString();
+      return;
+    }
+    case 3: // ContentBinary
+      dec.readBuf();
+      return;
+    case 4: // ContentString
+      dec.readString();
+      return;
+    case 5: // ContentEmbed
+      dec.readJSON();
+      return;
+    case 6: // ContentFormat
+      dec.readKey();
+      dec.readJSON();
+      return;
+    case 7: { // ContentType: YXmlElement (3) and YXmlHook (5) carry a key
+      const t = dec.readTypeRef();
+      if (t === 3 || t === 5) dec.readKey();
+      else if (t > 6) throw new Error('type ref');
+      return;
+    }
+    case 8: { // ContentAny
+      const n = dec.readLen();
+      for (let i = 0; i < n; i++) dec.readAny();
+      return;
+    }
+    case 9: // ContentDoc
+      dec.readString();
+      dec.readAny();
+      return;
+    default:
+      throw new Error('content ref');
+  }
 }
 
 /**
@@ -860,7 +1016,9 @@ function schemaProblem(loc: Loc, content: ItemContent): string | null {
     if (keys.length === 3) {
       if (keys[2] !== null) return bad;
       if (keys[1] === 'text') return content instanceof Y.ContentString || content instanceof Y.ContentFormat ? null : bad;
-      if (keys[1] === 'points') return vals && pointsOk(vals) ? null : bad;
+      // the elements of one item; how many the array ends up with is checked on the whole
+      // update (an item Yjs merged from inserts the update also deletes can be longer: fv5 M-1)
+      if (keys[1] === 'points') return vals && vals.every(pointNumberOk) ? null : bad;
       return bad;
     }
     return bad;
