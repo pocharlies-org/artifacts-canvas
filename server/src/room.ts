@@ -55,6 +55,16 @@ export interface Conn {
   joinFrames: Uint8Array[] | null;
   /** since when the outgoing buffer has been over the cap (0 = it is not) */
   overSince: number;
+  /**
+   * Drain tracking (fv6 L-A), sampled every second: bytes sent and buffered at the last sample,
+   * and the last time the peer drained at least WS_JOIN_MIN_BYTES_PER_SEC (or held little).
+   * A peer that made no such progress for WS_STALL_MS is stalled: under outgoing-budget pressure
+   * it is dropped before anyone else is refused.
+   */
+  lastSent: number;
+  lastBuffered: number;
+  progressAt: number;
+  sampledAt?: number;
   /** ping/pong liveness: a ping is outstanding, how much was buffered then, missed rounds */
   awaitingPong: boolean;
   pingBuffered: number;
@@ -78,6 +88,13 @@ export interface RoomDeps {
   metrics: Metrics;
   /** called after the last connection left and the room was flushed */
   onEmpty: (name: string) => void;
+  /**
+   * Server CPU for debounced saves, shared by every room (fv6 M-A): a save encodes the whole
+   * room, so a client making tiny edits in several big rooms made the server encode each of
+   * them every SAVE_DEBOUNCE_MS. A debounced save waits while the budget is in debt; flushes
+   * (last leave, shutdown) never wait.
+   */
+  saveBudget?: TokenBucket;
 }
 
 /**
@@ -99,11 +116,29 @@ export class Room {
   approxBytes = 0;
   /** rough ledger size estimate (it counts against the size cap too, fv4 M4) */
   ledgerApproxBytes = 0;
-  /** bumped on every change of either document (cache key of the encodings below) */
-  private version = 0;
-  private stateCache: { version: number; content: Uint8Array; ledger: Uint8Array } | null = null;
-  private ledgerFrameCache: { version: number; frame: Uint8Array } | null = null;
-  private contentFramesCache: { version: number; step2: Uint8Array; step1: Uint8Array; sv: Map<number, number> } | null = null;
+  /** bumped on every change of the content / the ledger document (cache keys below) */
+  private contentVersion = 0;
+  private ledgerVersion = 0;
+  /**
+   * Join payload caches (fv6 M-A). Each document is encoded in full once (a snapshot frame) and
+   * shared by every join; the updates broadcast since are kept as they went out (the tail) and
+   * a join gets snapshot + tail, which Yjs integrates into exactly the current document. The
+   * snapshot is encoded again only once its tail outgrew it (TAIL_MAX_MESSAGES, or a quarter of
+   * the snapshot): a client that bumps the room before every join no longer makes every join
+   * re-encode the whole room (fv6 Q2: 82 ms per join of a 3.3 MiB room).
+   */
+  private contentSnap: Snapshot | null = null;
+  private ledgerSnap: Snapshot | null = null;
+  /** the room's sync step 1 (state vector), per content version (fv6 L-C: not the full step 2) */
+  private step1Cache: { version: number; frame: Uint8Array; sv: Map<number, number> } | null = null;
+  /** full encodings of a document for joins (tests, metric canvas_join_encodes_total) */
+  encodes = 0;
+  /** CPU time the load took, not charged to anyone yet (see takeLoadMs) */
+  private loadMs = 0;
+  /** joins that are waiting for this room (its load, or attaching): never evicted meanwhile */
+  pendingJoins = 0;
+  /** live connections per principal (`u:<id>` / `a:<visitor>`): who keeps the room loaded */
+  readonly principals = new Map<string, number>();
   private lastPrune = 0;
   ttlTag: string | null = null;
   private saveTimer?: ReturnType<typeof setTimeout>;
@@ -139,14 +174,16 @@ export class Room {
       writeUpdate(e, update);
       const msg = encoding.toUint8Array(e);
       // Everyone but the sender (it has the update already).
-      this.version++;
+      this.contentVersion++;
+      this.contentSnap = extendTail(this.contentSnap, msg);
       for (const c of this.conns.values()) if (c !== origin) sendConn(c, msg);
       if (origin !== 'load') this.markDirty();
     });
     // The ledger goes to everyone, the sender included (it learns its own attribution here).
     this.ledger.on('update', (update: Uint8Array, origin: unknown) => {
       const msg = encodeLedger(update);
-      this.version++;
+      this.ledgerVersion++;
+      this.ledgerSnap = extendTail(this.ledgerSnap, msg);
       this.ledgerApproxBytes += update.byteLength;
       for (const c of this.conns.values()) sendConn(c, msg);
       if (origin !== 'load') this.markDirty();
@@ -171,57 +208,110 @@ export class Room {
   }
 
   /**
-   * The integrated state of both documents, encoded once per version: every join sends both
-   * in full, so N joins of an unchanged room cost one encoding, not N.
+   * The ledger part of a join: its snapshot frame (MSG_LEDGER + the full ledger) and the ledger
+   * messages broadcast since. The frames are shared by every join (fv5 H-1: N slow readers must
+   * not hold N copies of the room).
    */
-  fullState(): { content: Uint8Array; ledger: Uint8Array } {
-    if (!this.stateCache || this.stateCache.version !== this.version) {
-      this.stateCache = { version: this.version, content: encodeIntegratedState(this.doc), ledger: encodeIntegratedState(this.ledger) };
+  ledgerFrames(): Uint8Array[] {
+    if (!this.ledgerSnap) {
+      this.ledgerSnap = newSnapshot(encodeLedger(encodeIntegratedState(this.ledger)));
+      this.countEncode('ledger');
     }
-    return this.stateCache;
+    return [this.ledgerSnap.frame, ...this.ledgerSnap.tail];
   }
 
   /**
-   * The join frames, each encoded ONCE per room version and shared by every join of that
-   * version (fv5 H-1: every join encoded its own copy of the whole room into its socket's
-   * buffer, so N slow readers held N copies). The ledger frame (MSG_LEDGER + full ledger):
+   * The content part of a join: the snapshot (sync step 2 with the full state) and the content
+   * updates broadcast since, the room's sync step 1, and the state vector all of them add up to
+   * (what the joiner has once they arrived).
    */
-  ledgerFrame(): Uint8Array {
-    if (!this.ledgerFrameCache || this.ledgerFrameCache.version !== this.version) {
-      this.ledgerFrameCache = { version: this.version, frame: encodeLedger(encodeIntegratedState(this.ledger)) };
-    }
-    return this.ledgerFrameCache.frame;
-  }
-
-  /** The content frames: full state (sync step 2), the room's sync step 1, and its state vector. */
-  contentFrames(): { step2: Uint8Array; step1: Uint8Array; sv: Map<number, number> } {
-    if (!this.contentFramesCache || this.contentFramesCache.version !== this.version) {
+  contentFrames(): { frames: Uint8Array[]; step1: Uint8Array; sv: Map<number, number> } {
+    if (!this.contentSnap) {
       const e = encoding.createEncoder();
       encoding.writeVarUint(e, MSG_SYNC);
       encoding.writeVarUint(e, syncProtocol.messageYjsSyncStep2);
       encoding.writeVarUint8Array(e, encodeIntegratedState(this.doc));
-      const e1 = encoding.createEncoder();
-      encoding.writeVarUint(e1, MSG_SYNC);
-      syncProtocol.writeSyncStep1(e1, this.doc);
-      this.contentFramesCache = {
-        version: this.version,
-        step2: encoding.toUint8Array(e),
-        step1: encoding.toUint8Array(e1),
-        sv: Y.decodeStateVector(Y.encodeStateVector(this.doc)),
-      };
+      this.contentSnap = newSnapshot(encoding.toUint8Array(e));
+      this.countEncode('content');
     }
-    return this.contentFramesCache;
+    const s1 = this.step1();
+    return { frames: [this.contentSnap.frame, ...this.contentSnap.tail], step1: s1.frame, sv: s1.sv };
   }
 
-  /** True when the CURRENT version's join frames are among `frames` (a join in flight holds them). */
-  framesInFlight(frames: Set<Uint8Array>): boolean {
-    const l = this.ledgerFrameCache;
-    return !!l && l.version === this.version && frames.has(l.frame);
+  /** True when a join now needs no full encoding (both snapshots are cached). */
+  framesCached(): boolean {
+    return this.contentSnap !== null && this.ledgerSnap !== null;
+  }
+
+  /**
+   * What a join adds to the bytes held for peers: each document's size, unless a join in flight
+   * holds its current snapshot already (`frames`: the frames in flight; they are shared).
+   */
+  joinEstimate(frames: Set<Uint8Array>): number {
+    const ledger = this.ledgerSnap && frames.has(this.ledgerSnap.frame) ? 0 : this.ledgerApproxBytes;
+    const content = this.contentSnap && frames.has(this.contentSnap.frame) ? 0 : this.approxBytes;
+    return ledger + content;
   }
 
   /** A sync step 1 with the room's current state vector (asks a client for what the room lacks). */
   step1Frame(): Uint8Array {
-    return this.contentFrames().step1;
+    return this.step1().frame;
+  }
+
+  /** Sync step 1 and state vector, once per content version: O(clients), never the full state. */
+  private step1(): { frame: Uint8Array; sv: Map<number, number> } {
+    if (!this.step1Cache || this.step1Cache.version !== this.contentVersion) {
+      const e1 = encoding.createEncoder();
+      encoding.writeVarUint(e1, MSG_SYNC);
+      syncProtocol.writeSyncStep1(e1, this.doc);
+      this.step1Cache = { version: this.contentVersion, frame: encoding.toUint8Array(e1), sv: Y.decodeStateVector(Y.encodeStateVector(this.doc)) };
+    }
+    return this.step1Cache;
+  }
+
+  /** The load's CPU time, once (the first join charges it to its principal). */
+  takeLoadMs(): number {
+    const ms = this.loadMs;
+    this.loadMs = 0;
+    return ms;
+  }
+
+  private countEncode(doc: 'content' | 'ledger'): void {
+    this.encodes++;
+    this.deps.metrics.joinEncodes.inc({ doc });
+  }
+
+  /** Content + ledger bytes (the size cap's and the memory budget's measure). */
+  get bytes(): number {
+    return this.approxBytes + this.ledgerApproxBytes;
+  }
+
+  /** A joined connection: it counts for its principal (who keeps the room loaded). */
+  attach(conn: Conn): void {
+    this.conns.set(conn.ws, conn);
+    if (conn.identity.anonymous) this.anonConns++;
+    this.principals.set(conn.principal, (this.principals.get(conn.principal) ?? 0) + 1);
+  }
+
+  /** The connection left. */
+  detach(conn: Conn): void {
+    if (this.conns.get(conn.ws) !== conn) return;
+    this.conns.delete(conn.ws);
+    if (conn.identity.anonymous) this.anonConns--;
+    const n = (this.principals.get(conn.principal) ?? 1) - 1;
+    if (n > 0) this.principals.set(conn.principal, n);
+    else this.principals.delete(conn.principal);
+  }
+
+  /** Every live connection is anonymous (the room is held by anonymous visitors only). */
+  anonOnly(): boolean {
+    return this.conns.size > 0 && this.anonConns === this.conns.size;
+  }
+  private anonConns = 0;
+
+  /** Nobody is connected nor about to: the room can be evicted. */
+  get idle(): boolean {
+    return this.conns.size === 0 && this.pendingJoins === 0;
   }
 
   get objectKey(): string {
@@ -240,55 +330,77 @@ export class Room {
     }
   }
 
-  async load(): Promise<void> {
-    const { store, metrics, log } = this.deps;
+  /**
+   * Load both documents from storage. `admit` sees the encoded size before anything is decoded
+   * (fv6 H-1: the memory budget); it throws to refuse the load, else returns a release that
+   * runs once the documents are in.
+   */
+  async load(admit?: (encodedBytes: number) => Promise<() => void>): Promise<void> {
+    const { store, metrics } = this.deps;
     try {
       const [ledgerBytes, data] = await Promise.all([store.get(this.ledgerKey), store.get(this.objectKey)]);
-      // ledger first, so a migration below sees what the ledger already holds
-      if (ledgerBytes && ledgerBytes.byteLength > 0) {
-        Y.applyUpdate(this.ledger, ledgerBytes, 'load');
-        this.ledgerApproxBytes = ledgerBytes.byteLength;
-        if (dropPending(this.ledger)) {
-          log.warn({ room: this.name }, 'stored ledger had pending structs: dropped');
-          metrics.pendingDropped.inc({ where: 'load' });
-          this.markDirty();
-        }
+      const release = admit ? await admit((ledgerBytes?.byteLength ?? 0) + (data?.byteLength ?? 0)) : () => undefined;
+      const t0 = performance.now();
+      try {
+        this.apply(ledgerBytes, data);
+      } finally {
+        release();
+        this.loadMs = performance.now() - t0;
       }
-      if (data && data.byteLength > 0) {
-        Y.applyUpdate(this.doc, data, 'load');
-        this.approxBytes = data.byteLength;
-        // A stored document must integrate completely. Parked structs/deletes (an object
-        // written before the guard refused them) are dropped and the clean state is saved.
-        if (dropPending(this.doc)) {
-          log.warn({ room: this.name }, 'stored canvas had pending structs: dropped');
-          metrics.pendingDropped.inc({ where: 'load' });
-          this.markDirty();
-        }
-        // A document from before the content/ledger split: its attribution/users/history
-        // move to the ledger and leave the content document (both saved back).
-        if (migrateLegacyRoots(this.doc, this.ledger, 'migrate')) {
-          log.info({ room: this.name }, 'legacy canvas split into content + ledger');
-          metrics.migrations.inc();
-          this.markDirty();
-        }
-      }
-      this.prune();
       metrics.loads.inc({ outcome: 'ok' });
     } catch (err) {
-      metrics.loads.inc({ outcome: 'error' });
+      metrics.loads.inc({ outcome: err instanceof BusyError ? 'refused' : 'error' });
       throw err;
     }
+  }
+
+  private apply(ledgerBytes: Uint8Array | null, data: Uint8Array | null): void {
+    const { metrics, log } = this.deps;
+    // ledger first, so a migration below sees what the ledger already holds
+    if (ledgerBytes && ledgerBytes.byteLength > 0) {
+      Y.applyUpdate(this.ledger, ledgerBytes, 'load');
+      this.ledgerApproxBytes = ledgerBytes.byteLength;
+      if (dropPending(this.ledger)) {
+        log.warn({ room: this.name }, 'stored ledger had pending structs: dropped');
+        metrics.pendingDropped.inc({ where: 'load' });
+        this.markDirty();
+      }
+    }
+    if (data && data.byteLength > 0) {
+      Y.applyUpdate(this.doc, data, 'load');
+      this.approxBytes = data.byteLength;
+      // A stored document must integrate completely. Parked structs/deletes (an object
+      // written before the guard refused them) are dropped and the clean state is saved.
+      if (dropPending(this.doc)) {
+        log.warn({ room: this.name }, 'stored canvas had pending structs: dropped');
+        metrics.pendingDropped.inc({ where: 'load' });
+        this.markDirty();
+      }
+      // A document from before the content/ledger split: its attribution/users/history
+      // move to the ledger and leave the content document (both saved back).
+      if (migrateLegacyRoots(this.doc, this.ledger, 'migrate')) {
+        log.info({ room: this.name }, 'legacy canvas split into content + ledger');
+        metrics.migrations.inc();
+        this.markDirty();
+      }
+    }
+    this.prune();
   }
 
   /** Something changed (or may have, after an apply that threw): save soon. */
   markDirty(): void {
     this.dirty = true;
-    if (!this.saveTimer) {
-      this.saveTimer = setTimeout(() => {
-        this.saveTimer = undefined;
-        void this.save();
-      }, this.deps.cfg.saveDebounceMs);
-    }
+    if (!this.saveTimer) this.scheduleSave(this.deps.cfg.saveDebounceMs);
+  }
+
+  private scheduleSave(ms: number): void {
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = undefined;
+      // the server-wide save budget is used up: save once it refilled (still at most this late)
+      const wait = this.deps.saveBudget?.msUntilPositive() ?? 0;
+      if (wait > 0 && !this.disposed) this.scheduleSave(Math.max(wait, this.deps.cfg.saveDebounceMs));
+      else void this.save();
+    }, ms);
   }
 
   /**
@@ -316,6 +428,7 @@ export class Room {
         const bytes = encodeIntegratedState(this.doc);
         this.approxBytes = bytes.byteLength;
         this.ledgerApproxBytes = ledgerBytes.byteLength;
+        this.deps.saveBudget?.charge(performance.now() - t0);
         await store.put(this.ledgerKey, ledgerBytes, this.ttlTag ?? undefined);
         await store.put(this.objectKey, bytes, this.ttlTag ?? undefined);
         metrics.saves.inc({ outcome: 'ok' });
@@ -414,9 +527,9 @@ export class Room {
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = undefined;
     this.awareness.destroy();
-    this.stateCache = null;
-    this.ledgerFrameCache = null;
-    this.contentFramesCache = null;
+    this.contentSnap = null;
+    this.ledgerSnap = null;
+    this.step1Cache = null;
   }
 
   disposed = false;
@@ -430,6 +543,37 @@ export class Room {
       }
     }
   }
+}
+
+/** A refused join or load: the client is told `busy` and closed with 1013 (it retries). */
+export class BusyError extends Error {
+  constructor(readonly reason: string) {
+    super(`busy: ${reason}`);
+  }
+}
+
+/** A document encoded in full for joins, and the messages broadcast since (see Room). */
+interface Snapshot {
+  frame: Uint8Array;
+  tail: Uint8Array[];
+  tailBytes: number;
+}
+/** The tail is dropped (the next join encodes the document again) past this many messages... */
+export const TAIL_MAX_MESSAGES = 256;
+/** ...or past this many bytes, or a quarter of the snapshot if that is more. */
+const TAIL_MIN_BYTES = 64 * 1024;
+
+function newSnapshot(frame: Uint8Array): Snapshot {
+  return { frame, tail: [], tailBytes: 0 };
+}
+
+/** Add a broadcast message to a snapshot's tail; null once the tail outgrew the snapshot. */
+function extendTail(snap: Snapshot | null, msg: Uint8Array): Snapshot | null {
+  if (!snap) return null;
+  if (snap.tail.length >= TAIL_MAX_MESSAGES || snap.tailBytes + msg.byteLength > Math.max(TAIL_MIN_BYTES, snap.frame.byteLength / 4)) return null;
+  snap.tail.push(msg);
+  snap.tailBytes += msg.byteLength;
+  return snap;
 }
 
 /** Outgoing-buffer cap of a connection and what to do when it is passed (see limitBuffered). */
@@ -482,6 +626,13 @@ export function bufferCap(ws: WebSocket): number {
   return bufferLimits.get(ws)?.cap ?? Infinity;
 }
 
+/** Bytes handed to each socket so far (with bufferedAmount: how fast a peer drains, fv6 L-A). */
+const sentCounts = new WeakMap<WebSocket, number>();
+
+export function sentBytes(ws: WebSocket): number {
+  return sentCounts.get(ws) ?? 0;
+}
+
 export function sendWs(ws: WebSocket, msg: Uint8Array): void {
   if (ws.readyState !== ws.OPEN) return;
   const l = bufferLimits.get(ws);
@@ -495,5 +646,6 @@ export function sendWs(ws: WebSocket, msg: Uint8Array): void {
     }
     return;
   }
+  sentCounts.set(ws, (sentCounts.get(ws) ?? 0) + msg.byteLength);
   ws.send(msg);
 }

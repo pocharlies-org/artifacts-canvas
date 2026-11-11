@@ -1,4 +1,5 @@
 import path from 'node:path';
+import v8 from 'node:v8';
 import { fileURLToPath } from 'node:url';
 
 /**
@@ -42,6 +43,12 @@ export interface Config {
   /** Prefix of the canvas objects, per the core plugin contract. */
   canvasPrefix: string;
   saveDebounceMs: number;
+  /**
+   * Server CPU (ms per second, burst) the debounced saves of all rooms may use together; a save
+   * that is due waits while it is used up (fv6 M-A). Flushes (last leave, shutdown) never wait.
+   */
+  saveCpuMsPerSec: number;
+  saveCpuBurstMs: number;
   sweepIntervalSeconds: number;
   readyzCacheMs: number;
 
@@ -81,6 +88,11 @@ export interface Config {
   wsOutgoingBudgetBytes: number;
   /** The join payload (ledger + content) must reach the peer at least this fast (bytes/s), with a 30 s floor. */
   wsJoinMinBytesPerSec: number;
+  /**
+   * A peer that holds more than 256 KiB and drained less than WS_JOIN_MIN_BYTES_PER_SEC for this
+   * long is stalled: under outgoing-budget pressure it is dropped before a join is refused (fv6 L-A).
+   */
+  wsStallMs: number;
   /** WebSocket ping interval; a peer that answers no ping for two intervals and drains nothing is dropped. */
   wsPingIntervalMs: number;  /**
    * Bytes of sync step-2 answers per connection beyond the first one (which is free: a
@@ -125,6 +137,34 @@ export interface Config {
   cpuShedMinBytes: number;
   /** Attribution entries of shapes deleted longer ago than this are pruned from the ledger. */
   attributionRetentionDays: number;
+  /**
+   * Visitor cookies (anonymous principals) the server mints per minute and burst: on the wrapper
+   * page and on cookieless WebSocket joins (one global bucket each), and per client IP when the
+   * IP is known (clientIpHops). A visitor the limit refuses gets the page without a cookie, and
+   * a cookieless join over it is refused with 1013 and no cookie (the client retries) (fv6 M-A).
+   */
+  anonMintRatePerMin: number;
+  anonMintBurst: number;
+  anonIpMintRatePerMin: number;
+  anonIpMintBurst: number;
+  /**
+   * Loaded-room memory (fv6 H-1). A loaded room costs about `roomCostFactor` x its encoded size
+   * (content + ledger) plus ROOM_BASE_COST_BYTES. Loading a room past `roomMemoryBudgetBytes`
+   * (after evicting idle rooms) is refused with 1013, and so is an update that grows the loaded
+   * rooms past it. Default budget: derived from the V8 heap limit (see roomMemoryBudget()).
+   */
+  roomMemoryBudgetBytes: number;
+  /** where the budget came from: `env` (ROOM_MEMORY_BUDGET_BYTES) or `heap` (derived) */
+  roomMemoryBudgetSource: 'env' | 'heap';
+  roomCostFactor: number;
+  /**
+   * Share of the budget one principal may keep loaded (each room's cost is split between the
+   * principals connected to it); never less than one room at the principal's size cap. An
+   * anonymous visitor gets a quarter of it, and the rooms only anonymous visitors hold share
+   * `roomMemoryAnonShare` of the budget together.
+   */
+  roomMemoryPrincipalShare: number;
+  roomMemoryAnonShare: number;
   /** Advertised to the client in the wrapper config (client-side cap for pasted images). */
   maxImageBytes: number;
   anonMaxImageBytes: number;
@@ -207,6 +247,14 @@ function intOrOff(env: NodeJS.ProcessEnv, name: string, def: number): number {
   if (!Number.isInteger(n) || n < -1 || n > 16) throw new Error(`${name} must be an integer -1..16, got "${v}"`);
   return n;
 }
+/** A fraction in (0, 1], or the default. */
+function frac(env: NodeJS.ProcessEnv, name: string, def: number): number {
+  const v = env[name];
+  if (v === undefined || v === '') return def;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0 || n > 1) throw new Error(`${name} must be a number in (0, 1], got "${v}"`);
+  return n;
+}
 function list(env: NodeJS.ProcessEnv, name: string, def: string[]): string[] {
   const v = env[name];
   if (v === undefined || v === '') return def;
@@ -244,6 +292,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     s3ForcePathStyle: bool(env, 'S3_FORCE_PATH_STYLE', true),
     canvasPrefix: str(env, 'CANVAS_PREFIX', '_plugins/canvas').replace(/^\/+|\/+$/g, ''),
     saveDebounceMs: num(env, 'SAVE_DEBOUNCE_MS', 2000),
+    saveCpuMsPerSec: num(env, 'SAVE_CPU_MS_PER_SEC', 50),
+    saveCpuBurstMs: num(env, 'SAVE_CPU_BURST_MS', 1000),
     sweepIntervalSeconds: num(env, 'SWEEP_INTERVAL_SECONDS', 3600),
     readyzCacheMs: num(env, 'READYZ_CACHE_MS', 5000),
     maxConnsPerRoom: num(env, 'MAX_CONNS_PER_ROOM', 50),
@@ -264,6 +314,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     wsOutgoingBudgetBytes: num(env, 'WS_OUTGOING_BUDGET_BYTES', 256 * 1024 * 1024),
     wsJoinMinBytesPerSec: num(env, 'WS_JOIN_MIN_BYTES_PER_SEC', 32 * 1024),
     wsPingIntervalMs: num(env, 'WS_PING_INTERVAL_MS', 30_000),
+    wsStallMs: num(env, 'WS_STALL_MS', 3000),
     syncBytesPerSec: num(env, 'SYNC_BYTES_PER_SEC', 1024 * 1024),
     syncBurstBytes: num(env, 'SYNC_BURST_BYTES', 4 * 1024 * 1024),
     anonSyncBytesPerSec: num(env, 'ANON_SYNC_BYTES_PER_SEC', 256 * 1024),
@@ -287,6 +338,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     anonCpuTotalBurstMs: num(env, 'ANON_CPU_TOTAL_BURST_MS', 1500),
     cpuShedMinBytes: num(env, 'CPU_SHED_MIN_BYTES', 16 * 1024),
     attributionRetentionDays: num(env, 'ATTRIBUTION_RETENTION_DAYS', 30),
+    anonMintRatePerMin: num(env, 'ANON_MINT_RATE_PER_MIN', 120),
+    anonMintBurst: num(env, 'ANON_MINT_BURST', 60),
+    anonIpMintRatePerMin: num(env, 'ANON_IP_MINT_RATE_PER_MIN', 10),
+    anonIpMintBurst: num(env, 'ANON_IP_MINT_BURST', 10),
+    roomMemoryBudgetBytes: 0, // set below (depends on other limits)
+    roomMemoryBudgetSource: 'heap',
+    roomCostFactor: num(env, 'ROOM_COST_FACTOR', ROOM_COST_FACTOR),
+    roomMemoryPrincipalShare: frac(env, 'ROOM_MEMORY_PRINCIPAL_SHARE', 0.5),
+    roomMemoryAnonShare: frac(env, 'ROOM_MEMORY_ANON_SHARE', 0.5),
     maxImageBytes: num(env, 'MAX_IMAGE_BYTES', 2 * 1024 * 1024),
     anonMaxImageBytes: num(env, 'ANON_MAX_IMAGE_BYTES', 1 * 1024 * 1024),
     artifactPrefixes: list(env, 'ARTIFACT_PREFIXES', []),
@@ -319,5 +379,44 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (cfg.anonMaxDocBytes > cfg.maxDocBytes) {
     throw new Error('ANON_MAX_DOC_BYTES must be <= MAX_DOC_BYTES');
   }
+  if (env.ROOM_MEMORY_BUDGET_BYTES !== undefined && env.ROOM_MEMORY_BUDGET_BYTES !== '') {
+    cfg.roomMemoryBudgetBytes = num(env, 'ROOM_MEMORY_BUDGET_BYTES', 0);
+    cfg.roomMemoryBudgetSource = 'env';
+  } else {
+    cfg.roomMemoryBudgetBytes = roomMemoryBudget(v8.getHeapStatistics().heap_size_limit, cfg);
+  }
   return cfg;
+}
+
+/**
+ * Measured resident cost of a loaded room per encoded byte (content + ledger), V8 heap and
+ * buffers together, with its join frames encoded (fv6 H-1; Node 22 on x86-64, `--expose-gc`,
+ * rooms loaded through Room.load): geo shapes with a text label (the verifier's q4 room) 21.7x,
+ * geo shapes one per transaction 22.1x, texts with every other character deleted 17.5x, tiny maps
+ * 15.6x, text typed by two people one character at a time 12.7x, strokes grown two numbers at a
+ * time 4.2x. The worst, rounded up.
+ */
+export const ROOM_COST_FACTOR = 24;
+/** Resident cost of an empty loaded room (two documents, awareness, caches): measured 11-12 KiB. */
+export const ROOM_BASE_COST_BYTES = 32 * 1024;
+/** What the process needs besides rooms: runtime, libraries, the HTTP side (heap). */
+export const RUNTIME_RESERVE_BYTES = 192 * 1024 * 1024;
+/** Decoding, checking and applying one message costs about this many times its size (fv5 H-1). */
+export const MESSAGE_COST_FACTOR = 24;
+/** The budget never goes below this (a heap too small for the limits gets a warning at start). */
+export const MIN_ROOM_MEMORY_BUDGET_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Default loaded-room budget: what the V8 heap can hold besides the runtime, the outgoing budget
+ * and one message of the maximum size being processed:
+ *
+ *   heap_size_limit - RUNTIME_RESERVE_BYTES - WS_OUTGOING_BUDGET_BYTES - 24 x MAX_MESSAGE_BYTES
+ *
+ * heap_size_limit follows --max-old-space-size (the chart's nodeMaxOldSpaceMb), so the budget is
+ * right for any memory setting. The outgoing buffers live outside the heap: counting them here
+ * leaves the container limit the room it needs for them (chart values.yaml, "Memory").
+ */
+export function roomMemoryBudget(heapLimit: number, cfg: Pick<Config, 'wsOutgoingBudgetBytes' | 'maxMessageBytes'>): number {
+  const b = heapLimit - RUNTIME_RESERVE_BYTES - cfg.wsOutgoingBudgetBytes - MESSAGE_COST_FACTOR * cfg.maxMessageBytes;
+  return Math.max(MIN_ROOM_MEMORY_BUDGET_BYTES, Math.floor(b));
 }

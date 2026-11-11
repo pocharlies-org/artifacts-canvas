@@ -18,7 +18,7 @@ import { createApp, type App } from '../src/app.js';
 import { MemoryCanvasObjectStore } from '../src/store.js';
 import { createLogger } from '../src/logging.js';
 import { clientIp } from '../src/ws.js';
-import { limitBuffered } from '../src/room.js';
+import { TAIL_MAX_MESSAGES, limitBuffered } from '../src/room.js';
 import { startFakeCore, allowUser, allowAnon, type FakeCore } from './helpers/fakecore.js';
 import { TEST_ORIGIN, TestClient, expectClose, waitFor } from './helpers/yclient.js';
 import { checkClientUpdate, deleteSetCanonical, applyGuarded, shapeValueProblem } from '@pocharlies/artifacts-canvas-shared/stamper';
@@ -113,6 +113,9 @@ async function raw(app: App, key: string, cookie?: string, pause = false, header
 }
 const serverConns = (app: App, key: string, user: string) =>
   [...(app.manager.get(key)?.conns.values() ?? [])].filter((c) => c.identity.id === user);
+/** Bytes of a join payload of `room` (ledger and content frames: snapshots + tails). */
+const frameBytes = (room: { ledgerFrames(): Uint8Array[]; contentFrames(): { frames: Uint8Array[] } }) =>
+  [...room.ledgerFrames(), ...room.contentFrames().frames].reduce((a, f) => a + f.byteLength, 0);
 async function rejected(app: App, reason: string): Promise<number> {
   const m = await app.metrics.wsRejected.get();
   return m.values.filter((v) => v.labels.reason === reason).reduce((a, v) => a + v.value, 0);
@@ -154,7 +157,7 @@ describe('fv5 H-1: slow readers cannot hold the server memory', () => {
     const roomBytes = await fill(app, key, ana, 12_000);
     expect(roomBytes).toBeGreaterThan(3_500_000);
     const room = app.manager.get(key)!;
-    const F = room.ledgerFrame().byteLength + room.contentFrames().step2.byteLength;
+    const F = frameBytes(room);
     const socks = [];
     for (let i = 0; i < 20; i++) socks.push(await raw(app, key, 'sid=eve', true).catch(() => null));
     await sleep(150);
@@ -211,7 +214,9 @@ describe('fv5 H-1: slow readers cannot hold the server memory', () => {
 
   it('the outgoing budget: a join that would pass it is refused with 1013 + busy (retryable); while it is passed the peer holding most is dropped; then joins succeed', async () => {
     // the 40 000-shape fill must not run into the per-principal CPU budget (tested apart)
-    const app = await startApp({ WS_PING_INTERVAL_MS: '600000', WS_SLOW_CONSUMER_MS: '600000', CPU_MS_PER_SEC: '100000', CPU_BURST_MS: '100000', CPU_TOTAL_MS_PER_SEC: '100000', CPU_TOTAL_BURST_MS: '100000' });
+    // fv6 L-A: a stalled peer is dropped to make room for a join (adversarial-fv6 / fv6.test.ts);
+    // here no peer counts as stalled, so the budget refuses
+    const app = await startApp({ WS_PING_INTERVAL_MS: '600000', WS_SLOW_CONSUMER_MS: '600000', WS_STALL_MS: '600000', MSG_RATE_PER_SEC: '1000', MSG_BURST: '1000', CPU_MS_PER_SEC: '100000', CPU_BURST_MS: '100000', CPU_TOTAL_MS_PER_SEC: '100000', CPU_TOTAL_BURST_MS: '100000' });
     const cfg = (app.manager as unknown as { deps: { cfg: { wsOutgoingBudgetBytes: number } } }).deps.cfg;
     const key = 'u/budget/index.html';
     users(key);
@@ -220,13 +225,14 @@ describe('fv5 H-1: slow readers cannot hold the server memory', () => {
     await fill(app, key, ana, 40_000, 4000); // bigger than the kernel's socket buffers on any host
     expect(ana.closeCode).toBeNull();
     const room = app.manager.get(key)!;
-    const F = room.ledgerFrame().byteLength + room.contentFrames().step2.byteLength;
+    const F = frameBytes(room);
     cfg.wsOutgoingBudgetBytes = Math.round(1.2 * F);
     const eve = await raw(app, key, 'sid=eve', true); // holds her join payload unread
     await waitFor(() => (serverConns(app, key, 'eve@corp')[0]?.ws.bufferedAmount ?? 0) > 1024 * 1024, 10_000, 'eve holds her join');
-    // a new room version: the next join needs new frames, more than the budget has left
-    ana.doc.getMap('meta').set('v', 1);
-    await waitFor(() => room.doc.getMap('meta').get('v') === 1, 3000, 'edit');
+    // new join frames: the next join needs them, more than the budget has left (fv6: a join
+    // shares the snapshot until the updates since outgrow it, TAIL_MAX_MESSAGES)
+    for (let v = 1; v <= TAIL_MAX_MESSAGES + 1; v++) ana.doc.getMap('meta').set('v', v);
+    await waitFor(() => room.doc.getMap('meta').get('v') === TAIL_MAX_MESSAGES + 1, 3000, 'edit');
     const bob = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob.connect();
     expect(await bob.closed).toBe(1013);
@@ -749,7 +755,9 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
 // ---------------------------------------------------------------------------------------------
 describe('fv5 M-6: anonymous joins cannot lock other visitors out', () => {
   it('p6: a cookieless client draining the room\'s join bucket does not lock out visitors with a cookie; a first join is never refused with 4429', async () => {
-    const app = await startApp({ ANON_ROOM_JOIN_BURST: '5', ANON_ROOM_JOIN_RATE_PER_MIN: '1' });
+    // the cookie of a refused cookieless join is minted within the WebSocket mint rate (fv6
+    // M-A, tested in fv6.test.ts); here the rate is out of the way
+    const app = await startApp({ ANON_ROOM_JOIN_BURST: '5', ANON_ROOM_JOIN_RATE_PER_MIN: '1', ANON_MINT_BURST: '100000' });
     const key = 'pub/talk/index.html';
     core.rules.set(key, allowAnon());
     const codes: number[] = [];

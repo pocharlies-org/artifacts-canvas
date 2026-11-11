@@ -1,4 +1,5 @@
 import http from 'node:http';
+import v8 from 'node:v8';
 import type { Config } from './config.js';
 import { createLogger, type Logger } from './logging.js';
 import { Metrics } from './metrics.js';
@@ -39,7 +40,7 @@ export function createApp(deps: AppDeps): App {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const authz = new AuthzClient(cfg, log, metrics, fetchImpl);
   const manager = new RoomManager({ cfg, store, authz, log, metrics });
-  const anon = new AnonIssuer(cfg.anonCookieSecret);
+  const anon = new AnonIssuer(cfg.anonCookieSecret, cfg);
   const httpApp = new HttpApp({ cfg, authz, manager, store, log, metrics, fetchImpl, anon });
   const wsApp = new WsServer({ cfg, authz, manager, log, metrics, anon });
   const metricsServer = cfg.metricsPort ? http.createServer(metricsHandler(metrics)) : null;
@@ -59,6 +60,10 @@ export function createApp(deps: AppDeps): App {
         server.listen(cfg.port, cfg.host, () => {
           server.removeListener('error', reject);
           log.info({ port: cfg.port }, 'artifacts-canvas server listening');
+          log.info(
+            { budgetMiB: Math.round(cfg.roomMemoryBudgetBytes / 1048576), source: cfg.roomMemoryBudgetSource, heapLimitMiB: Math.round(v8.getHeapStatistics().heap_size_limit / 1048576), costFactor: cfg.roomCostFactor },
+            'loaded-room memory budget',
+          );
           resolve();
         });
       }).then(

@@ -11,6 +11,7 @@ import type { AuthzResult } from './types.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
 import type { CanvasObjectStore } from './store.js';
 import type { AnonIssuer } from './anon.js';
+import { clientIp } from './limits.js';
 
 export interface HttpDeps {
   cfg: Config;
@@ -242,9 +243,14 @@ export class HttpApp {
     for (const [k, v] of Object.entries(WRAPPER_HEADERS)) res.setHeader(k, v);
     const anonymous = !gate.res.identity || gate.res.identity.anonymous;
     if (anonymous && !this.deps.anon.parse(cookie)) {
-      // Anonymous visitor without a pseudonym yet: the server assigns one (anon.ts).
-      const v = this.deps.anon.visitor('', url.searchParams.get('anon'));
-      res.setHeader('set-cookie', this.deps.anon.setCookie(v.nonce, v.num, forwardedHttps(req)));
+      // Anonymous visitor without a pseudonym yet: the server assigns one (anon.ts), within the
+      // mint rate (fv6 M-A). Over it, the page is served without a cookie: the WebSocket join
+      // mints one later or is refused with 1013, and the client retries.
+      if (this.deps.anon.mint(clientIp(req, cfg.clientIpHops), 'http')) {
+        const v = this.deps.anon.visitor('', url.searchParams.get('anon'));
+        res.setHeader('set-cookie', this.deps.anon.setCookie(v.nonce, v.num, forwardedHttps(req)));
+        this.deps.metrics.anonMinted.inc({ outcome: 'minted' });
+      } else this.deps.metrics.anonMinted.inc({ outcome: 'refused' });
     }
     res.end(req.method === 'HEAD' ? undefined : html);
   }

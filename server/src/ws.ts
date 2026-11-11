@@ -11,13 +11,13 @@ import type { Logger } from './logging.js';
 import type { Metrics } from './metrics.js';
 import type { AuthzClient } from './authz.js';
 import { artifactState } from './expiry.js';
-import { TokenBucket } from './limits.js';
+import { TokenBucket, clientIp } from './limits.js';
 import { composeIdentity, sanitizeAwarenessUpdate } from './identity.js';
 import { AnonIssuer, assignNum } from './anon.js';
 import { normalizeOrigin } from './config.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
 import type { RoomManager } from './rooms.js';
-import { Room, bufferCap, limitBuffered, sendWs, underBufferCap, type Conn } from './room.js';
+import { BusyError, Room, bufferCap, limitBuffered, sendWs, sentBytes, underBufferCap, type Conn } from './room.js';
 import {
   CLOSE,
   MSG_AWARENESS,
@@ -50,6 +50,15 @@ const JOIN_LOW_WATER = 256 * 1024;
 const SWEEP_MS = 1000;
 /** Floor of the join deadline (see WS_JOIN_MIN_BYTES_PER_SEC). */
 const JOIN_MIN_MS = 30_000;
+/**
+ * A peer holding more than this that drained less than WS_JOIN_MIN_BYTES_PER_SEC for WS_STALL_MS
+ * is stalled (fv6 L-A): under outgoing-budget pressure it is dropped before a join is refused.
+ */
+const STALL_MIN_BYTES = 256 * 1024;
+/** Joins of principals that hold nothing may take the outgoing budget this much over (fv6 L-A). */
+const OUTGOING_SLACK = 0.25;
+
+export { clientIp };
 
 /** Request property carrying the Set-Cookie of the upgrade response (see the 'headers' hook). */
 const SET_COOKIE = Symbol('canvas-set-cookie');
@@ -73,7 +82,7 @@ export class WsServer {
 
   constructor(private readonly deps: WsDeps) {
     const { cfg } = deps;
-    this.anon = deps.anon ?? new AnonIssuer(cfg.anonCookieSecret);
+    this.anon = deps.anon ?? new AnonIssuer(cfg.anonCookieSecret, cfg);
     this.cpuAll = new TokenBucket(cfg.cpuTotalMsPerSec, cfg.cpuTotalBurstMs);
     this.cpuAnon = new TokenBucket(cfg.anonCpuTotalMsPerSec, cfg.anonCpuTotalBurstMs);
     this.sweepTimer = setInterval(() => this.sweep(), Math.min(SWEEP_MS, cfg.wsPingIntervalMs));
@@ -130,6 +139,24 @@ export class WsServer {
     const cookie = req.headers.cookie ?? '';
     const authorization = req.headers.authorization ?? '';
     const anonParam = url.searchParams.get('anon');
+    // fv6 M-A: a visitor cookie whose join budget is used up, or whose principal is in CPU debt,
+    // is refused before the core is asked (each refused attempt cost an authz round trip: q2's
+    // attackers made 670 a second). Only anonymous joins spend a visitor's join budget, so a
+    // browser that logged in meanwhile is refused only while that budget refills (seconds).
+    if (!authorization) {
+      const v = this.anon.parse(cookie);
+      if (v) {
+        const p = `a:${v.nonce}`;
+        if ((this.joins.get(p)?.level() ?? 1) < 1) {
+          this.refuseBusy(req, socket, head, 'join_rate', 'too many joins');
+          return;
+        }
+        if ((this.principals.get(p)?.cpu.level() ?? 0) < 0) {
+          this.refuseBusy(req, socket, head, 'cpu_debt', 'cpu budget');
+          return;
+        }
+      }
+    }
 
     this.deps.authz
       .authorize(cookie, key.key, authorization)
@@ -158,6 +185,15 @@ export class WsServer {
         const num = visitor ? assignNum(visitor.num, visitor.nonce, existing ? existing.anonHolders() : new Map()) : '';
         const identity = composeIdentity(res, num, visitor ? this.anon.visitorId(visitor.nonce) : '');
         const principal = visitor ? `a:${visitor.nonce}` : `u:${identity.id}`;
+        const ip = clientIp(req, cfg.clientIpHops);
+        // fv6 M-A: a new visitor is a new principal (budgets of its own): minted within the
+        // mint rate only, else refused with 1013 and no cookie (the client retries).
+        if (visitor?.fresh && !this.anon.mint(ip, 'ws')) {
+          this.deps.metrics.anonMinted.inc({ outcome: 'refused' });
+          this.refuseBusy(req, socket, head, 'anon_mint', 'too many new visitors');
+          return;
+        }
+        if (visitor?.fresh) this.deps.metrics.anonMinted.inc({ outcome: 'minted' });
         // A visitor without a cookie gets one with ANY answer (also a refusal), so the retry
         // of an honest browser comes back as a returning visitor with a bucket of its own.
         if (visitor && (visitor.fresh || num !== visitor.num)) {
@@ -169,7 +205,7 @@ export class WsServer {
         // a cookieless client draining it no longer locks out returning visitors (who have
         // their own bucket); with a known client IP, every anonymous join also takes from a
         // bucket per IP. A refused join closes with 1013: the client retries (never 4429).
-        if (!this.joinAllowed(visitor ? null : identity.id, visitor, key.key, clientIp(req, cfg.clientIpHops))) {
+        if (!this.joinAllowed(visitor ? null : identity.id, visitor, key.key, ip)) {
           this.refuseBusy(req, socket, head, 'join_rate', 'too many joins');
           return;
         }
@@ -197,12 +233,30 @@ export class WsServer {
             }
           }
         }
-        // what this join adds: nothing if a join of the same room version holds the frames
-        // already (they are shared), else the room's size; refused only while something is held
-        // (a room bigger than the budget can still be joined by one peer at a time)
-        const held = this.outgoing().total;
-        const joinEstimate = existing && !existing.framesInFlight(this.inFlightFrames()) ? existing.approxBytes + existing.ledgerApproxBytes : 0;
-        if (held > 0 && held + joinEstimate > cfg.wsOutgoingBudgetBytes) {
+        // fv6 M-A: a principal whose CPU budget is used up joins nobody until it refilled (every
+        // join costs CPU: authz, the payload, possibly an encoding or a load)
+        const own = this.principals.get(principal);
+        if (own && own.cpu.level() < 0) {
+          this.refuseBusy(req, socket, head, 'cpu_debt', 'cpu budget');
+          return;
+        }
+        // ...and while the server-wide budget (or the anonymous share) is used up, a join that
+        // would encode the room or load it waits (1013): those are the expensive ones
+        const cpuShed = this.cpuAll.level() < 0 || (!!visitor && this.cpuAnon.level() < 0);
+        if (cpuShed && (!existing || !existing.framesCached())) {
+          this.refuseBusy(req, socket, head, 'cpu_shed', 'server busy');
+          return;
+        }
+        // fv6 H-1: a join that would LOAD the room is refused while the loaded rooms use the
+        // memory budget (joins to loaded rooms are never refused for memory)
+        if (!existing) {
+          const why = this.deps.manager.mayLoad({ principal, anonymous: !!visitor });
+          if (why) {
+            this.refuseBusy(req, socket, head, why, 'server memory busy');
+            return;
+          }
+        }
+        if (!this.admitOutgoing(existing, principal)) {
           this.refuseBusy(req, socket, head, 'outgoing_budget', 'server busy');
           return;
         }
@@ -213,7 +267,7 @@ export class WsServer {
           ws.once('close', () => this.releasePrincipal(principal));
           // nothing the client sends is read before join() listens (the room may still load)
           ws.pause();
-          void this.join(ws, key.key, cookie, authorization, identity, visitor ? { nonce: visitor.nonce, num } : null, res.artifact?.ttl ?? null, principal);
+          void this.join(ws, key.key, cookie, authorization, identity, visitor ? { nonce: visitor.nonce, num } : null, res.artifact?.ttl ?? null, principal, !!visitor);
         });
       })
       .catch((err) => {
@@ -276,14 +330,17 @@ export class WsServer {
 
   /**
    * Bytes held for every peer: outgoing buffers and backlogs, with the join frames still in
-   * flight (shared by every join of a room version) counted once.
+   * flight (shared by every join of a room snapshot) counted once; per connection (its own
+   * view: shared frames included) and per principal.
    */
-  private outgoing(): { total: number; conns: { conn: Conn; bytes: number }[] } {
+  private outgoing(): { total: number; conns: { conn: Conn; bytes: number }[]; byPrincipal: Map<string, number> } {
     let total = 0;
     const frames = new Set<Uint8Array>();
     const conns: { conn: Conn; bytes: number }[] = [];
+    const byPrincipal = new Map<string, number>();
     for (const room of this.deps.manager.rooms.values()) {
       for (const conn of room.conns.values()) {
+        if (conn.closing) continue; // terminated: its buffers are gone
         const b = conn.ws.bufferedAmount + conn.backlogBytes;
         let own = b;
         if (conn.joinFrames && b > 0) {
@@ -296,16 +353,57 @@ export class WsServer {
         }
         total += own;
         conns.push({ conn, bytes: b });
+        if (b > 0) byPrincipal.set(conn.principal, (byPrincipal.get(conn.principal) ?? 0) + b);
       }
     }
     for (const f of frames) total += f.byteLength;
-    return { total, conns };
+    return { total, conns, byPrincipal };
+  }
+
+  /** What one principal may have held for its connections together (fv6 L-A). */
+  private outgoingShare(): number {
+    const { cfg } = this.deps;
+    return Math.max(cfg.wsOutgoingBudgetBytes / 8, cfg.maxDocBytes + cfg.wsMaxBufferedBytes);
+  }
+
+  /** A peer that holds more than STALL_MIN_BYTES and drained (almost) nothing for WS_STALL_MS. */
+  private stalled(conn: Conn, bytes: number, now: number): boolean {
+    return bytes > STALL_MIN_BYTES && now - conn.progressAt >= this.deps.cfg.wsStallMs;
+  }
+
+  /**
+   * Room in the outgoing budget for a join (fv6 L-A). What the join adds: nothing if a join of
+   * the same snapshot holds the frames already (they are shared), else the room's size. A
+   * principal holding more than its share is refused (its own peers are not reading); else, if
+   * the budget would be passed, stalled peers (not reading, whoever they are) are dropped first,
+   * and the join is refused only if the bytes still held are all draining. A room bigger than
+   * the budget can still be joined by one peer at a time.
+   */
+  private admitOutgoing(existing: Room | undefined, principal: string): boolean {
+    const { cfg } = this.deps;
+    let out = this.outgoing();
+    const own = out.byPrincipal.get(principal) ?? 0;
+    if (own > this.outgoingShare()) return false;
+    // a principal that holds nothing may use OUTGOING_SLACK above the budget: a peer that just
+    // stopped reading is only known as stalled after WS_STALL_MS, and the honest join must not
+    // wait for that; the sweep brings the total back under the budget (stalled peers first)
+    const limit = cfg.wsOutgoingBudgetBytes * (own === 0 ? 1 + OUTGOING_SLACK : 1);
+    const estimate = existing ? existing.joinEstimate(this.inFlightFrames()) : 0;
+    if (out.total === 0 || out.total + estimate <= limit) return true;
+    const now = Date.now();
+    const victims = out.conns.filter((c) => this.stalled(c.conn, c.bytes, now)).sort((a, b) => b.bytes - a.bytes);
+    for (const v of victims) {
+      this.drop(v.conn, 'outgoing_reclaim');
+      out = this.outgoing();
+      if (out.total === 0 || out.total + estimate <= limit) return true;
+    }
+    return false;
   }
 
   /** Every join frame some connection still has in flight. */
   private inFlightFrames(): Set<Uint8Array> {
     const out = new Set<Uint8Array>();
-    for (const room of this.deps.manager.rooms.values()) for (const c of room.conns.values()) if (c.joinFrames) for (const f of c.joinFrames) out.add(f);
+    for (const room of this.deps.manager.rooms.values()) for (const c of room.conns.values()) if (c.joinFrames && !c.closing) for (const f of c.joinFrames) out.add(f);
     return out;
   }
 
@@ -345,6 +443,14 @@ export class WsServer {
         const ws = conn.ws;
         const buffered = ws.bufferedAmount + conn.backlogBytes;
         if (conn.joinFrames && !conn.joining && buffered <= JOIN_LOW_WATER) conn.joinFrames = null;
+        // drain progress (fv6 L-A): what the socket wrote out since the last sample
+        const sent = sentBytes(ws);
+        const drainedOut = sent - conn.lastSent - (ws.bufferedAmount - conn.lastBuffered);
+        const dt = Math.max(1, now - (conn.sampledAt ?? now - SWEEP_MS));
+        if (buffered <= STALL_MIN_BYTES || drainedOut >= (cfg.wsJoinMinBytesPerSec * dt) / 1000) conn.progressAt = now;
+        conn.lastSent = sent;
+        conn.lastBuffered = ws.bufferedAmount;
+        conn.sampledAt = now;
         if (buffered > bufferCap(ws)) {
           if (!conn.overSince) conn.overSince = now;
           else if (now - conn.overSince >= cfg.wsSlowConsumerMs) {
@@ -376,16 +482,22 @@ export class WsServer {
       }
     }
     for (const [k, p] of this.principals) if (p.conns === 0 && p.cpu.full()) this.principals.delete(k);
-    const out = this.outgoing();
+    let out = this.outgoing();
     if (out.total > cfg.wsOutgoingBudgetBytes) {
-      let total = out.total;
-      for (const { conn, bytes } of out.conns.sort((a, b) => b.bytes - a.bytes)) {
-        if (total <= cfg.wsOutgoingBudgetBytes || bytes < 1024 * 1024) break;
-        this.drop(conn, 'outgoing_budget');
-        total -= bytes;
+      // over the budget: stalled peers first, then principals over their share, then the
+      // biggest holders (fv6 L-A: a peer that reads is the last one dropped)
+      const share = this.outgoingShare();
+      const rank = (c: { conn: Conn; bytes: number }) =>
+        (this.stalled(c.conn, c.bytes, now) ? 2 : 0) + ((out.byPrincipal.get(c.conn.principal) ?? 0) > share ? 1 : 0);
+      const order = out.conns.filter((c) => c.bytes >= 1024 * 1024).sort((a, b) => rank(b) - rank(a) || b.bytes - a.bytes);
+      for (const c of order) {
+        this.drop(c.conn, 'outgoing_budget');
+        out = this.outgoing();
+        if (out.total <= cfg.wsOutgoingBudgetBytes) break;
       }
     }
     metrics.outgoingBytes.set(out.total);
+    metrics.roomMemory.set(this.deps.manager.memory().total);
   }
 
   /** Resolves once the connection buffers less than JOIN_LOW_WATER (or is gone). */
@@ -429,13 +541,19 @@ export class WsServer {
     anonVisitor: { nonce: string; num: string } | null,
     ttl: number | null,
     principal: string,
+    anonymous: boolean,
   ): Promise<void> {
     const { cfg, manager, metrics, log } = this.deps;
     let room: Room;
+    const loader = { principal, anonymous };
     try {
-      room = await manager.getOrCreate(artifactKey, ttl);
+      room = await manager.getOrCreate(artifactKey, ttl, loader);
       // evicted (last leave) while this join waited for it: join the room that replaces it
-      if (room.disposed || manager.get(artifactKey) !== room) room = await manager.getOrCreate(artifactKey, ttl);
+      if (room.disposed || manager.get(artifactKey) !== room) {
+        const old = room;
+        room = await manager.getOrCreate(artifactKey, ttl, loader);
+        manager.abandon(artifactKey, old);
+      }
     } catch (err) {
       if (manager.closing) {
         // restarting: the client reconnects (4503) to the next process
@@ -443,11 +561,24 @@ export class WsServer {
         ws.close(CLOSE.serverRestart, 'server restart');
         return;
       }
+      if (err instanceof BusyError) {
+        // fv6 H-1: loading this room would pass the memory budget (1013: the client retries)
+        metrics.wsRejected.inc({ reason: err.reason });
+        sendWs(ws, encodeNotice({ kind: 'busy' }));
+        ws.close(CLOSE.tryAgain, 'server memory busy');
+        setTimeout(() => ws.terminate(), 1000).unref?.();
+        return;
+      }
       log.error({ err: String(err), room: artifactKey }, 'room load failed');
       ws.close(1011, 'storage error');
       return;
     }
-    if (ws.readyState !== ws.OPEN) return; // gone while the room loaded
+    if (ws.readyState !== ws.OPEN) {
+      // gone while the room loaded: the room must not stay loaded for nobody (fv6 H-1: a
+      // socket closed during the load left the room in memory forever)
+      manager.abandon(artifactKey, room);
+      return;
+    }
     let identity = identityIn;
     let anonNum: string | undefined;
     if (anonVisitor) {
@@ -458,7 +589,8 @@ export class WsServer {
       if (anonNum !== anonVisitor.num) identity = { ...identity, name: `Anónimo ${anonNum}` };
     }
     const t0 = performance.now();
-    const ledgerFrame = room.ledgerFrame();
+    const ledgerFrames = room.ledgerFrames();
+    const ledgerBytes = ledgerFrames.reduce((a, f) => a + f.byteLength, 0);
     const conn: Conn = {
       ws,
       artifactKey,
@@ -484,10 +616,13 @@ export class WsServer {
       backlog: [],
       backlogBytes: 0,
       // until the content frame is encoded, the room's last known size stands for it
-      joinBytes: ledgerFrame.byteLength + room.approxBytes,
+      joinBytes: ledgerBytes + room.approxBytes,
       joinStarted: Date.now(),
-      joinFrames: [ledgerFrame],
+      joinFrames: ledgerFrames,
       overSince: 0,
+      lastSent: 0,
+      lastBuffered: 0,
+      progressAt: Date.now(),
       awaitingPong: false,
       pingBuffered: 0,
       missedPongs: 0,
@@ -500,7 +635,8 @@ export class WsServer {
       log.warn({ room: artifactKey, user: identity.id, buffered: ws.bufferedAmount }, 'ws dropped: outgoing buffer over the cap');
     };
     limitBuffered(ws, cfg.wsMaxBufferedBytes + conn.joinBytes, onOver);
-    room.conns.set(ws, conn);
+    room.attach(conn);
+    room.pendingJoins = Math.max(0, room.pendingJoins - 1);
     metrics.wsAccepted.inc({ anonymous: identity.anonymous ? 'true' : 'false' });
     metrics.connections.inc({ anonymous: identity.anonymous ? 'true' : 'false' });
     log.info({ room: artifactKey, user: identity.id, anon: identity.anonymous }, 'ws joined');
@@ -543,7 +679,7 @@ export class WsServer {
       conn.backlog = [];
       conn.backlogBytes = 0;
       if (conn.recheckTimer) clearInterval(conn.recheckTimer);
-      room.conns.delete(ws);
+      room.detach(conn);
       awarenessProtocol.removeAwarenessStates(room.awareness, Array.from(conn.clientIds), null);
       metrics.connections.dec({ anonymous: identity.anonymous ? 'true' : 'false' });
       void manager.leave(artifactKey, room);
@@ -562,8 +698,13 @@ export class WsServer {
     // IDENTITY MUST be the first message (protocol §4.1). The ledger (read-only for clients)
     // before the content, so shapes arrive with authors.
     sendWs(ws, encodeIdentity(identity));
-    sendWs(ws, ledgerFrame);
+    for (const f of ledgerFrames) sendWs(ws, f);
     this.chargeCpu(conn, room, performance.now() - t0, false);
+    // the CPU the load took (decoding the stored documents) counts against the server-wide
+    // budgets (fv6 M-A): while they are used up, joins that would load or encode wait
+    const loadMs = room.takeLoadMs();
+    this.cpuAll.charge(loadMs);
+    if (identity.anonymous) this.cpuAnon.charge(loadMs);
     await this.drained(conn);
     if (conn.closing || ws.readyState !== ws.OPEN) return;
     // The content: the full state (step 2), then the server's state vector (step 1) so the
@@ -573,10 +714,10 @@ export class WsServer {
     const t2 = performance.now();
     const content = room.contentFrames();
     conn.joinSv = content.sv;
-    conn.joinFrames = [ledgerFrame, content.step2];
-    conn.joinBytes = ledgerFrame.byteLength + content.step2.byteLength;
+    conn.joinFrames = [...ledgerFrames, ...content.frames];
+    conn.joinBytes = ledgerBytes + content.frames.reduce((a, f) => a + f.byteLength, 0);
     limitBuffered(ws, cfg.wsMaxBufferedBytes + conn.joinBytes, onOver);
-    sendWs(ws, content.step2);
+    for (const f of content.frames) sendWs(ws, f);
     sendWs(ws, content.step1);
     const states = room.awareness.getStates();
     if (states.size) {
@@ -698,6 +839,19 @@ export class WsServer {
         this.closeConn(conn, CLOSE.tooLarge, 'document too large');
         this.deps.metrics.wsRejected.inc({ reason: 'doc_too_large' });
         return;
+      }
+      // fv6 H-1: the loaded rooms together may not grow past the memory budget, one principal
+      // past its share of it, the rooms only anonymous visitors hold past theirs. Refused with
+      // 1013 (busy, the client retries); nothing is applied.
+      if (check.grows) {
+        const why = this.deps.manager.growthRefusal(room, conn.principal, conn.identity.anonymous, growth);
+        if (why) {
+          this.deps.log.warn({ room: room.name, user: conn.identity.id, growth, why }, 'update refused: memory budget');
+          sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+          this.closeConn(conn, CLOSE.tryAgain, 'server memory busy');
+          this.deps.metrics.wsRejected.inc({ reason: why });
+          return;
+        }
       }
       // Apply with the connection as origin (the stamper attributes it to this identity).
       // applyGuarded ALWAYS drops whatever Yjs could not integrate, also when it throws
@@ -860,18 +1014,6 @@ function checkClientUpdateSafe(room: Room, conn: Conn, update: Uint8Array): Upda
 /** Join deadline: the payload at WS_JOIN_MIN_BYTES_PER_SEC, never less than 30 s. */
 function joinDeadlineMs(bytes: number, minBytesPerSec: number): number {
   return Math.max(JOIN_MIN_MS, (bytes / minBytesPerSec) * 1000);
-}
-
-/**
- * The client IP when the deployment says where it comes from (CLIENT_IP_HOPS): 0 = the TCP
- * peer, n = the n-th address from the right of X-Forwarded-For; -1 = unknown (null).
- */
-export function clientIp(req: IncomingMessage, hops: number): string | null {
-  if (hops < 0) return null;
-  if (hops === 0) return req.socket?.remoteAddress ?? null;
-  const xf = req.headers['x-forwarded-for'];
-  const list = (Array.isArray(xf) ? xf.join(',') : xf ?? '').split(',').map((s) => s.trim()).filter((s) => s !== '');
-  return list.length >= hops ? list[list.length - hops] : req.socket?.remoteAddress ?? null;
 }
 
 function isHttps(req: IncomingMessage): boolean {

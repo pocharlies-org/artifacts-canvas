@@ -73,6 +73,28 @@ export class Metrics {
     help: 'Bytes held for all WebSocket peers (outgoing buffers; join payloads in flight counted once per room version)',
     registers: [this.registry],
   });
+  readonly roomMemory = new Gauge({
+    name: 'canvas_room_memory_bytes',
+    help: 'Estimated resident memory of the loaded rooms (ROOM_COST_FACTOR x content + ledger, plus a base per room)',
+    registers: [this.registry],
+  });
+  readonly roomMemoryBudget = new Gauge({
+    name: 'canvas_room_memory_budget_bytes',
+    help: 'Loaded-room memory budget (ROOM_MEMORY_BUDGET_BYTES, or derived from the V8 heap limit)',
+    registers: [this.registry],
+  });
+  readonly joinEncodes = new Counter({
+    name: 'canvas_join_encodes_total',
+    help: 'Full encodings of a room document for joins (each one is shared by every join until the updates since outgrow it)',
+    labelNames: ['doc'],
+    registers: [this.registry],
+  });
+  readonly anonMinted = new Counter({
+    name: 'canvas_anon_visitors_minted_total',
+    help: 'Anonymous visitor cookies issued, and refused by the mint rate limit',
+    labelNames: ['outcome'],
+    registers: [this.registry],
+  });
   readonly migrations = new Counter({
     name: 'canvas_legacy_migrations_total',
     help: 'Stored single-document canvases split into content + ledger on load',

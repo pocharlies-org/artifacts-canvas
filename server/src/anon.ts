@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { BucketMap, TokenBucket } from './limits.js';
 
 /**
  * Server-assigned anonymous pseudonyms (protocol §4).
@@ -28,11 +29,46 @@ export interface AnonVisitor {
   fresh: boolean;
 }
 
+export type MintRoute = 'http' | 'ws';
+
+/** Visitor cookies minted per minute and burst, per route and per client IP (fv6 M-A). */
+export interface MintLimits {
+  anonMintRatePerMin: number;
+  anonMintBurst: number;
+  anonIpMintRatePerMin: number;
+  anonIpMintBurst: number;
+}
+
 export class AnonIssuer {
   private readonly key: Buffer;
+  /** global mint buckets: the wrapper page, and the WebSocket (a cookieless join) */
+  private readonly mintAll: Record<MintRoute, TokenBucket> | null;
+  private readonly mintIp: BucketMap | null;
 
-  constructor(secret: string) {
+  constructor(secret: string, limits?: MintLimits) {
     this.key = secret ? crypto.createHash('sha256').update(`artifacts-canvas anon v1\n${secret}`).digest() : crypto.randomBytes(32);
+    this.mintAll = limits
+      ? { http: new TokenBucket(limits.anonMintRatePerMin / 60, limits.anonMintBurst), ws: new TokenBucket(limits.anonMintRatePerMin / 60, limits.anonMintBurst) }
+      : null;
+    this.mintIp = limits ? new BucketMap(limits.anonIpMintRatePerMin / 60, limits.anonIpMintBurst) : null;
+  }
+
+  /**
+   * May a new visitor (a new anonymous principal, with budgets of its own) be minted now? fv6
+   * M-A: one client minted hundreds of visitors with HEAD requests, each with its own join and
+   * CPU buckets. Takes one token from the route's global bucket and from the client IP's bucket
+   * (when the IP is known; shared by both routes). The wrapper page and the WebSocket have a
+   * global bucket each, so a flood of cookieless joins cannot stop the wrapper page from giving
+   * honest visitors their cookie (fv5 M-6), nor the other way round.
+   */
+  mint(ip: string | null, route: MintRoute): boolean {
+    if (!this.mintAll || !this.mintIp) return true;
+    const all = this.mintAll[route];
+    const perIp = ip !== null ? this.mintIp.get(ip) : null;
+    if (all.level() < 1 || (perIp && perIp.level() < 1)) return false;
+    all.take();
+    perIp?.take();
+    return true;
   }
 
   private sign(nonce: string, num: string): string {
