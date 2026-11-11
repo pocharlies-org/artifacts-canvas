@@ -153,6 +153,12 @@ export class CanvasDoc {
       // across separate gestures, always merge within one gesture.
       captureTimeout: 24 * 3600 * 1000,
     });
+    // fv5 (found by the honest-edit fuzzer): Yjs' undo/redo can create an item whose left
+    // origin equals its right origin; documents then place it differently depending on how
+    // their items happen to be merged (the room, loaded from storage, diverged from the tabs).
+    doc.on('afterTransaction', (tr: Y.Transaction) => {
+      if (tr.origin === this.undoManager) fixSelfOrigins(tr);
+    });
 
     this.shapes.observeDeep((events) => {
       const ids = new Set<string>();
@@ -510,4 +516,42 @@ function sameValue(a: unknown, b: unknown): boolean {
 function structuredCloneSafe<T>(v: T): T {
   if (v && typeof v === 'object') return JSON.parse(JSON.stringify(v));
   return v;
+}
+
+/**
+ * Give every list item an undo/redo transaction created the origins of the place it actually
+ * took in this document: its left neighbour's last id and its right neighbour's id, skipping
+ * items the same transaction created later (an origin must name an earlier clock). Yjs' redo
+ * can write origins that contradict each other — "after X and before X", or a right origin
+ * that comes before the left one — and documents then place the item differently depending on
+ * how their own items happen to be merged (fv5: the room, loaded from storage, diverged from
+ * the tabs). This runs before Yjs encodes the transaction's update, so every other document
+ * integrates the item exactly where this one put it. Returns how many items it rewrote.
+ */
+export function fixSelfOrigins(tr: Y.Transaction): number {
+  let fixed = 0;
+  const store = tr.doc.store;
+  for (const [client, after] of tr.afterState) {
+    const before = tr.beforeState.get(client) ?? 0;
+    if (after <= before) continue;
+    const structs = store.clients.get(client) as (Y.Item | Y.GC)[] | undefined;
+    if (!structs) continue;
+    for (let i = Y.findIndexSS(structs, before); i < structs.length; i++) {
+      const it = structs[i];
+      if (!(it instanceof Y.Item) || it.parentSub !== null) continue;
+      const later = (x: Y.Item) => x.id.client === client && x.id.clock > it.id.clock;
+      let l = it.left;
+      while (l && later(l)) l = l.left;
+      let r = it.right;
+      while (r && later(r)) r = r.right;
+      const origin = l ? l.lastId : null;
+      const rightOrigin = r ? r.id : null;
+      const same = (a: Y.ID | null, b: Y.ID | null) => (a === null ? b === null : b !== null && a.client === b.client && a.clock === b.clock);
+      if (same(origin, it.origin) && same(rightOrigin, it.rightOrigin)) continue;
+      it.origin = origin;
+      it.rightOrigin = rightOrigin;
+      fixed++;
+    }
+  }
+  return fixed;
 }
