@@ -98,13 +98,30 @@ test('L2: a 6002-character unbroken word in a 20 px box renders in < 50 ms; over
   const t0 = Date.now();
   await editorReady(viewer.page);
   expect(Date.now() - t0).toBeLessThan(10_000);
-  // more than MAX_TEXT_LENGTH characters: the writer is closed 4403 and nobody gets the shape
+  // more than MAX_TEXT_LENGTH characters: the canvas client never writes them (fv5 M-3: it
+  // keeps 10 000) ...
   await att.page.evaluate(() => {
     (window as any).__canvas.editor.doc.create({ type: 'note', x: 600, y: 300, w: 200, h: 200, text: 'x'.repeat(10_001) });
   });
+  await viewer.page.waitForFunction(() => (window as any).__canvas.editor.doc.all().some((s: any) => s.type === 'note'), undefined, { timeout: 10_000 });
+  expect(await viewer.page.evaluate(() => (window as any).__canvas.editor.doc.all().find((s: any) => s.type === 'note').text.length)).toBe(10_000);
+  expect(await wsCloses(att.page)).toEqual([]);
+  // ... and a client that writes them anyway (raw Yjs, like the PoC) is closed 4403; nobody gets it
+  await att.page.evaluate(() => {
+    const c = (window as any).__canvas;
+    const shapes = c.ydoc.getMap('shapes');
+    c.ydoc.transact(() => {
+      const m = new c.Y.Map();
+      shapes.set('raw-long', m);
+      for (const [k, v] of Object.entries({ id: 'raw-long', type: 'note', x: 900, y: 300, w: 200, h: 200, rotation: 0, index: 9, groupId: '', locked: false, color: 'black', fill: 'none', dash: 'solid', size: 'm', font: 'draw', opacity: 1 })) m.set(k, v);
+      const t = new c.Y.Text();
+      m.set('text', t);
+      t.insert(0, 'x'.repeat(10_001));
+    });
+  });
   await expect.poll(() => wsCloses(att.page), { timeout: 10_000 }).toContain(4403);
   await sleep(500);
-  expect(await viewer.page.evaluate(() => (window as any).__canvas.editor.doc.all().filter((s: any) => s.type === 'note').length)).toBe(0);
+  expect(await viewer.page.evaluate(() => !!(window as any).__canvas.editor.doc.get('raw-long'))).toBe(false);
   expect(viewer.errors).toEqual([]);
 });
 

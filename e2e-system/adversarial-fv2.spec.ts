@@ -3,6 +3,8 @@
  * compose stack (see system.spec.ts):
  *   A  parked ("pending") Yjs structs released into history after the guard
  *   B  a pending delete set on the stamper's future clocks
+ * Since fv5 (M-2) an update that would wait as pending is not applied and is answered with a sync
+ * step 1 instead of closing 4403 (an honest reconnect can send one); the room still never holds it.
  *   C  non-map / malformed values under `shapes` vs a live browser, and a stored document
  *      that already holds bad values (recovery)
  *   D  anonymous pseudonym reuse through a free ?anon= hint
@@ -41,6 +43,8 @@ class Raw {
   ident: { id: string; name: string; anonymous: boolean } | null = null;
   code: number | null = null;
   synced = false;
+  /** sync step 1 messages from the server (the join's, then any resync request) */
+  step1s = 0;
   setCookie: string | null = null;
   closed: Promise<number>;
   private res!: (n: number) => void;
@@ -64,6 +68,7 @@ class Raw {
         if (t === 0) {
           const st = decoding.readVarUint(dec);
           if (st !== 0) { Y.applyUpdate(this.doc, decoding.readVarUint8Array(dec), 'server'); this.synced = true; }
+          else this.step1s++;
         } else if (t === 102) Y.applyUpdate(this.ledger, decoding.readVarUint8Array(dec), 'server');
         else if (t === 100) this.ident = JSON.parse(decoding.readVarString(dec));
       });
@@ -175,8 +180,11 @@ for (const [label, keyOf, attacker] of [
 
     const e1 = await joined(wsUrl(key), attacker());
     expect(e1.synced).toBe(true);
+    await until(() => e1.step1s >= 1);
     e1.send(gapUpdate());
-    expect(await e1.closeCode(), 'gap write').toBe(4403);
+    expect(await until(() => e1.step1s >= 2), 'gap write: answered with a resync request').toBe(true);
+    expect(e1.code, 'gap write: not closed').toBeNull();
+    e1.close();
 
     const e2 = await joined(wsUrl(key), attacker());
     await until(() => e2.ledger.getArray('history').length > 0);
@@ -206,7 +214,7 @@ for (const [label, keyOf, attacker] of [
   });
 }
 
-test('B: a pending delete set on future stamper clocks closes 4403 and deletes no later history line', async () => {
+test('B: a pending delete set on future stamper clocks is never applied and deletes no later history line', async () => {
   const P = publish({ users: [USERS.user1.email, USERS.user2.email] }, `fv2-del-${stamp}`);
   const honest = await joined(wsUrl(P.key), { cookie: cookies.user1 });
   geo(honest.doc, 'd1');
@@ -217,12 +225,16 @@ test('B: a pending delete set on future stamper clocks closes 4403 and deletes n
   const N = Y.getState(evil.ledger.store, S);
   const enc = encoding.createEncoder();
   for (const n of [0, 1, S, 1, N, 64]) encoding.writeVarUint(enc, n); // 0 structs; ds {S: [N, N+64)}
+  await until(() => evil.step1s >= 1);
   evil.send(encoding.toUint8Array(enc));
-  expect(await evil.closeCode()).toBe(4403);
+  expect(await until(() => evil.step1s >= 2), 'pending delete set: answered with a resync request').toBe(true);
   // the same after a gap write (the verifier's order)
   const evil2 = await joined(wsUrl(P.key), { cookie: cookies.user2 });
+  await until(() => evil2.step1s >= 1);
   evil2.send(gapUpdate());
-  expect(await evil2.closeCode()).toBe(4403);
+  expect(await until(() => evil2.step1s >= 2), 'gap write: answered with a resync request').toBe(true);
+  evil.close();
+  evil2.close();
   geo(honest.doc, 'd2');
   await until(() => honest.ledger.getArray('history').length > 1);
   await sleep(300);
