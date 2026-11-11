@@ -84,7 +84,12 @@ config:
 limits:
   maxConnsPerRoom: 50
   maxConnsPerRoomAnon: 10
+  # Live connections per anonymous visitor (cookie) and per logged-in user, over ALL rooms of
+  # the pod (a refused join closes with 1013 and the client retries).
   maxConnsPerAnonVisitor: 2
+  maxConnsPerUser: 8
+  # Presence states a room relays (each connection holds one: its own client id).
+  maxAwarenessPerRoom: 50
   msgRatePerSec: 120
   msgBurst: 240
   anonMsgRatePerSec: 30
@@ -98,23 +103,48 @@ limits:
   # A peer that stops reading is dropped once the server holds this much for it (beyond the
   # join burst).
   wsMaxBufferedBytes: 8388608 # 8 MiB
+  # ...and by a timer once it stays over that cap this long (not only on its next send).
+  wsSlowConsumerMs: 10000
+  # Bytes held for all peers together (join payloads in flight counted once per room
+  # version). Joins beyond it are refused with 1013; the peers holding most are dropped.
+  wsOutgoingBudgetBytes: 268435456 # 256 MiB — part of the memory formula below
+  # The join payload must reach the peer at least this fast (30 s floor).
+  wsJoinMinBytesPerSec: 32768
+  # Ping every peer; one that answers no ping for two rounds and drains nothing is dropped.
+  wsPingIntervalMs: 30000
   # Sync step-2 answers after the first one per connection, bytes/s and burst.
   syncBytesPerSec: 1048576
   syncBurstBytes: 4194304
   anonSyncBytesPerSec: 262144
   anonSyncBurstBytes: 1048576
-  # Joins per principal (user id / anonymous visitor) and per room for anonymous visitors.
+  # Joins per principal (user id / anonymous visitor cookie), per room for anonymous joins
+  # that bring no visitor cookie, and per client IP for anonymous joins (only when
+  # clientIpHops says where the IP comes from). A refused join closes with 1013 (retry).
   joinRatePerMin: 30
   joinBurst: 20
   anonJoinRatePerMin: 10
   anonJoinBurst: 6
   anonRoomJoinRatePerMin: 60
   anonRoomJoinBurst: 30
-  # Server CPU time (ms) a connection's messages may use per second, and the burst.
+  anonIpJoinRatePerMin: 30
+  anonIpJoinBurst: 20
+  # Where the client IP comes from: -1 = unknown (no per-IP limit), 0 = the TCP peer,
+  # n = the n-th entry from the right of X-Forwarded-For (n trusted proxies in front, e.g. 1
+  # behind one Traefik that appends the client address).
+  clientIpHops: -1
+  # Server CPU time (ms) one principal's messages may use per second, and the burst (shared
+  # by all its connections).
   cpuMsPerSec: 250
   cpuBurstMs: 5000
   anonCpuMsPerSec: 60
   anonCpuBurstMs: 1000
+  # Server CPU of all connections together, and of all anonymous ones. While one is used up,
+  # messages bigger than cpuShedMinBytes are refused with 1013 (the client resends them).
+  cpuTotalMsPerSec: 600
+  cpuTotalBurstMs: 6000
+  anonCpuTotalMsPerSec: 150
+  anonCpuTotalBurstMs: 1500
+  cpuShedMinBytes: 16384
   # Attribution of shapes deleted longer ago than this is pruned from the ledger.
   attributionRetentionDays: 30
   # Optional key-space allowlist, e.g. ["runs/", "pub/"]. Empty = any structurally valid key.
@@ -153,13 +183,29 @@ networkPolicy:
 deployment:
   replicas: 1
 
+# Memory: size the limit from the document size cap. Measured (fv5 H-1): a loaded room costs
+# ~22x its encoded size (content + ledger, what limits.maxDocBytes caps) in heap + buffers, and
+# decoding/checking/applying one message ~24x the message. So, with 24x as headroom:
+#
+#   limit >= 192 MiB                              (Node runtime, libraries, slack)
+#          + hotRooms x 24 x limits.maxDocBytes    (rooms at the size cap loaded at once)
+#          + limits.wsOutgoingBudgetBytes          (bytes held for slow peers)
+#          + 24 x limits.maxMessageBytes           (one max-size message in flight)
+#
+# Defaults (maxDocBytes 20 MiB, budget 256 MiB, maxMessageBytes 8 MiB), 2 hot full rooms:
+#   192 + 2 x 480 + 256 + 192 = 1600 MiB  ->  2Gi with ~25% headroom.
+# nodeMaxOldSpaceMb caps the V8 heap below the limit (~75% of it) so the process collects
+# garbage before the kernel's OOM killer acts; buffers live outside that heap. Change both
+# together. (The previous 1Gi held one full room; an attack added a second copy and the pod
+# was OOM-killed.)
+nodeMaxOldSpaceMb: 1536
 resources:
   requests:
     cpu: 100m
-    memory: 256Mi
+    memory: 512Mi
   limits:
     cpu: "1"
-    memory: 1Gi
+    memory: 2Gi
 
 nodeSelector: {}
 tolerations: []

@@ -59,6 +59,9 @@ spec:
             - configMapRef:
                 name: {{ include "artifacts-canvas.fullname" . }}
           env:
+            # V8 heap cap below the memory limit (values.yaml: the memory formula)
+            - name: NODE_OPTIONS
+              value: {{ printf "--max-old-space-size=%d" (int64 .Values.nodeMaxOldSpaceMb) | quote }}
             {{- if .Values.s3.secretRef.name }}
             - name: S3_ACCESS_KEY_ID
               valueFrom:

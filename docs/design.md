@@ -1,36 +1,33 @@
 # Shared live canvas on artifacts — design
 
 - Date: 2026-11-09
-- Owner: Daniel Ibáñez
+- Owner: the project owner
 - Repos (GitHub, public, Apache-2.0, copyright Daniel Ibáñez):
   - `pocharlies-org/artifacts` — the artifacts system (gate + publisher + MCP + plugin contract), extracted and generalised
     from earlier private prototypes.
   - `pocharlies-org/artifacts-canvas` — this canvas, as the first plugin of `artifacts`.
-- Status: APPROVED to start by Daniel on 2026-11-09 ("empieza así, dale en autopilot").
-- Approved UI mockup: `docs/mockups/2026-11-09-lienzo-set-completo.html` in `artifacts-canvas`. Daniel approved it as is.
+- Status: approved to start by the owner on 2026-11-09.
+- Approved UI mockup: `docs/mockups/2026-11-09-lienzo-set-completo.html` in `artifacts-canvas`. The owner approved it as is.
 - Wherever this document says "the gate" or "`gate/gate.py`", read: the gate of `pocharlies-org/artifacts`.
   §5 summarises the constraints of the reference deployment.
 
 ## 1. Intent and why
 
-Daniel wants a tldraw-style drawing canvas (https://tldraw.dev) **on top of every artifact** served by
-the artifacts host. The canvas is one system with two uses. Daniel's words: "es lo mismo al final".
+The owner wants a tldraw-style drawing canvas (https://tldraw.dev) **on top of every artifact** served by
+the artifacts host. The canvas is one system with two uses, which the owner sees as the same thing.
 
-1. **Annotation at any time, with attribution.** People draw on an artifact and the canvas keeps who drew what:
-   "para que pueda quedar quien ha dibujado qué".
+1. **Annotation at any time, with attribution.** People draw on an artifact and the canvas keeps who drew what.
 2. **Live use in meetings and presentations.** Someone presents an artifact and the others annotate on it while it
-   is shown: "lo quiero para las presentaciones y para que la gente haga anotaciones".
+   is shown.
 
-Daniel decided the following:
+The owner decided the following:
 
-- **Real-time multiplayer, Miro-style.** Strokes appear live on every screen: "deben ver trazados aparecer en
-  tiempo real como una pizarra colaborativa tipo miro".
+- **Real-time multiplayer, Miro-style.** Strokes appear live on every screen, like a collaborative whiteboard.
 - **One shared canvas per artifact.** Everyone sees every annotation, live and later. There are no per-person or
-  per-meeting layers: "un solo lienzo compartido en vivo".
+  per-meeting layers: one live shared canvas.
 - **Who may draw: anyone who can see the artifact.** People with an Entra login draw under their real name.
   Visitors of anonymous `pub/` artifacts draw too, as anonymous users.
-- **The full tldraw toolset from day one.** No reduced first release: "para la primera reunión mete todas las
-  herramientas. no seas perezoso".
+- **The full tldraw toolset from day one.** No reduced first release: every tool is there for the first meeting.
 - **The mockup is approved as is**, including the parts the designer proposed: the authors panel with filter and
   history, *Presentar* / *Seguir a*, and export.
 - **Drawings live as long as the artifact and die with it.** When the artifact expires (ILM `ttl` tag, the 90-day
@@ -93,7 +90,7 @@ arrowheads, opacity, bring to front / send to back, group / ungroup, lock / unlo
 - A small coloured name tag next to a shape shows who drew it. The colour is stable per person.
 - **Authors panel (left)**: lists everyone who drew, with their shape count and an eye toggle that hides or shows
   that person's shapes. The toggle is local to my view.
-- **History**: a timeline of changes ("10:17 Marta añadió una nota", "10:16 Daniel movió un rectángulo de Iván").
+- **History**: a timeline of changes ("10:17 Marta añadió una nota", "10:16 Ana movió un rectángulo de Iván").
 - Anyone who can draw may also move, edit and delete anyone's shapes, as in tldraw and Miro. Attribution records who
   did it.
 
@@ -101,7 +98,7 @@ arrowheads, opacity, bring to front / send to back, group / ungroup, lock / unlo
 
 - **Entra users**: the real display name and UPN, from the same login the artifact already uses.
 - **Anonymous (`pub/` without login)**: a pseudonym "Anónimo NNNN" kept in the visitor's browser, so two anonymous
-  people in the same meeting are not mixed up. The pseudonym is **the designer's call**; Daniel did not reject it.
+  people in the same meeting are not mixed up. The pseudonym is **the designer's call**; the owner did not reject it.
 - **Attribution must not be forgeable.** An Entra user's name always comes from the server-verified identity, never
   from the client. An anonymous client must not be able to claim a real UPN.
 
@@ -126,7 +123,7 @@ arrowheads, opacity, bring to front / send to back, group / ungroup, lock / unlo
 ## 3. Non-goals
 
 - Not a standalone whiteboard product. There are no canvases without an artifact underneath.
-- No per-meeting or per-person layers or versions (rejected by Daniel).
+- No per-meeting or per-person layers or versions (rejected by the owner).
 - No edits to the artifact's own content.
 - No new permission model. **Who sees a canvas = who sees the artifact**, decided by the existing gate rules.
 - No canvas on the old storage host. Only the artifacts host.
@@ -173,8 +170,8 @@ that shape the canvas are:
 
 ## 6. How: decided so far
 
-Daniel decided the product items in §1–2. The items below are the **designer's calls**. Daniel accepted them as a
-direction ("me vale así"), but a builder may change one with a stated reason.
+The owner decided the product items in §1–2. The items below are the **designer's calls**. The owner accepted them
+as a direction, but a builder may change one with a stated reason.
 
 ### 6.1 A wrapper page per artifact (designer's call)
 
@@ -238,7 +235,7 @@ direction ("me vale así"), but a builder may change one with a stated reason.
 - Tests: unit, an e2e that drives two browsers (strokes visible on both, attribution correct, deny cases), and new
   smoke negatives (no canvas or storage access without the gate's allow, no anonymous drawing outside `pub/`).
 
-## 8. Product split and the plugin contract (Daniel 2026-11-09: "es un plugin extra a los artifacts")
+## 8. Product split and the plugin contract (the owner, 2026-11-09: the canvas is an extra plugin of the artifacts)
 
 `artifacts` (core) is a generic, self-hostable product with **no deployment specifics in git**: hostnames,
 tenant/app/group ids, IPs, subscriptions, bucket names and Slack ids all come from config (Helm values / env), with

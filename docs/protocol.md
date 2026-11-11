@@ -143,7 +143,7 @@ its own message type, LEDGER (102).
 | 2 | AUTH | server → client | y-protocols/auth (permission denied + reason) |
 | 3 | QUERY_AWARENESS | client → server | — |
 | **100** | **IDENTITY** | server → client | `varString` JSON `Identity` (below). MUST be the **first** message on every connection. |
-| **101** | **NOTICE** | server → client | `varString` JSON `{kind, message?}`, `kind` ∈ `revoked`, `expired`, `readonly`, `rate-limited`, `too-large`, `shutdown` |
+| **101** | **NOTICE** | server → client | `varString` JSON `{kind, message?}`, `kind` ∈ `revoked`, `expired`, `readonly`, `rate-limited`, `too-large`, `shutdown`, `busy` (a capacity refusal, closed `1013`: the client reconnects by itself) |
 | **102** | **LEDGER** | server → client **only** | `varUint8Array` Yjs update (v1) of the room's ledger document. A client that sends a 102 is closed `4403` (`ledger is read-only`); its bytes are never applied. |
 
 ```ts
@@ -176,7 +176,9 @@ interface Identity {
 - Close codes (RFC 6455 private range; the client does not reconnect on 44xx): `4403`
   forbidden (authz denied, revoked, or a forbidden write, §5), `4404` artifact gone, `4410`
   artifact expired, `4413` document/message too large, `4429` rate-limited, `4503`
-  restarting (client reconnects), `1013` room at capacity (retry later). `4401`
+  restarting (client reconnects), `1013` try again later (room, principal or server capacity,
+  join rate, server CPU; the client reconnects with backoff — a join is never refused with the
+  terminal `4429`, fv5 M-6). `4401`
   (unauthenticated) is reserved and unused in v1 — the gate denies unauthenticated visitors
   as `4403`/`4404`. Send a NOTICE before closing when there is something to tell the user.
 - Re-check authz every `AUTHZ_RECHECK_SECONDS` (default 300; the chart ships 300) and on ACL
@@ -188,11 +190,22 @@ interface Identity {
 
 - **On join** the server sends, in this order: IDENTITY; LEDGER with the full ledger state;
   **SYNC step 2** with the full content state; **SYNC step 1** with the content state vector;
-  then the awareness states. The step 1 is what makes edits made while disconnected arrive: the
+  then the awareness states. The two big frames are encoded **once per room version** and
+  shared by every join of that version, and the content frames go out only once the ledger
+  frame drained below 256 KiB (a peer that does not read never gets them queued); room
+  broadcasts meanwhile wait and follow in order, and a client step 1 that arrives meanwhile is
+  answered right after (fv5 H-1: every join copied the whole room into its socket's buffer). The step 1 is what makes edits made while disconnected arrive: the
   stock y-websocket client answers it with a step 2 holding everything the room lacks (shapes
   drawn while the socket was down, or while the server restarted), which the server treats as a
   plain client update. Without it, a reconnected client's next edit depended on clocks the room
-  never received and was refused as `pending`. A process that is shutting down joins nobody
+  never received and was refused as `pending`. **The canvas client holds its local updates**
+  from the moment a socket opens until it has answered that step 1: the answer carries every
+  local change made until then, so nothing it sends can depend on clocks the room lacks (fv5
+  M-2: y-websocket sends local updates as soon as the socket is open, and a keystroke typed while
+  reconnecting reached the server before the answer). For any other client, a `pending` update
+  no longer closes the connection: it is dropped (never applied) and answered with a fresh
+  step 1, whose step-2 answer carries it (at most one request outstanding; 20 requests per
+  connection, +1 every 2 s, then `4403`). A process that is shutting down joins nobody
   (close `4503`), so a reconnect always lands on the next process.
 - **Client step 1** (state vector): the server answers with step 2 of the content for that
   vector **merged with the state vector the connection was sent in full at join** (every later
@@ -255,7 +268,11 @@ server announces `attribution: 'server'` and MUST:
      unknown root);
    - `malformed`: a **zero-length** struct (Yjs integrates a zero-length item even at a known
      clock: over a live map entry it erases that entry and the document can no longer be
-     encoded) or a **zero-length delete range** (Yjs throws re-encoding it); a client that
+     encoded) or a **zero-length delete range** (Yjs throws re-encoding it); a delete set that
+     is not canonical — ranges unsorted or overlapping, a client listed twice, bytes after it
+     (fv5 M-4: Yjs applies every range as listed, but `Y.isDeleted` binary-searches them, so an
+     unsorted list hid "this update also deletes its own new `type`", and one range repeated
+     60 000 times was subtracted 60 000 times from the text length); a client that
      appears in more than one struct block (Yjs keeps only the last one); a same-client
      dependency on a clock at or after the struct's own;
    - `pending`: anything that would not integrate completely — a struct starting beyond the
@@ -269,7 +286,10 @@ server announces `attribution: 'server'` and MUST:
      overlaps the room);
    - `shapes-schema` / `assets-schema` / `meta-schema`: §6 — for every new item at a field key,
      a deleted (`ContentDeleted`) one included (it deletes the value there: a live shape's
-     `type` can never go away).
+     `type` can never go away). The text and point caps count the **resulting** length: the
+     room's, plus the new elements the update leaves alive (one it inserts and deletes again —
+     an offline paste the UndoManager undid — adds nothing, fv5 M-1), minus the live room
+     elements it deletes.
    The check is one pass, O(update) plus a binary search per room lookup: origin chains of any
    length are followed iteratively and memoised, and a delete range walks the room's struct
    array once. There is **no slow path**: the scratch copy of the room it used to rebuild for
@@ -279,9 +299,15 @@ server announces `attribution: 'server'` and MUST:
    schema allows (`malformed`), a shape's `type` overwritten twice in one update
    (`shapes-schema`; clients never change a shape's type) — is refused; no honest Yjs encoder
    produces any of it. A malformed update that makes decoding throw counts as forbidden too.
-   Each connection also has a **CPU budget** (`CPU_MS_PER_SEC` / `CPU_BURST_MS`): the time the
-   server spends on its messages is charged to it, and a sender that keeps the event loop busy
-   is closed `4429`.
+   Each **principal** (a user, an anonymous visitor cookie) has a **CPU budget**
+   (`CPU_MS_PER_SEC` / `CPU_BURST_MS`) shared by all its connections: the time the server spends
+   on their messages (and on their joins) is charged to it, and a principal that keeps the event
+   loop busy has its connections closed `4429` (fv5 M-5: 20 connections of one user each had
+   their own budget). The server as a whole has one too (`CPU_TOTAL_MS_PER_SEC`, and
+   `ANON_CPU_TOTAL_MS_PER_SEC` for all anonymous connections together): while it is used up,
+   messages bigger than `CPU_SHED_MIN_BYTES` are refused with `1013` (the client reconnects and
+   resends), small ones still pass. One message costs at most O(its size), and its size is
+   capped (§10): about 3 s of guard on this hardware at the 8 MiB cap.
    **Whatever the apply does, the room never keeps pending state**: `applyGuarded` drops any
    parked structs/deletes in a `finally` — also when `Y.applyUpdate` throws half-way (a throw
    used to skip that check and leave the room pending, refusing every later writer as
@@ -299,7 +325,10 @@ server announces `attribution: 'server'` and MUST:
    presence schema of §6 (`cleanPresenceState`: only the known fields, typed and bounded, a
    field that does not fit is dropped; `laser.pts` at most 60 points; a state over 16 KiB of
    JSON is dropped unread), and the client applies the same check to what it receives (fv4 M3:
-   `{laser: {pts: null}, status: 5}` made every other viewer throw).
+   `{laser: {pts: null}, status: 5}` made every other viewer throw). A connection holds **one**
+   state (its own client id: the first it announces; a removal frees the slot) and a room at
+   most `MAX_AWARENESS_PER_ROOM` (50): more are dropped (fv5 M-7: one 2 MiB message announced
+   72 000 client ids and every viewer kept and walked them all).
 
 `attribution: 'client'` exists only for development against a plain relay (e.g.
 `npx y-websocket`): the client then runs the same stamper for its own transactions, into a
@@ -461,19 +490,40 @@ that is gone or expired.
   is reduced to the presence schema.
 - **Limits** (anonymous gets the stricter set): messages `120/s` burst 240 (anon 30/60) →
   `4429`; message size 8 MiB (anon 2 MiB) → `4413`; room size 20 MiB (anon 5 MiB), **content
-  plus ledger** → `4413` (an update that only deletes always passes); room connections 50 (anon
-  rooms 10; per anon visitor 2) → `1013`; joins per user 30/min burst 20 (per anonymous visitor
-  10/min burst 6, per room for anonymous visitors 60/min burst 30) → `4429`; sync answers after
-  the first 1 MiB/s burst 4 MiB (anon 256 KiB/s, 1 MiB) → `4429`; CPU 250 ms/s burst 5 s (anon
-  60 ms/s, 1 s) → `4429`; outgoing buffer 8 MiB beyond the join burst → dropped. Every penalty
-  is **per connection** (joins: per principal): an update that would grow the room past the
-  sender's cap is refused and only that connection is closed; the room stays open for everyone
-  else. Attribution entries of shapes deleted more than `ATTRIBUTION_RETENTION_DAYS` (30) ago
+  plus ledger** → `4413`, where a delete that splits live items counts 24 bytes per split on
+  top of its size (fv5 L-2: deleting every other character grew a room 8x with "deletes only";
+  an update that only removes whole items always passes); room connections 50 (anon rooms 10)
+  → `1013`; connections per logged-in user 8 and per anonymous visitor 2, **over all rooms** →
+  `1013`; joins per user 30/min burst 20, per anonymous visitor cookie 10/min burst 6, per room
+  for anonymous joins **without** a visitor cookie 60/min burst 30 (a refusal sets the cookie,
+  so the retry of an honest browser has a bucket of its own), per client IP for anonymous joins
+  30/min burst 20 when `CLIENT_IP_HOPS` says where the IP comes from → `1013`; sync answers
+  after the first 1 MiB/s burst 4 MiB (anon 256 KiB/s, 1 MiB) → `4429`; CPU per principal
+  250 ms/s burst 5 s (anon 60 ms/s, 1 s) → `4429`; CPU of the whole server 600 ms/s burst 6 s
+  (all anonymous connections 150 ms/s, 1.5 s) → messages over 16 KiB `1013`; awareness one state
+  per connection, 50 per room → dropped. **Outgoing data** (fv5 H-1): a peer's buffer over
+  8 MiB beyond its join payload → dropped on the next send, or by a timer after
+  `WS_SLOW_CONSUMER_MS` (10 s); the join payload must drain at `WS_JOIN_MIN_BYTES_PER_SEC`
+  (32 KiB/s, 30 s floor); a peer that answers no WebSocket ping for two `WS_PING_INTERVAL_MS`
+  (30 s) rounds and drains nothing → dropped; everything held for all peers together (join
+  frames counted once per room version) over `WS_OUTGOING_BUDGET_BYTES` (256 MiB) → new joins
+  `1013` and the peers holding most are dropped. Every penalty is per connection or per
+  principal: an update that would grow the room past the sender's cap is refused and only that
+  connection is closed; the room stays open for everyone else. Attribution entries of shapes deleted more than `ATTRIBUTION_RETENTION_DAYS` (30) ago
   are pruned from the ledger.
 - **Origin** (§4): WebSocket upgrades only from `ALLOWED_ORIGINS`, else `4403`. The HTTP routes
   are `GET`/`HEAD` only (no state-changing HTTP route exists).
 
 ## 11. Known model constraints
+
+- Text and point caps hold for the merged result. Two tabs that grow the same text
+  concurrently (each under 10 000 characters locally) can merge past the cap: the update that
+  would pass it is refused (`shapes-schema`, `4403`). The editor never lets one tab exceed the
+  cap (maxLength, truncated paste), so this needs two people typing thousands of characters
+  into one note at the same moment.
+- Memory: a loaded room costs about 22x its encoded size (content + ledger), so the memory limit
+  is sized from `MAX_DOC_BYTES` (chart `values.yaml`, "Memory"); the number of rooms loaded at
+  once is not capped by the server.
 
 - A client that relays someone else's structs (e.g. a tab reconnecting after a server CRASH that
   lost unsaved edits of other people) delivers them in its own step 2: the stamper attributes

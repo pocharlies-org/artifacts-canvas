@@ -137,8 +137,11 @@ the adversarial cases (a forged `history` append, `attribution`/`users` overwrit
 a client LEDGER message, a pending-state DoS, bad style enums and `__proto__` fields, offline edits across a
 canvas restart, a client-id claim after a restart, the oauth2-proxy catch-all, a foreign or missing
 `Origin`, the expired-artifact leak to a stranger, `/metrics` on the public route, an anonymous visitor
-filling the document, a client-chosen anonymous id); and finally the core's own `deploy/compose/e2e.sh`,
-which must still pass with the plugin enabled.
+filling the document, a client-chosen anonymous id, dozens of paused sockets on a ~20 MB room, a keystroke
+while reconnecting after a restart); and finally the core's own `deploy/compose/e2e.sh`, which must still
+pass with the plugin enabled. The canvas container runs under the chart's default memory limit (2 GiB,
+`--max-old-space-size=1536`; see "Memory" in [`chart/values.yaml`](chart/values.yaml) for how to size it
+from `MAX_DOC_BYTES`).
 
 Stop everything with `docker compose down -v` (from `deploy/compose/`).
 
