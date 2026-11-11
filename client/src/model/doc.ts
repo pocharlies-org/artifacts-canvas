@@ -310,7 +310,7 @@ export class CanvasDoc {
       };
       for (const [k, v] of Object.entries(base)) {
         if (v === undefined) continue;
-        if (YTEXT_FIELDS.has(k)) m.set(k, new Y.Text(String(v)));
+        if (YTEXT_FIELDS.has(k)) m.set(k, new Y.Text(String(v).slice(0, MAX_TEXT_LENGTH)));
         else if (YARRAY_FIELDS.has(k)) {
           const a = new Y.Array<number>();
           a.push(v as number[]);
@@ -357,7 +357,13 @@ export class CanvasDoc {
   }
 
   /** Minimal-diff update of a Y.Text so concurrent typing merges. */
-  private setText(m: Y.Map<unknown>, next: string) {
+  private setText(m: Y.Map<unknown>, nextIn: string) {
+    // never more than the server accepts (fv5 M-3): it would close the connection
+    let next = nextIn;
+    if (next.length > MAX_TEXT_LENGTH) {
+      const c = next.charCodeAt(MAX_TEXT_LENGTH - 1);
+      next = next.slice(0, c >= 0xd800 && c <= 0xdbff ? MAX_TEXT_LENGTH - 1 : MAX_TEXT_LENGTH);
+    }
     let t = m.get('text') as Y.Text | undefined;
     if (!(t instanceof Y.Text)) {
       t = new Y.Text();

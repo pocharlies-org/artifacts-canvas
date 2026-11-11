@@ -1,6 +1,6 @@
 import * as Y from 'yjs';
 import { CanvasDoc, newId } from '../model/doc';
-import { assetValueOk } from '@pocharlies/artifacts-canvas-shared/model';
+import { MAX_TEXT_LENGTH, assetValueOk } from '@pocharlies/artifacts-canvas-shared/model';
 import { attachStamper } from '../model/stamper';
 import { DEFAULT_STYLE, STYLE_KEYS, type Identity, type Shape, type Style, type GeoKind } from '../model/types';
 import { Connection, type Status } from '../collab/connection';
@@ -116,6 +116,10 @@ export class Editor {
     this.textarea.style.display = 'none';
     this.stage.appendChild(this.textarea);
     this.textarea.addEventListener('input', () => this.onTextInput());
+    // fv5 M-3: the server refuses a text longer than MAX_TEXT_LENGTH (and closes the
+    // connection), so the editor never lets one through: maxLength on the textarea (typing),
+    // a paste cut to what fits (with a toast), and onTextInput truncates whatever got in anyway.
+    this.textarea.addEventListener('paste', (e) => this.onTextPaste(e));
     this.textarea.addEventListener('blur', () => this.stopEditing());
     this.textarea.addEventListener('keydown', (e) => {
       e.stopPropagation();
@@ -139,6 +143,11 @@ export class Editor {
     if (conn) {
       conn.onStatus((s) => {
         this.status = s;
+        // a notice that only meant "reconnecting" ends once the tab is synced again
+        if (s === 'synced' && this.notice && (this.notice.kind === 'busy' || this.notice.kind === 'shutdown')) {
+          this.notice = null;
+          this.emit('notice');
+        }
         this.emit('status');
       });
       conn.onIdentity((id) => this.setIdentity(id));
@@ -591,7 +600,8 @@ export class Editor {
     this.editingId = id;
     this.select([id]);
     const ta = this.textarea;
-    ta.value = s.type === 'frame' ? s.name : s.text;
+    ta.maxLength = s.type === 'frame' ? FRAME_NAME_MAX : MAX_TEXT_LENGTH;
+    ta.value = clampText(s.type === 'frame' ? s.name : s.text, ta.maxLength);
     ta.dataset.kind = s.type;
     ta.style.display = 'block';
     this.positionTextarea();
@@ -647,13 +657,36 @@ export class Editor {
     });
   }
 
+  /** A paste into the text editor: only what fits under the length cap goes in. */
+  private onTextPaste(e: ClipboardEvent) {
+    const ta = this.textarea;
+    const pasted = e.clipboardData?.getData('text/plain');
+    if (pasted === undefined) return;
+    const room = ta.maxLength - (ta.value.length - (ta.selectionEnd - ta.selectionStart));
+    if (pasted.length <= room) return; // the browser inserts it
+    e.preventDefault();
+    const part = clampText(pasted, Math.max(0, room));
+    ta.setRangeText(part, ta.selectionStart, ta.selectionEnd, 'end');
+    this.toast(t('text.truncated', { max: ta.maxLength.toLocaleString() }));
+    this.onTextInput();
+  }
+
   private onTextInput() {
     const id = this.editingId;
     const s = id ? this.doc.get(id) : undefined;
     if (!id || !s) return;
-    const text = this.textarea.value;
+    const max = s.type === 'frame' ? FRAME_NAME_MAX : MAX_TEXT_LENGTH;
+    let text = this.textarea.value;
+    if (text.length > max) {
+      // a value set around maxLength (drop, IME, a script): cut it, keep the caret
+      const caret = Math.min(this.textarea.selectionStart, max);
+      text = clampText(text, max);
+      this.textarea.value = text;
+      this.textarea.setSelectionRange(caret, caret);
+      this.toast(t('text.truncated', { max: max.toLocaleString() }));
+    }
     if (s.type === 'frame') {
-      this.doc.update(id, { name: text.slice(0, 120) });
+      this.doc.update(id, { name: text });
       return;
     }
     const patch: Record<string, unknown> = { text };
@@ -1059,4 +1092,16 @@ function downscale(img: HTMLImageElement, maxSide: number, type: string, q = 0.9
 
 function getComputedFontFamily(f: Style['font']): string {
   return own(FONT_FAMILY, f, FONT_FAMILY.draw);
+}
+
+/** Longest frame name the editor writes. */
+const FRAME_NAME_MAX = 120;
+
+/** `text` cut to at most `max` UTF-16 units, never in the middle of a surrogate pair. */
+export function clampText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let end = max;
+  const c = text.charCodeAt(end - 1);
+  if (end > 0 && c >= 0xd800 && c <= 0xdbff) end--;
+  return text.slice(0, end);
 }
