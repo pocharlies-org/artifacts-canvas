@@ -9,7 +9,9 @@ states), L-1 (text-length bypass with a repeated delete range) and L-2 (delete-o
 past the size cap). Their regressions live in `server/test/fv5.test.ts` (with the honest-edit
 fuzzer `server/test/fuzz/honest-fuzz.ts`), `client/e2e-server/fv5.spec.ts` and
 `e2e-system/adversarial-fv5.spec.ts`. Fixing H-1 also found that every evicted room stayed in
-memory (its awareness interval was never cleared); fixed with a regression in the same file.
+memory (its awareness interval was never cleared), and the honest-edit fuzzer found that Yjs'
+redo writes contradictory origins that made a reloaded room diverge from the tabs (the client
+now rewrites them: `client/tests/fv5.test.ts`); both fixed.
 
 Findings of the fourth independent verification (fv4) that are not fixed yet. The High ones
 (H1 sync step-1 amplification, H2 O(room) guard slow path, H3 cubic text wrap) and M2, M3, M4,

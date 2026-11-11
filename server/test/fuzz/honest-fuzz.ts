@@ -14,8 +14,9 @@
  * select-all-and-type, strokes, arrows bound to shapes, images, groups, z-order, styles,
  * locks, deletes, undo/redo), go offline (in-flight messages lost both ways) and reconnect,
  * and messages are delivered in random interleavings (FIFO per direction, like TCP). Several
- * tabs may grow the same text concurrently only up to MAX_TEXT_LENGTH together (a merge over
- * the cap is a real conflict the server refuses by design: see docs/protocol.md §11).
+ * tabs may grow the same text concurrently only up to MAX_TEXT_LENGTH together — typing,
+ * pastes and undo/redo alike (a merge over the cap is a real conflict the server refuses by
+ * design: see docs/protocol.md §11).
  *
  * Oracle: the server closes no tab (no 4403/4413/4429/1003/1011), and once everything is
  * delivered every tab equals the room. `updates` counts the client sync messages that carried
@@ -24,6 +25,8 @@
  *   npx tsx server/test/fuzz/honest-fuzz.ts [runs=200] [seed=1] [steps=400] [mode=both|client|ywebsocket]
  */
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import path from 'node:path';
 import * as Y from 'yjs';
 import * as decoding from 'lib0/decoding';
 import { WebsocketProvider } from 'y-websocket';
@@ -126,6 +129,8 @@ interface Link {
   s2c: Uint8Array[];
   serverClose: { code: number; reason: string } | null;
   dead: boolean;
+  /** the last client message the server processed (dumped with HONEST_DUMP=<dir>) */
+  last?: Uint8Array;
 }
 
 interface Tab {
@@ -174,6 +179,23 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
     };
     const resyncs0 = (await metrics.pendingResync.get()).values[0]?.value ?? 0;
     const trace: string[] = [];
+    /** with HONEST_DUMP: every update each document integrated, in order (divergence analysis) */
+    const logs = new Map<string, Uint8Array[]>();
+    const logDoc = (name: string, d: Y.Doc, initial?: Uint8Array) => {
+      if (!process.env.HONEST_DUMP) return;
+      const l = logs.get(name) ?? [];
+      logs.set(name, l);
+      if (initial) l.push(initial);
+      d.on('update', (u: Uint8Array) => l.push(u));
+    };
+    let loggedRoom: unknown = null;
+    const watchRoom = () => {
+      const room = manager.get(KEY);
+      if (room && room !== loggedRoom) {
+        loggedRoom = room;
+        logDoc(`room${logs.size}`, room.doc, Y.encodeStateAsUpdate(room.doc));
+      }
+    };
     let runRefused = false;
     const nTabs = 2 + Math.floor(rnd() * 2);
     const principals = ['ana@corp', 'bob@corp', 'ana@corp']; // the third tab is Ana's second tab
@@ -197,6 +219,16 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
           const k = `${c.code} ${c.reason}`;
           res.refusals[k] ??= { n: 0, example: `seed ${seed} mode ${mode} run ${r}: ${trace.slice(-14).join(' | ')}` };
           res.refusals[k].n++;
+          const dir = process.env.HONEST_DUMP;
+          if (dir && link.last) {
+            // the update the server refused, the room before it, the trace
+            const room = manager.get(KEY);
+            fs.mkdirSync(dir, { recursive: true });
+            const tag = `${mode}-${seed}-${r}`;
+            fs.writeFileSync(path.join(dir, `${tag}.msg`), link.last);
+            if (room) fs.writeFileSync(path.join(dir, `${tag}.room`), Y.encodeStateAsUpdate(room.doc));
+            fs.writeFileSync(path.join(dir, `${tag}.trace`), trace.join('\n'));
+          }
         }
       });
       const identity = { id: t.principal, name: t.principal, anonymous: false, attribution: 'server' };
@@ -228,6 +260,8 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
       const m = link.c2s.shift()!;
       const d = decoding.createDecoder(m);
       if (decoding.readVarUint(d) === 0 && decoding.readVarUint(d) !== 0) res.updates++;
+      link.last = m;
+      watchRoom();
       link.server.emit('message', Buffer.from(m));
       return true;
     };
@@ -236,6 +270,7 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
       const link = t.link;
       if (!link || !link.client || link.client.readyState !== 1 || !link.s2c.length) return false;
       const m = link.s2c.shift()!;
+      watchRoom();
       link.client.onmessage?.({ data: m.buffer.slice(m.byteOffset, m.byteOffset + m.byteLength) as ArrayBuffer });
       return true;
     };
@@ -270,19 +305,38 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
       }
       ClientSock.connecting = null;
       t.provider.disconnect(); // the constructor connected to the placeholder link: start offline
+      logDoc(t.name, doc);
       tabs.push(t);
     }
     for (const t of tabs) await connect(t);
 
     /**
-     * Characters a tab may add to a text so that every merge stays under the cap: a character
-     * alive in the merged text is alive in the tab that inserted it (a delete anywhere kills it
-     * in the merge), so the merge is never longer than the sum of the tabs' own texts.
+     * Characters a tab may add to a text so that the room's text never passes the cap: a
+     * character alive in the room, or in any tab, is counted (the room can hold characters a
+     * tab already deleted offline), so room + every tab's own text bounds every state the room
+     * can reach. The room is the live one, or the last one loaded (evicted rooms keep their doc).
      */
+    let roomDoc: Y.Doc | null = null;
+    const roomText = (id: string) => {
+      roomDoc = manager.get(KEY)?.doc ?? roomDoc;
+      return (((roomDoc?.getMap('shapes').get(id) as Y.Map<unknown> | undefined)?.get('text') as Y.Text | undefined)?.length ?? 0);
+    };
     const textBudget = (_t: Tab, id: string) => {
-      let sum = 0;
+      let sum = roomText(id);
       for (const o of tabs) sum += ((o.cd.get(id) as { text?: string } | undefined)?.text ?? '').length;
       return MAX_TEXT_LENGTH - sum;
+    };
+    /** some text is longer, summed over the room and the tabs, than the cap (an undo/redo brought it back) */
+    const overBudget = () => {
+      const sum = new Map<string, number>();
+      for (const o of tabs) {
+        for (const id of o.cd.ids()) {
+          const n = ((o.cd.get(id) as { text?: string } | undefined)?.text ?? '').length;
+          if (n) sum.set(id, (sum.get(id) ?? roomText(id)) + n);
+        }
+      }
+      for (const n of sum.values()) if (n > MAX_TEXT_LENGTH) return true;
+      return false;
     };
     const ids = (t: Tab) => t.cd.ids().filter((id) => t.cd.get(id));
     const texty = (t: Tab) => ids(t).filter((id) => ['note', 'text', 'geo'].includes(t.cd.get(id)!.type));
@@ -349,7 +403,10 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
       }],
       ['select-all-text', 2, (t) => {
         const l = texty(t);
-        if (l.length) t.cd.update(pick(l), { text: rnd() < 0.5 ? '' : 'new text' } as never);
+        if (!l.length) return;
+        const id = pick(l);
+        const next = rnd() < 0.5 ? '' : 'new text';
+        if (next.length <= textBudget(t, id)) t.cd.update(id, { text: next } as never);
       }],
       ['style', 4, (t) => {
         const l = ids(t);
@@ -379,10 +436,14 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
       ['undo', 9, (t) => {
         t.cd.endGesture();
         t.cd.undo();
+        // an undo can bring back text another tab has meanwhile filled up: take it back
+        // (redo) when the texts of all tabs together would pass the cap (see textBudget)
+        if (overBudget()) t.cd.redo();
       }],
       ['redo', 5, (t) => {
         t.cd.endGesture();
         t.cd.redo();
+        if (overBudget()) t.cd.undo();
       }],
       ['page-width', 1, (t) => t.cd.ensurePageWidth(1200)],
     ];
@@ -431,11 +492,17 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
         while (toServer(t)) moved = true;
       }
       await tick();
-      if (!moved && tabs.every((t) => !t.link || (!t.link.c2s.length && !t.link.s2c.length))) {
-        // the client hold (Connection) may still wait for nothing: settle once more
-        await tick();
-        if (tabs.every((t) => !t.link || (!t.link.c2s.length && !t.link.s2c.length))) break;
+      // done when every tab is online, its server connection finished joining (join() awaits
+      // the room load: on a busy host that takes more than one tick), and nothing is in flight
+      const settled = () => {
+        const conns = [...(manager.get(KEY)?.conns.values() ?? [])];
+        return tabs.every((t) => t.link && t.link.server && conns.some((c) => c.ws === (t.link!.server as unknown) && !c.joining) && t.provider.synced && !t.link.c2s.length && !t.link.s2c.length);
+      };
+      if (!moved && settled()) {
+        await new Promise((r) => setTimeout(r, 2));
+        if (settled()) break;
       }
+      if (!moved) await new Promise((r) => setTimeout(r, 1));
     }
     if (!runRefused) {
       const room = manager.get(KEY);
@@ -447,6 +514,25 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
       }
       for (const t of tabs) {
         if (view(t.cd.doc) !== want) {
+          if (process.env.HONEST_DEBUG) {
+            const conns = [...(room?.conns.values() ?? [])].map((c) => ({ p: c.principal, joining: c.joining, closing: c.closing }));
+            const rs = room?.doc.getMap('shapes');
+            const ts = t.cd.doc.getMap('shapes');
+            const onlyRoom = [...(rs?.keys() ?? [])].filter((k) => !ts.has(k));
+            const onlyTab = [...ts.keys()].filter((k) => !rs?.has(k));
+            const differ = [...ts.keys()].filter((k) => rs?.has(k) && JSON.stringify(canon((rs.get(k) as Y.Map<unknown>).toJSON())) !== JSON.stringify(canon((ts.get(k) as Y.Map<unknown>).toJSON())));
+            console.error(`DIVERGED run ${r} tab ${t.name} online=${t.online} synced=${t.provider.synced} link=${!!t.link} c2s=${t.link?.c2s.length} s2c=${t.link?.s2c.length} conns=${JSON.stringify(conns)} onlyRoom=${onlyRoom} onlyTab=${onlyTab} differ=${differ.slice(0, 3)}`);
+            for (const k of differ.slice(0, 1)) console.error(' room:', JSON.stringify(canon((rs!.get(k) as Y.Map<unknown>).toJSON())).slice(0, 400), '\n tab: ', JSON.stringify(canon((ts.get(k) as Y.Map<unknown>).toJSON())).slice(0, 400));
+            console.error(' sv room', JSON.stringify([...Y.decodeStateVector(Y.encodeStateVector(room!.doc))]), 'sv tab', JSON.stringify([...Y.decodeStateVector(Y.encodeStateVector(t.cd.doc))]), 'pending tab', !!t.cd.doc.store.pendingStructs, !!t.cd.doc.store.pendingDs);
+          }
+          if (process.env.HONEST_DUMP && !res.refusals.diverged) {
+            const dir = path.join(process.env.HONEST_DUMP, `diverged-${mode}-${seed}-${r}`);
+            fs.mkdirSync(dir, { recursive: true });
+            for (const [name, l] of logs) l.forEach((u, i) => fs.writeFileSync(path.join(dir, `${name}.${String(i).padStart(6, '0')}`), u));
+            fs.writeFileSync(path.join(dir, 'room.final'), Y.encodeStateAsUpdate(room!.doc));
+            for (const o of tabs) fs.writeFileSync(path.join(dir, `${o.name}.final`), Y.encodeStateAsUpdate(o.cd.doc));
+            fs.writeFileSync(path.join(dir, 'trace'), trace.join('\n'));
+          }
           res.diverged++;
           const k = 'diverged';
           res.refusals[k] ??= { n: 0, example: `seed ${seed} mode ${mode} run ${r} tab ${t.name}: ${trace.slice(-14).join(' | ')}` };

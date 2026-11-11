@@ -521,6 +521,12 @@ that is gone or expired.
   would pass it is refused (`shapes-schema`, `4403`). The editor never lets one tab exceed the
   cap (maxLength, truncated paste), so this needs two people typing thousands of characters
   into one note at the same moment.
+- Yjs' undo/redo can write a list item whose origins contradict each other ("after X and
+  before X", or a right origin before the left one); documents then place it differently
+  depending on how their own items are merged — the room, reloaded from storage, diverged from
+  the tabs (found by the fv5 honest-edit fuzzer). The canvas client rewrites the origins of
+  every item of its undo/redo transactions to the place the item took before the update is
+  encoded (`fixSelfOrigins`, client/src/model/doc.ts). Another Yjs client is not protected.
 - Memory: a loaded room costs about 22x its encoded size (content + ledger), so the memory limit
   is sized from `MAX_DOC_BYTES` (chart `values.yaml`, "Memory"); the number of rooms loaded at
   once is not capped by the server.
