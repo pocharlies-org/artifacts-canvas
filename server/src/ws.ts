@@ -337,7 +337,9 @@ export class WsServer {
     let total = 0;
     const frames = new Set<Uint8Array>();
     const conns: { conn: Conn; bytes: number }[] = [];
+    // per principal: its own bytes, plus the shared frames its connections hold (each once)
     const byPrincipal = new Map<string, number>();
+    const principalFrames = new Map<string, Set<Uint8Array>>();
     for (const room of this.deps.manager.rooms.values()) {
       for (const conn of room.conns.values()) {
         if (conn.closing) continue; // terminated: its buffers are gone
@@ -345,18 +347,26 @@ export class WsServer {
         let own = b;
         if (conn.joinFrames && b > 0) {
           let shared = 0;
+          let pf = principalFrames.get(conn.principal);
+          if (!pf) principalFrames.set(conn.principal, (pf = new Set()));
           for (const f of conn.joinFrames) {
             frames.add(f);
+            pf.add(f);
             shared += f.byteLength;
           }
           own = Math.max(0, b - shared);
         }
         total += own;
         conns.push({ conn, bytes: b });
-        if (b > 0) byPrincipal.set(conn.principal, (byPrincipal.get(conn.principal) ?? 0) + b);
+        if (own > 0) byPrincipal.set(conn.principal, (byPrincipal.get(conn.principal) ?? 0) + own);
       }
     }
     for (const f of frames) total += f.byteLength;
+    for (const [p, fs] of principalFrames) {
+      let n = byPrincipal.get(p) ?? 0;
+      for (const f of fs) n += f.byteLength;
+      byPrincipal.set(p, n);
+    }
     return { total, conns, byPrincipal };
   }
 
