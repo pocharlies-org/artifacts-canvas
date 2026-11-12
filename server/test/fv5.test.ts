@@ -216,7 +216,9 @@ describe('fv5 H-1: slow readers cannot hold the server memory', () => {
     // the 40 000-shape fill must not run into the per-principal CPU budget (tested apart)
     // fv6 L-A: a stalled peer is dropped to make room for a join (adversarial-fv6 / fv6.test.ts);
     // here no peer counts as stalled, so the budget refuses
-    const app = await startApp({ WS_PING_INTERVAL_MS: '600000', WS_SLOW_CONSUMER_MS: '600000', WS_STALL_MS: '600000', MSG_RATE_PER_SEC: '1000', MSG_BURST: '1000', CPU_MS_PER_SEC: '100000', CPU_BURST_MS: '100000', CPU_TOTAL_MS_PER_SEC: '100000', CPU_TOTAL_BURST_MS: '100000' });
+    // (no authorization re-check: the fill below takes ~20 s of a busy event loop, and a re-check
+    // that times out fails closed and revokes Ana mid-fill, 4403)
+    const app = await startApp({ WS_PING_INTERVAL_MS: '600000', WS_SLOW_CONSUMER_MS: '600000', WS_STALL_MS: '600000', MSG_RATE_PER_SEC: '1000', MSG_BURST: '1000', CPU_MS_PER_SEC: '100000', CPU_BURST_MS: '100000', CPU_TOTAL_MS_PER_SEC: '100000', CPU_TOTAL_BURST_MS: '100000', AUTHZ_RECHECK_SECONDS: '3600' });
     const cfg = (app.manager as unknown as { deps: { cfg: { wsOutgoingBudgetBytes: number } } }).deps.cfg;
     const key = 'u/budget/index.html';
     users(key);
@@ -233,6 +235,16 @@ describe('fv5 H-1: slow readers cannot hold the server memory', () => {
     // shares the snapshot until the updates since outgrow it, TAIL_MAX_MESSAGES)
     for (let v = 1; v <= TAIL_MAX_MESSAGES + 1; v++) ana.doc.getMap('meta').set('v', v);
     await waitFor(() => room.doc.getMap('meta').get('v') === TAIL_MAX_MESSAGES + 1, 3000, 'edit');
+    // The budget just above what eve holds. How much that is depends on the kernel: the join goes
+    // out piece by piece, each once the previous one drained, so eve holds the first piece (the
+    // 4 MB content) if her paused socket's buffers could not take it, or the ledger (15 MB) queued
+    // behind it if they could (right at the limit of a Linux socket buffer). Either way the join
+    // bob needs, 19.6 MB of new frames, is more than the 25% slack leaves. The held-bytes gauge
+    // is refreshed by the sweep, once a second.
+    await sleep(1100);
+    const heldByEve = (await app.metrics.outgoingBytes.get()).values[0]?.value ?? 0;
+    expect(heldByEve).toBeGreaterThan(1024 * 1024);
+    cfg.wsOutgoingBudgetBytes = heldByEve + 256 * 1024;
     const bob = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob.connect();
     expect(await bob.closed).toBe(1013);
@@ -668,18 +680,46 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
     users(key2);
     const bob = new TestClient(`${base(app)}/${key2}`, 'sid=bob');
     await bob.connect();
-    const socks = [];
-    for (let i = 0; i < 8; i++) socks.push(await raw(app, key, 'sid=eve'));
+    // Eve's 8 sockets. Her joins are charged to the same budget the attack below uses up, and the
+    // server charges wall time: on a slow or busy host a few joins alone put her in debt, and a
+    // principal in debt joins nobody (1013) until it refilled. So a refused socket is retried.
+    const socks: Awaited<ReturnType<typeof raw>>[] = [];
+    for (let tries = 0; socks.length < 8 && tries < 80; tries++) {
+      const s = await raw(app, key, 'sid=eve');
+      if ((await Promise.race([s.closed, sleep(250).then(() => null)])) === null) socks.push(s);
+      else await sleep(500);
+    }
+    expect(socks).toHaveLength(8);
     const sv = encoding.createEncoder();
     encoding.writeVarUint(sv, 1);
     encoding.writeVarUint(sv, 123456);
     encoding.writeVarUint(sv, 1);
     const step1 = syncMsg(0, encoding.toUint8Array(sv));
-    // the cost of one answer (a diff against the join: O(room) for the delete set)
-    const room = app.manager.get(key)!;
-    const t1 = performance.now();
-    for (let i = 0; i < 10; i++) Y.encodeStateAsUpdate(room.doc, Y.encodeStateVector(room.doc));
-    const cost = Math.max(0.2, (performance.now() - t1) / 10);
+    // The cost of one answer (a diff against the join: O(room) for the delete set), as the server
+    // charges it. A local timing of the encode, or one answer at a time on an idle CPU (efficiency
+    // cores, cold JIT), is off by the factor that decides whether 8 sockets reach 4x the budget
+    // within the 6 s below: it was the reason this test failed on slow and on loaded hosts (0 of 8
+    // closed). A principal of its own (the budget is per principal) gets bursts of 3 answers, until
+    // 15 or until half its bucket is gone; what the bucket lost plus what it refilled meanwhile
+    // (CPU_MS_PER_SEC) is the price of a burst. The cheapest burst counts: a price too high makes
+    // the attack too slow, too low only makes it faster.
+    core.rulesByCookie.set(`sid=frank|${key}`, allowUser('frank@corp', 'Frank'));
+    const frank = await raw(app, key, 'sid=frank');
+    await waitFor(() => serverConns(app, key, 'frank@corp')[0]?.joining === false, 10_000, 'frank joined');
+    const fc = serverConns(app, key, 'frank@corp')[0];
+    const level0 = fc.cpu.level();
+    let answered = 0;
+    let cost = Infinity;
+    while (answered < 15 && fc.cpu.level() > level0 / 2) {
+      const before = fc.cpu.level();
+      const tBurst = Date.now();
+      for (let i = 0; i < 3; i++) frank.ws.send(step1);
+      answered += 3;
+      await waitFor(() => fc.step1Answers >= answered, 10_000, 'frank answered');
+      cost = Math.min(cost, (before - fc.cpu.level() + (10 * (Date.now() - tBurst)) / 1000) / 3);
+    }
+    cost = Math.max(0.2, cost);
+    frank.ws.close();
     // each socket alone stays at HALF the budget (10 ms/s): never closed by a per-connection
     // budget; the 8 together use 4x it
     const perSec = Math.min(100, 5 / cost);
