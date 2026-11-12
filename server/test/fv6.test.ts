@@ -501,7 +501,8 @@ describe('fv6 L-A: paused sockets cannot hold the outgoing budget against honest
     // the verifier's q5 at test scale: a pub/ room bigger than the kernel's socket buffers
     // (so the server holds what the paused sockets do not read), the budget just above what
     // the paused sockets hold: before, every honest join that needed more was refused 1013
-    const app = await startApp({ ANON_MINT_BURST: '400', WS_PING_INTERVAL_MS: '600000', WS_SLOW_CONSUMER_MS: '600000', JOIN_BURST: '1000', JOIN_RATE_PER_MIN: '60000', CPU_TOTAL_MS_PER_SEC: '100000', CPU_TOTAL_BURST_MS: '100000', ANON_CPU_TOTAL_MS_PER_SEC: '100000', ANON_CPU_TOTAL_BURST_MS: '100000' });
+    // (no authorization re-check: a re-check that times out in a busy event loop fails closed and revokes the honest peers)
+    const app = await startApp({ ANON_MINT_BURST: '400', WS_PING_INTERVAL_MS: '600000', WS_SLOW_CONSUMER_MS: '600000', JOIN_BURST: '1000', JOIN_RATE_PER_MIN: '60000', CPU_TOTAL_MS_PER_SEC: '100000', CPU_TOTAL_BURST_MS: '100000', ANON_CPU_TOTAL_MS_PER_SEC: '100000', ANON_CPU_TOTAL_BURST_MS: '100000', AUTHZ_RECHECK_SECONDS: '3600' });
     const cfg = cfgOf(app);
     const keys = ['pub/q5-0/index.html'];
     const holders: WebSocket[] = [];
@@ -534,51 +535,120 @@ describe('fv6 L-A: paused sockets cannot hold the outgoing budget against honest
       return r;
     };
     const held = async () => (await app.metrics.outgoingBytes.get()).values[0]?.value ?? 0;
-    const child = fork(path.join(here, 'fv6', 'q5-attacker.ts'), [], {
-      execArgv: ['--import', 'tsx'],
-      env: { ...process.env, HTTP: httpBase(app), BASE: base(app), KEYS: keys.join(','), DUR: '40', PER_ROOM: '9', ORIGIN: TEST_ORIGIN },
-      stdio: 'ignore',
-    });
-    await new Promise((r) => child.once('message', r));
-    child.send('go');
-    await waitFor(async () => (await held()) > 4 * MiB, 30_000, 'the paused sockets hold their join payloads');
-    await sleep(2000);
-    // the budget: just above what they hold now (the sweep drops nobody), so every honest join
-    // to another room needs room the paused sockets hold
-    const h0 = await held();
-    cfg.wsOutgoingBudgetBytes = h0 + 256 * 1024;
-    const during: string[] = [];
-    let tEnd = Date.now() + 12_000;
-    while (Date.now() < tEnd) {
-      during.push('team:' + (await honestJoin(team, 4000)));
-      during.push('small:' + (await honestJoin(small, 0)));
-    }
-    // then a budget below what the paused sockets hold: the sweep drops them (stalled first)
-    const dropped0 = (await rejected(app, 'outgoing_reclaim')) + (await rejected(app, 'outgoing_budget'));
-    cfg.wsOutgoingBudgetBytes = Math.round(h0 / 2);
-    tEnd = Date.now() + 8000;
-    while (Date.now() < tEnd) {
-      during.push('team:' + (await honestJoin(team, 4000)));
-      during.push('small:' + (await honestJoin(small, 0)));
-    }
-    const done = await new Promise<{ joins: number; closes: Record<string, number> }>((r) => {
-      const f = (m: { done?: boolean }) => {
-        if (m.done) {
-          child.off('message', f);
-          r(m as never);
-        }
+    const droppedPeers = async () => (await rejected(app, 'outgoing_reclaim')) + (await rejected(app, 'outgoing_budget'));
+    const tallyOf = (rs: string[]) => rs.reduce((m: Record<string, number>, x) => ((m[x] = (m[x] ?? 0) + 1), m), {});
+    // The server's own verdict on a paused socket (ws.ts `stalled`): it holds more than 256 KiB
+    // and drained nothing worth counting for WS_STALL_MS. A peer is only known as stalled that
+    // long after it stopped reading (an honest slow reader looks the same until then), and the
+    // join frames the nine of them share are freed only when the last of them is dropped. So the
+    // attack is established once ALL of them are stalled, and only then does "an honest join is
+    // never refused" hold: while it ramps up, an honest join that needs more than the slack may
+    // be refused 1013 by design, and how many joins fall into that window is a matter of speed.
+    // (This test used to open the window 2 s after 'go': its waitFor on the held bytes was an
+    // async predicate, always truthy, so it never waited for the last socket to be stalled.)
+    const PER_ROOM = 9;
+    const pausedOf = (k: string) => [...(app.manager.get(k)?.conns.values() ?? [])].filter((c) => c.identity.anonymous && !c.closing);
+    const stalledOf = (k: string) => pausedOf(k).filter((c) => c.ws.bufferedAmount + c.backlogBytes > 256 * 1024 && Date.now() - c.progressAt >= cfg.wsStallMs);
+    const honestJoins = async (ms: number, room: { key: string; shapes: number }): Promise<string[]> => {
+      const out: string[] = [];
+      const tEnd = Date.now() + ms;
+      while (Date.now() < tEnd || out.length < 12) {
+        out.push('team:' + (await honestJoin(room.key, room.shapes)));
+        out.push('small:' + (await honestJoin(small, 0)));
+      }
+      return out;
+    };
+    /** One wave of the attacker (a process of its own); `stop` ends it and its sockets. */
+    const attack = async () => {
+      const child = fork(path.join(here, 'fv6', 'q5-attacker.ts'), [], {
+        execArgv: ['--import', 'tsx'],
+        env: { ...process.env, HTTP: httpBase(app), BASE: base(app), KEYS: keys.join(','), DUR: '600', PER_ROOM: String(PER_ROOM), ORIGIN: TEST_ORIGIN },
+        stdio: 'ignore',
+      });
+      let last: Record<string, unknown> = {};
+      child.on('message', (m) => (last = m as Record<string, unknown>));
+      await new Promise((r) => child.once('message', r));
+      child.send('go');
+      const stop = async () => {
+        const exited = new Promise((r) => child.once('exit', r));
+        child.kill();
+        await exited;
+        return last;
       };
-      child.on('message', f);
-    });
-    child.send('bye');
-    const tally = during.reduce((m: Record<string, number>, x) => ((m[x] = (m[x] ?? 0) + 1), m), {});
-    // the stalled holders are dropped: for a join, or by the sweep once the budget is passed
-    const reclaimed = (await rejected(app, 'outgoing_reclaim')) + (await rejected(app, 'outgoing_budget')) - dropped0;
-    console.log(`[fv6 q5] held by the paused sockets ${(h0 / MiB).toFixed(1)} MiB (budget set just above); honest joins during the attack ${JSON.stringify(tally)}; attacker ${JSON.stringify(done)}; stalled peers dropped once the budget was halved ${reclaimed} (before ${dropped0})`);
+      // established: every paused socket is stalled by the server's own clock
+      await waitFor(() => stalledOf(keys[0]).length === PER_ROOM, 90_000, 'every paused socket is stalled').catch(async (e) => {
+        await stop();
+        throw e;
+      });
+      // the held-bytes gauge is refreshed by the sweep (once a second)
+      await sleep(1100);
+      return { held: await held(), stop };
+    };
+    const MIN_HELD = 3.5 * MiB; // the room's join payload (~4 MB for 40 000 shapes), held once by the nine
+    const defaultBudget = cfg.wsOutgoingBudgetBytes;
+    const teamRoom = { key: team, shapes: 4000 };
+
+    // wave 1: the budget just above what the paused sockets hold, so an honest join to another
+    // room needs room the paused sockets hold: before, it was refused 1013 for as long as they stayed
+    const w1 = await attack();
+    let during1: string[];
+    let reclaimed1: number;
+    let attacker1: Record<string, unknown>;
+    // What the nine hold depends on the kernel: a socket whose buffers took the whole 4 MB join
+    // frame makes the server queue the ledger frame behind it (19.6 MB held in all). Then the join
+    // of the 2 MB `team` room fits the 25% slack of that budget without needing anyone's room, so
+    // the honest room is one that does not (and still fits the budget alone).
+    const ledgerQueued = w1.held > 8 * MiB;
+    const bigKey = 'u/team-big/index.html';
+    let carolBig: TestClient | undefined;
+    try {
+      expect(w1.held).toBeGreaterThan(MIN_HELD);
+      if (ledgerQueued) {
+        // a room that is loaded (carol keeps it so), or the server has no size to count for a join
+        await seed(bigKey, 16_000, 'carol@corp');
+        share(bigKey, 'carol', 'dave', 'erin');
+        carolBig = await join(app, bigKey, 'sid=carol');
+        await settled(carolBig, 16_000);
+        // the sweep forgets a join's frames once they drained; until then the server counts a join
+        // of the same snapshot as sharing them, and the honest join would cost nothing
+        await waitFor(() => [...(app.manager.get(bigKey)?.conns.values() ?? [])].every((c) => !c.joinFrames), 15_000, 'carol\'s join frames released');
+      }
+      cfg.wsOutgoingBudgetBytes = w1.held + 256 * 1024;
+      const reclaim0 = await rejected(app, 'outgoing_reclaim');
+      during1 = await honestJoins(12_000, ledgerQueued ? { key: bigKey, shapes: 16_000 } : teamRoom);
+      reclaimed1 = (await rejected(app, 'outgoing_reclaim')) - reclaim0;
+    } finally {
+      carolBig?.close();
+      attacker1 = await w1.stop();
+    }
+
+    // wave 2: a budget below what the paused sockets hold: the sweep drops them (stalled first),
+    // and the honest joins in the meantime still all succeed
+    cfg.wsOutgoingBudgetBytes = defaultBudget;
+    const w2 = await attack();
+    let during2: string[];
+    let dropped2: number;
+    let attacker2: Record<string, unknown>;
+    try {
+      expect(w2.held).toBeGreaterThan(MIN_HELD);
+      const dropped0 = await droppedPeers();
+      // half of what they hold, and never less than the honest room needs to be in flight
+      cfg.wsOutgoingBudgetBytes = Math.max(Math.round(w2.held / 2), 3 * MiB);
+      during2 = await honestJoins(8000, teamRoom);
+      dropped2 = (await droppedPeers()) - dropped0;
+    } finally {
+      attacker2 = await w2.stop();
+    }
+    console.log(`[fv6 q5] wave 1: the paused sockets held ${(w1.held / MiB).toFixed(1)} MiB, budget set just above; honest joins ${JSON.stringify(tallyOf(during1))}; stalled peers dropped for them ${reclaimed1}; attacker ${JSON.stringify(attacker1)}. wave 2: held ${(w2.held / MiB).toFixed(1)} MiB, budget halved; honest joins ${JSON.stringify(tallyOf(during2))}; peers dropped ${dropped2}; attacker ${JSON.stringify(attacker2)}`);
     // before (verifier q5b): 64 of 133 honest joins refused 1013
-    expect(during.length).toBeGreaterThan(10);
-    expect(during.every((r) => r.endsWith(':joined'))).toBe(true);
-    expect(reclaimed).toBeGreaterThan(0);
+    expect(during1.length).toBeGreaterThan(10);
+    expect(during1.every((r) => r.endsWith(':joined'))).toBe(true);
+    // the stalled holders are dropped for the joins that need their room
+    expect(reclaimed1).toBeGreaterThan(0);
+    expect(during2.length).toBeGreaterThan(10);
+    expect(during2.every((r) => r.endsWith(':joined'))).toBe(true);
+    // ... and by the sweep once the budget is passed
+    expect(dropped2).toBeGreaterThan(0);
     // the existing honest connections still edit
     carol.doc.getMap('shapes').set('after', shapeMap(geo('after')));
     await waitFor(() => app.manager.get(team)!.doc.getMap('shapes').has('after'), 10_000, 'carol edits');
