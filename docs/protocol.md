@@ -506,7 +506,8 @@ that is gone or expired.
 - **Limits** (anonymous gets the stricter set): messages `120/s` burst 240 (anon 30/60) →
   `4429`; message size 4 MiB (anon 1 MiB) → `4413`; room size 5 MiB (anon 1.25 MiB), **content
   plus ledger** → `4413` (all of them lowered at start to what the memory budget holds, see
-  "Loaded rooms" below), where a delete that splits live items counts 24 bytes per split on
+  "Loaded rooms" below; the ledger an update will add is counted ahead, `ledgerBound` §11),
+  where a delete that splits live items counts 24 bytes per split on
   top of its size (fv5 L-2: deleting every other character grew a room 8x with "deletes only";
   an update that only removes whole items always passes); room connections 50 (anon rooms 10)
   → `1013`; connections per logged-in user 8 and per anonymous visitor 2, **over all rooms** →

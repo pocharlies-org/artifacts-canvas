@@ -56,18 +56,20 @@ test('P5: dozens of paused sockets of one ACL member on a room near the size cap
   const started0 = inspect('{{.State.StartedAt}}');
   const P = publish({ users: [USERS.user1.email, USERS.user2.email, USERS.user3.email] }, `fv5-p5-${Date.now().toString(36)}`);
   const owner = await join(browser, P.canvas, 'user1');
-  // ~4 MB of content + ledger: a big room just under the 5 MiB cap (the cap counts an upper bound
-  // until the next save, so 10 000 shapes can be refused near the end). fv5 ran it on a ~17 MB
-  // room under the old 20 MiB cap; fv7 F1 lowered the cap to what a third of the memory holds.
+  // ~4.5 MB of content + ledger: a big room just under the 5 MiB cap. fv5 ran it on a ~17 MB room
+  // under the old 20 MiB cap; fv7 F1 lowered the cap to what a third of the memory holds, and
+  // counts the attribution and history an update adds against it ahead (per shape: a paste of
+  // 4 000 shapes reserves ~1 MB of ledger), so the room is filled in pastes of 1 000.
   const n = 8_000;
-  for (let b = 0; b < n; b += 4000) {
-    await owner.page.evaluate(([b, n]) => {
+  const batch = 1000;
+  for (let b = 0; b < n; b += batch) {
+    await owner.page.evaluate(([b, n, batch]) => {
       const d = (window as any).__canvas.editor.doc;
       d.transact(() => {
-        for (let i = b; i < Math.min(n, b + 4000); i++) d.create({ type: 'geo', geo: 'rectangle', x: i % 900, y: Math.floor(i / 900) * 20, w: 10, h: 10, text: 'label ' + i });
+        for (let i = b; i < Math.min(n, b + batch); i++) d.create({ type: 'geo', geo: 'rectangle', x: i % 900, y: Math.floor(i / 900) * 20, w: 10, h: 10, text: 'label ' + i });
       });
-    }, [b, n]);
-    await sleep(1500);
+    }, [b, n, batch]);
+    await sleep(1000);
   }
   await sleep(4000);
   expect((await wsCloses(owner.page)).filter((c) => c >= 4400 && c < 4500)).toEqual([]);
