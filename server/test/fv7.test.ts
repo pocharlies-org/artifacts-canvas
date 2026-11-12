@@ -445,8 +445,8 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
     expect(app.manager.held('u:ana@corp')).toBeLessThanOrEqual(app.manager.share(false));
     a.close();
 
-    // two users create 1500 shapes each; a third moves all 3000 in one small update: the
-    // stamper rewrites 3000 attribution entries (~0.4 MB of ledger for a ~40 KB update)
+    // two users create 1000 shapes each; a third moves all 2000 in one small update: the
+    // stamper rewrites 2000 attribution entries (~0.2 MB of ledger for a ~30 KB update)
     const key = 'u/mass/index.html';
     share(key, 'p1', 'p2', 'p3');
     const p1 = await join(app, key, 'sid=p1');
@@ -456,10 +456,11 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
     const room = app.manager.get(key)!;
     for (const [c, tag] of [[p1, 'a'], [p2, 'b']] as const) {
       c.doc.transact(() => {
-        for (let i = 0; i < 1500; i++) c.doc.getMap('shapes').set(`${tag}${i}`, shapeMap(geo(`${tag}${i}`, i)));
+        for (let i = 0; i < 1000; i++) c.doc.getMap('shapes').set(`${tag}${i}`, shapeMap(geo(`${tag}${i}`, i)));
       });
     }
-    await waitFor(() => room.doc.getMap('shapes').size === 3000 && p3.doc.getMap('shapes').size === 3000, 10_000, 'created');
+    await waitFor(() => (room.doc.getMap('shapes').size === 2000 && p3.doc.getMap('shapes').size === 2000) || p1.closeCode !== null || p2.closeCode !== null, 10_000, 'created');
+    expect([p1.closeCode, p2.closeCode, room.doc.getMap('shapes').size]).toEqual([null, null, 2000]);
     await saved(app);
     const ledger0 = room.ledgerApproxBytes;
     const sv = Y.encodeStateVector(p3.doc);
@@ -467,9 +468,9 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
       for (const id of p3.doc.getMap('shapes').keys()) (p3.doc.getMap('shapes').get(id) as Y.Map<unknown>).set('x', 7);
     });
     const moveBytes = Y.encodeStateAsUpdate(p3.doc, sv).byteLength;
-    await waitFor(() => (room.doc.getMap('shapes').get('b1499') as Y.Map<unknown>).get('x') === 7 || p3.closeCode !== null, 10_000, 'moved');
+    await waitFor(() => (room.doc.getMap('shapes').get('b999') as Y.Map<unknown>).get('x') === 7 || p3.closeCode !== null, 10_000, 'moved');
     const ledgerAdded = room.ledgerApproxBytes - ledger0;
-    console.log(`[fv7 F1 ledger] a move of 3000 shapes: ${moveBytes} B of update, ${ledgerAdded} B of ledger; p3 charged ${mib(app.manager.held('u:p3@corp'))} MiB`);
+    console.log(`[fv7 F1 ledger] a move of 2000 shapes: ${moveBytes} B of update, ${ledgerAdded} B of ledger; p3 charged ${mib(app.manager.held('u:p3@corp'))} MiB`);
     expect(p3.closeCode).toBeNull();
     // the ledger is many times the update (fv6 counted it at most 1.6 x)
     expect(ledgerAdded).toBeGreaterThan(5 * moveBytes);
@@ -586,7 +587,9 @@ describe('fv7 F1: the share is a real fraction of the budget; the size caps foll
       await sleep(10);
     }
     expect(await m.closed).toBe(4413);
+    // the ledger of each update is counted ahead against the cap: the room never passes it
     expect(app.manager.get('u/cap/index.html')!.bytes).toBeLessThanOrEqual(cfg.maxDocBytes);
+    expect(app.manager.get('u/cap/index.html')!.bytes).toBeGreaterThan(cfg.maxDocBytes * 0.5);
     keeper.close();
   });
 });

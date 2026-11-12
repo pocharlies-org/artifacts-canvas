@@ -29,13 +29,16 @@ export { GROWTH_FRACTION, LOAD_FRACTION };
 export const LEDGER_LINE_BYTES = 192;
 export const LEDGER_UPDATE_BYTES = 2048;
 const HISTORY_LIMIT = 300;
+/** A shape id is at most MAX_KEY_LENGTH (256) characters, 3 UTF-8 bytes each. */
+const MAX_KEY_BYTES = 3 * 256;
 
 /** Bound of the ledger the stamper writes for an update (see LEDGER_LINE_BYTES). */
 export function ledgerBound(shapes: number, shapeKeyBytes: number, userIdBytes: number): number {
   if (shapes <= 0) return 0;
   const line = LEDGER_LINE_BYTES + 2 * userIdBytes;
   const lines = Math.min(shapes, HISTORY_LIMIT);
-  return LEDGER_UPDATE_BYTES + shapes * line + shapeKeyBytes + lines * line + shapeKeyBytes * (lines / shapes);
+  // the history keeps the update's LAST lines: their ids may be the longest ones
+  return LEDGER_UPDATE_BYTES + shapes * line + shapeKeyBytes + lines * line + Math.min(shapeKeyBytes, lines * MAX_KEY_BYTES);
 }
 /** Rooms fetched from storage and decoded at once (each fetch holds up to MAX_DOC_BYTES). */
 export const MAX_CONCURRENT_LOADS = 4;
@@ -277,6 +280,10 @@ export class RoomManager {
    */
   private async admitLoad(room: Room, bytes: number, loader: Loader | undefined): Promise<() => void> {
     const { cfg, log } = this.deps;
+    // rooms nobody is connected to anymore are on their way out (flushed, then evicted) and count
+    // as free: when the loader is still charged for one, it goes first, so that what the loader
+    // is charged for is exact when its share is checked below
+    if (loader && [...this.rooms.values()].some((r) => r.idle && !r.disposed && r.chargeOf(loader.principal) > 0)) await this.evictIdle();
     // the room's base is counted already (it is in `rooms`, empty, while it loads)
     const extra = this.cost(bytes) - this.cost(0);
     const charge = this.cost(bytes);

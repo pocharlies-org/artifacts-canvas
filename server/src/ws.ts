@@ -850,9 +850,14 @@ export class WsServer {
       // message (fv4 H2). An update that adds nothing (deletes only) always passes.
       // fv5 L-2: deletes that split live items grow the encoded room too (every split becomes
       // structs of its own), so they count against the cap with SPLIT_COST_BYTES per split.
+      // fv7 F1: and the ledger the stamper writes with it, counted ahead (its shapes, their ids
+      // and the room's longest user id: each line names the writer and the shape's creator), so a
+      // room never passes its cap by the attribution of its last update (a room at the cap must
+      // fit one share of the memory budget, and load for anyone).
       const limit = conn.identity.anonymous ? cfg.anonMaxDocBytes : cfg.maxDocBytes;
       const growth = update.byteLength + check.splits * SPLIT_COST_BYTES;
-      if (check.grows && room.approxBytes + room.ledgerApproxBytes + growth > limit) {
+      const ledger = check.grows ? ledgerBound(check.shapes, check.shapeKeyBytes, Math.max(utf8Length(conn.identity.id), room.maxUserIdBytes)) : 0;
+      if (check.grows && room.approxBytes + room.ledgerApproxBytes + growth + ledger > limit) {
         sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
         this.closeConn(conn, CLOSE.tooLarge, 'document too large');
         this.deps.metrics.wsRejected.inc({ reason: 'doc_too_large' });
@@ -863,9 +868,6 @@ export class WsServer {
       // the anonymous visitors past theirs. Refused with 1013 (busy, the client retries); nothing
       // is applied.
       if (check.grows) {
-        // the ledger the stamper writes with it, counted ahead: its shapes, ids and the room's
-        // longest user id (each line names the writer and the shape's creator)
-        const ledger = ledgerBound(check.shapes, check.shapeKeyBytes, Math.max(utf8Length(conn.identity.id), room.maxUserIdBytes));
         const why = this.deps.manager.growthRefusal(room, conn.principal, conn.identity.anonymous, growth, ledger);
         if (why) {
           this.deps.log.warn({ room: room.name, user: conn.identity.id, growth, why }, 'update refused: memory budget');
