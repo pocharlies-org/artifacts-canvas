@@ -10,7 +10,8 @@ import type { Metrics } from './metrics.js';
 import { canvasLedgerKey, canvasObjectKey } from './paths.js';
 import type { CanvasObjectStore } from './store.js';
 import type { Identity } from './types.js';
-import { attachStamper, dropPending, encodeIntegratedState, hasPending } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { attachStamper, dropPending, encodeIntegratedState, hasPending, utf8Length } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { ROOT } from '@pocharlies/artifacts-canvas-shared/model';
 import { bindWriters, materializeContent, materializeLedger, migrateLegacyRoots, pruneAttribution, writerOf } from '@pocharlies/artifacts-canvas-shared/ledger';
 import { MSG_SYNC, encodeLedger } from '@pocharlies/artifacts-canvas-shared/protocol';
 import type { TokenBucket } from './limits.js';
@@ -150,6 +151,12 @@ export class Room {
   private readonly charges = new Map<string, Charge>();
   /** content bytes of the updates the document emitted (Yjs' own encoding of what changed) */
   contentChangedBytes = 0;
+  /**
+   * UTF-8 bytes of the longest user id in the ledger's `users` (everyone who ever wrote here):
+   * the attribution and history the stamper writes for a shape name its creator (fv7 F1, the
+   * ledger an update adds is counted ahead with it)
+   */
+  maxUserIdBytes = 0;
   private lastPrune = 0;
   ttlTag: string | null = null;
   private saveTimer?: ReturnType<typeof setTimeout>;
@@ -190,6 +197,9 @@ export class Room {
       this.contentSnap = extendTail(this.contentSnap, msg);
       for (const c of this.conns.values()) if (c !== origin) sendConn(c, msg);
       if (origin !== 'load') this.markDirty();
+    });
+    this.ledger.getMap(ROOT.users).observe((e) => {
+      for (const k of e.keysChanged) this.maxUserIdBytes = Math.max(this.maxUserIdBytes, utf8Length(k));
     });
     // The ledger goes to everyone, the sender included (it learns its own attribution here).
     this.ledger.on('update', (update: Uint8Array, origin: unknown) => {

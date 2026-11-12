@@ -17,11 +17,26 @@ export interface Loader {
 
 export { GROWTH_FRACTION, LOAD_FRACTION };
 /**
- * Ledger bytes the stamper writes per content byte, at most (measured, fv6 H-1: tiny shapes one
- * attribution entry each 1.53, geo shapes 0.21-0.28): an update's growth counts the room's own
- * ratio more, between 0.3 and this.
+ * What the stamper adds to the ledger for one update, at most (fv7 F1, server/test/fv7/ledger.ts):
+ * per shape the update writes or deletes, one attribution entry (the shape id, its creator's and
+ * the writer's ids, two timestamps) and one history line (the shape id, the writer's id, the
+ * creator's as owner, the verb and type), each LEDGER_LINE_BYTES plus those ids; history lines
+ * are at most HISTORY_LIMIT per update; plus the writer's `users` entry and the update's headers,
+ * LEDGER_UPDATE_BYTES. Measured with 768-byte ids: 3.4-3.9 KiB per shape against a bound of
+ * 4.3 KiB; with short ids 0.3 KiB per shape. (fv6 counted the ledger as a ratio of the content,
+ * 0.3-1.6: one image of 2 MiB in a new room was counted at 2.6 x its size, more than a share.)
  */
-export const LEDGER_PER_CONTENT = 1.6;
+export const LEDGER_LINE_BYTES = 192;
+export const LEDGER_UPDATE_BYTES = 2048;
+const HISTORY_LIMIT = 300;
+
+/** Bound of the ledger the stamper writes for an update (see LEDGER_LINE_BYTES). */
+export function ledgerBound(shapes: number, shapeKeyBytes: number, userIdBytes: number): number {
+  if (shapes <= 0) return 0;
+  const line = LEDGER_LINE_BYTES + 2 * userIdBytes;
+  const lines = Math.min(shapes, HISTORY_LIMIT);
+  return LEDGER_UPDATE_BYTES + shapes * line + shapeKeyBytes + lines * line + shapeKeyBytes * (lines / shapes);
+}
 /** Rooms fetched from storage and decoded at once (each fetch holds up to MAX_DOC_BYTES). */
 export const MAX_CONCURRENT_LOADS = 4;
 
@@ -291,13 +306,14 @@ export class RoomManager {
   }
 
   /**
-   * Why an update that grows `room` by `growthBytes` (encoded), sent by `principal`, is refused,
-   * or null (fv6 H-1, fv7 F1): the loaded rooms may not grow past GROWTH_FRACTION of the budget,
-   * the principal past its share, the anonymous visitors past theirs. Idle rooms count as free
-   * and are evicted. An update that is let through is charged with chargeUpdate() once applied.
+   * Why an update that grows `room` by `growthBytes` (encoded) and adds at most `ledgerBytes` to
+   * its ledger (ledgerBound()), sent by `principal`, is refused, or null (fv6 H-1, fv7 F1): the
+   * loaded rooms may not grow past GROWTH_FRACTION of the budget, the principal past its share,
+   * the anonymous visitors past theirs. Idle rooms count as free and are evicted. An update that
+   * is let through is charged with chargeUpdate() once applied.
    */
-  growthRefusal(room: Room, principal: string, anonymous: boolean, growthBytes: number): string | null {
-    const extra = this.growthCost(room, growthBytes);
+  growthRefusal(room: Room, principal: string, anonymous: boolean, growthBytes: number, ledgerBytes: number): string | null {
+    const extra = this.deps.cfg.roomCostFactor * (growthBytes + ledgerBytes);
     const { cfg } = this.deps;
     const m = this.memory();
     const limit = cfg.roomMemoryBudgetBytes * GROWTH_FRACTION;
@@ -306,16 +322,6 @@ export class RoomManager {
     if (this.held(principal) + extra > this.share(anonymous)) return 'room_memory_principal';
     if (anonymous && this.anonHeld() + extra > this.anonShare()) return 'room_memory_anon';
     return null;
-  }
-
-  /**
-   * Estimated memory an update of `growthBytes` adds to `room`: the ledger grows with the content
-   * (the stamper writes it after the apply), counted ahead at this room's ledger/content ratio
-   * (at least 0.3, at most LEDGER_PER_CONTENT).
-   */
-  growthCost(room: Room, growthBytes: number): number {
-    const ratio = room.approxBytes > 64 * 1024 ? room.ledgerApproxBytes / room.approxBytes : LEDGER_PER_CONTENT;
-    return this.deps.cfg.roomCostFactor * growthBytes * (1 + Math.min(LEDGER_PER_CONTENT, Math.max(0.3, ratio)));
   }
 
   /**

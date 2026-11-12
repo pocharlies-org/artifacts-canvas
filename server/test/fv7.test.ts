@@ -425,6 +425,59 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
     s.close();
   });
 
+  it('the ledger an update adds is counted ahead by the shapes it touches: one big image in a new room fits a share (fv6 counted 2.6 x its size), a move of thousands of shapes counts their attribution', async () => {
+    // a 256 MiB budget: a share of 85 MiB, rooms clamped to ~1.5 MiB
+    const app = await startApp({ ROOM_MEMORY_BUDGET_BYTES: String(256 * MiB), MSG_RATE_PER_SEC: '1000', MSG_BURST: '1000' });
+    const cfg = cfgOf(app);
+    share('u/img/index.html', 'ana');
+    const a = await join(app, 'u/img/index.html', 'sid=ana');
+    expect(await joined(a)).toBeNull();
+    // an image as big as a message may be (a data URL in `assets`, one image shape)
+    const data = `data:image/png;base64,${'A'.repeat(Math.floor(cfg.maxMessageBytes * 0.9))}`;
+    a.doc.transact(() => {
+      a.doc.getMap('assets').set('img1', data);
+      a.doc.getMap('shapes').set('i1', shapeMap({ id: 'i1', type: 'image', x: 0, y: 0, w: 100, h: 100, rotation: 0, index: 1, groupId: '', locked: false, opacity: 1, assetId: 'img1' }));
+    });
+    await waitFor(() => app.manager.get('u/img/index.html')?.doc.getMap('assets').has('img1') === true || a.closeCode !== null, 5000, 'image applied');
+    expect(a.closeCode).toBeNull();
+    // fv6's estimate: 44 x size x 2.6 for a room under 64 KiB, more than the share
+    expect(ROOM_COST_FACTOR * data.length * 2.6).toBeGreaterThan(app.manager.share(false));
+    expect(app.manager.held('u:ana@corp')).toBeLessThanOrEqual(app.manager.share(false));
+    a.close();
+
+    // two users create 1500 shapes each; a third moves all 3000 in one small update: the
+    // stamper rewrites 3000 attribution entries (~0.4 MB of ledger for a ~40 KB update)
+    const key = 'u/mass/index.html';
+    share(key, 'p1', 'p2', 'p3');
+    const p1 = await join(app, key, 'sid=p1');
+    const p2 = await join(app, key, 'sid=p2');
+    const p3 = await join(app, key, 'sid=p3');
+    for (const c of [p1, p2, p3]) expect(await joined(c)).toBeNull();
+    const room = app.manager.get(key)!;
+    for (const [c, tag] of [[p1, 'a'], [p2, 'b']] as const) {
+      c.doc.transact(() => {
+        for (let i = 0; i < 1500; i++) c.doc.getMap('shapes').set(`${tag}${i}`, shapeMap(geo(`${tag}${i}`, i)));
+      });
+    }
+    await waitFor(() => room.doc.getMap('shapes').size === 3000 && p3.doc.getMap('shapes').size === 3000, 10_000, 'created');
+    await saved(app);
+    const ledger0 = room.ledgerApproxBytes;
+    const sv = Y.encodeStateVector(p3.doc);
+    p3.doc.transact(() => {
+      for (const id of p3.doc.getMap('shapes').keys()) (p3.doc.getMap('shapes').get(id) as Y.Map<unknown>).set('x', 7);
+    });
+    const moveBytes = Y.encodeStateAsUpdate(p3.doc, sv).byteLength;
+    await waitFor(() => (room.doc.getMap('shapes').get('b1499') as Y.Map<unknown>).get('x') === 7 || p3.closeCode !== null, 10_000, 'moved');
+    const ledgerAdded = room.ledgerApproxBytes - ledger0;
+    console.log(`[fv7 F1 ledger] a move of 3000 shapes: ${moveBytes} B of update, ${ledgerAdded} B of ledger; p3 charged ${mib(app.manager.held('u:p3@corp'))} MiB`);
+    expect(p3.closeCode).toBeNull();
+    // the ledger is many times the update (fv6 counted it at most 1.6 x)
+    expect(ledgerAdded).toBeGreaterThan(5 * moveBytes);
+    // and all of it is charged to the mover
+    expect(app.manager.held('u:p3@corp')).toBeGreaterThanOrEqual(ROOM_COST_FACTOR * (moveBytes + ledgerAdded) * 0.99);
+    for (const c of [p1, p2, p3]) c.close();
+  });
+
   it('an update that only repeats deletions the room has adds nothing to the estimate (before: counted at its size, with no save to correct it)', async () => {
     const app = await startApp({ ROOM_MEMORY_BUDGET_BYTES: String(256 * MiB), MSG_RATE_PER_SEC: '1000', MSG_BURST: '1000' });
     const key = 'u/nop/index.html';

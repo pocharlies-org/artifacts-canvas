@@ -623,8 +623,15 @@ that is gone or expired.
   little of the co-writer's part (never more than its own estimates). A principal that loaded or
   wrote a room keeps paying for it while others keep it loaded. The estimate is between saves an
   upper bound (every accepted update counts in full until the next save measures the room
-  again); an update's growth counts more for the ledger the stamper writes with it: the room's
-  own ledger/content ratio, between 0.3 and 1.6 (measured at most 1.53, for tiny shapes).
+  again). A growing update is checked with the ledger the stamper will write for it counted
+  ahead: per shape it writes or deletes one attribution entry and one history line (at most 300
+  lines per update), bounded by the shape ids, the writer's id and the longest user id of the
+  room (`ledgerBound`, measured by `server/test/fv7/ledger.ts`: a move of 3 000 shapes by another
+  user is ~45 KB of update and ~290 KB of ledger; fv6 counted the ledger as 0.3-1.6 x the content,
+  so such an update was under-counted and one big image in a new room over-counted). An update
+  that only deletes is never refused; what its ledger adds (the attribution and history of the
+  shapes it deleted) is charged to the deleter once applied and can take it past its share, and
+  the loaded rooms past the thresholds, until the next save measures the room.
 
 - A client that relays someone else's structs (e.g. a tab reconnecting after a server CRASH that
   lost unsaved edits of other people) delivers them in its own step 2: the stamper attributes

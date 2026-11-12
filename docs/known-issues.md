@@ -45,7 +45,10 @@ The fv7 findings F1, F2 and F6 are fixed:
   one full room); a stored room bigger than the joiner's share is refused `4413`. Verifying the
   bound also found that an update that only repeated deletions the room had (a full-state step 2
   does) grew the size estimate by its size with no save to correct it: such updates now count
-  what they really deleted.
+  what they really deleted; and that the ledger an update adds was counted as 0.3-1.6 x its
+  content (a move of 3 000 shapes by another user adds ~6.5 x in attribution and history; one big
+  image in a new room was counted at 2.6 x, more than a share): it is now bounded per shape the
+  update touches (`ledgerBound`).
 - [x] **F2 — The cost factors underestimated some shapes (Medium).** `ROOM_COST_FACTOR` 24 → 44
   (worst measured 39.5×, alternating overwrites with a new pair of client ids every 250 writes,
   plus 10%) and `MESSAGE_COST_FACTOR` 24 → 60 (51-53× measured for one 7.98 MiB update of

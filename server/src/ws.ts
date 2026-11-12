@@ -16,7 +16,7 @@ import { composeIdentity, sanitizeAwarenessUpdate } from './identity.js';
 import { AnonIssuer, assignNum } from './anon.js';
 import { normalizeOrigin } from './config.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
-import type { RoomManager } from './rooms.js';
+import { ledgerBound, type RoomManager } from './rooms.js';
 import { BusyError, Room, bufferCap, limitBuffered, sendWs, sentBytes, underBufferCap, type Conn } from './room.js';
 import {
   CLOSE,
@@ -28,7 +28,7 @@ import {
   encodeLedger,
   encodeNotice,
 } from '@pocharlies/artifacts-canvas-shared/protocol';
-import { SPLIT_COST_BYTES, applyGuarded, checkClientUpdate, type UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { SPLIT_COST_BYTES, applyGuarded, checkClientUpdate, utf8Length, type UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
 
 export const WS_ROUTE = '/_canvas/_/ws/';
 /** Same route when the ingress controller strips the plugin prefix. */
@@ -863,7 +863,10 @@ export class WsServer {
       // the anonymous visitors past theirs. Refused with 1013 (busy, the client retries); nothing
       // is applied.
       if (check.grows) {
-        const why = this.deps.manager.growthRefusal(room, conn.principal, conn.identity.anonymous, growth);
+        // the ledger the stamper writes with it, counted ahead: its shapes, ids and the room's
+        // longest user id (each line names the writer and the shape's creator)
+        const ledger = ledgerBound(check.shapes, check.shapeKeyBytes, Math.max(utf8Length(conn.identity.id), room.maxUserIdBytes));
+        const why = this.deps.manager.growthRefusal(room, conn.principal, conn.identity.anonymous, growth, ledger);
         if (why) {
           this.deps.log.warn({ room: room.name, user: conn.identity.id, growth, why }, 'update refused: memory budget');
           sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
@@ -1051,7 +1054,7 @@ function checkClientUpdateSafe(room: Room, conn: Conn, update: Uint8Array): Upda
       mayWriteClient: (client) => room.mayWrite(client, conn.identity.id, conn),
     });
   } catch {
-    return { bad: 'forbidden', writers: [], grows: false, splits: 0 };
+    return { bad: 'forbidden', writers: [], grows: false, splits: 0, shapes: 0, shapeKeyBytes: 0 };
   }
 }
 

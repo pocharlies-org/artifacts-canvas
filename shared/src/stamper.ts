@@ -280,6 +280,13 @@ export interface UpdateCheck {
   grows: boolean;
   /** item boundaries the delete set creates in live room items (see SPLIT_COST_BYTES) */
   splits: number;
+  /**
+   * shapes the update writes or deletes (distinct ids), and the UTF-8 bytes of those ids: the
+   * stamper writes one attribution entry and one history line per shape touched, so they bound
+   * what the update adds to the ledger (the server's memory budget counts it ahead)
+   */
+  shapes: number;
+  shapeKeyBytes: number;
 }
 
 /**
@@ -334,8 +341,23 @@ export function forbiddenRootWrite(doc: Y.Doc, update: Uint8Array, opts: GuardOp
 
 /** forbiddenRootWrite plus the client ids the update writes with. */
 export function checkClientUpdate(doc: Y.Doc, update: Uint8Array, opts: GuardOptions = {}): UpdateCheck {
-  if (hasPending(doc)) return { bad: 'room-pending', writers: [], grows: false, splits: 0 };
+  if (hasPending(doc)) return { bad: 'room-pending', writers: [], grows: false, splits: 0, shapes: 0, shapeKeyBytes: 0 };
   return fastCheck(doc, update, opts);
+}
+
+/** UTF-8 length of a string (what Yjs writes for it). */
+export function utf8Length(str: string): number {
+  let n = 0;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+      n += 4;
+      i++;
+    } else n += 3;
+  }
+  return n;
 }
 
 /** True when Yjs parked structs or deletes in `doc` that wait for missing clocks. */
@@ -427,7 +449,12 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
   const serverClient = opts.serverClient ?? doc.clientID;
   const decoded = Y.decodeUpdate(update);
   const writers: number[] = [];
-  const no = (bad: string): UpdateCheck => ({ bad, writers, grows: false, splits: 0 });
+  const no = (bad: string): UpdateCheck => ({ bad, writers, grows: false, splits: 0, shapes: 0, shapeKeyBytes: 0 });
+  /** shape ids written or deleted (see UpdateCheck.shapes) */
+  const touchedShapes = new Set<string>();
+  const touchShape = (loc: Loc) => {
+    if (loc.root === ROOT.shapes && typeof loc.keys[0] === 'string') touchedShapes.add(loc.keys[0]);
+  };
   // One struct block per client. Yjs keeps only the LAST block of a client that appears in
   // several (and an empty block wipes the earlier ones), while decodeUpdate lists all of
   // them: what this check sees would not be what Yjs integrates.
@@ -705,6 +732,7 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
     if (loc === UNRESOLVED) return no('malformed');
     if (loc === GC_ROOT) continue;
     if (!CLIENT_WRITABLE_ROOTS.has(loc.root)) return no(loc.root);
+    touchShape(loc);
     if (s.content instanceof Y.ContentDeleted) {
       // a deleted item at a map key replaces (= deletes) the value there: same rules as a
       // delete — the key must be one a client may use, and a live shape keeps its `type`
@@ -760,6 +788,7 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
           const loc = locOfRoomItem(item);
           if (loc === UNRESOLVED) return no('malformed');
           if (!CLIENT_WRITABLE_ROOTS.has(loc.root)) return no(loc.root);
+          touchShape(loc);
           const from = Math.max(clock, item.id.clock);
           const to = Math.min(r.clock + r.len, item.id.clock + item.length);
           // a range that starts or ends inside a live item splits it (fv5 L-2)
@@ -806,7 +835,9 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
   for (const m of newShapeMaps) {
     if (!dsHas(m.id) && !typeParents.has(idKey(m.id))) return no('shapes-schema');
   }
-  return { bad: null, writers, grows: fresh.size > 0 || splits > 0, splits };
+  let shapeKeyBytes = 0;
+  for (const k of touchedShapes) shapeKeyBytes += utf8Length(k);
+  return { bad: null, writers, grows: fresh.size > 0 || splits > 0, splits, shapes: touchedShapes.size, shapeKeyBytes };
 }
 
 /** Clocks of [clock, clock + len) of `client` that the (canonical: sorted, disjoint) delete set deletes. */
