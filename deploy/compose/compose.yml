@@ -44,11 +44,12 @@ services:
       AUTHZ_RECHECK_SECONDS: "3"
       SAVE_DEBOUNCE_MS: "300"
       LOG_LEVEL: info
-      # the chart's memory sizing (chart/values.yaml: nodeMaxOldSpaceMb, resources.limits)
-      NODE_OPTIONS: --max-old-space-size=1536
+      # the chart's memory sizing (chart/values.yaml: nodeMaxOldSpaceMb, resources.limits);
+      # CANVAS_MAX_OLD_SPACE_MB + CANVAS_MEM_LIMIT run the stack at another size, e.g. 768 + 1g
+      NODE_OPTIONS: --max-old-space-size=${CANVAS_MAX_OLD_SPACE_MB:-1536}
     # the chart's default memory limit, so the full-system suite runs under it
-    mem_limit: 2g
-    memswap_limit: 2g
+    mem_limit: ${CANVAS_MEM_LIMIT:-2g}
+    memswap_limit: ${CANVAS_MEM_LIMIT:-2g}
     depends_on:
       bootstrap: {condition: service_completed_successfully}
       gate: {condition: service_started}

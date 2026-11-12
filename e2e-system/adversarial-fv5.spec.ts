@@ -2,7 +2,8 @@
  * FULL-SYSTEM regressions of the fifth independent verification (fv5), against the live
  * compose stack, whose canvas container runs under the chart's memory limit (compose.yml:
  * mem_limit 2g, NODE_OPTIONS --max-old-space-size=1536):
- *   P5  one ACL member, a ~20 MB room, dozens of paused sockets (before, at the old 1 GiB
+ *   P5  one ACL member, a room near the size cap (fv5: ~20 MB under the old 20 MiB cap; ~4 MB
+ *       under the 5 MiB cap since fv7), dozens of paused sockets (before, at the old 1 GiB
  *       limit: +400-700 MiB and the container OOM-killed) -> 8 accepted, memory flat, dropped
  *       by the ping timeout, the container never restarts, honest users keep editing
  *   M-2 offline typing + a keystroke while the tab reconnects after a canvas restart
@@ -47,7 +48,7 @@ function metric(name: string, label = ''): number {
   return n;
 }
 
-test('P5: dozens of paused sockets of one ACL member on a ~20 MB room: memory flat under the chart limit, no restart, honest users unaffected', async ({ browser }) => {
+test('P5: dozens of paused sockets of one ACL member on a room near the size cap: memory flat under the chart limit, no restart, honest users unaffected', async ({ browser }) => {
   test.setTimeout(420_000);
   // the container runs with the chart's memory limit
   expect(Number(inspect('{{.HostConfig.Memory}}'))).toBe(2 * 1024 ** 3);
@@ -55,9 +56,10 @@ test('P5: dozens of paused sockets of one ACL member on a ~20 MB room: memory fl
   const started0 = inspect('{{.State.StartedAt}}');
   const P = publish({ users: [USERS.user1.email, USERS.user2.email, USERS.user3.email] }, `fv5-p5-${Date.now().toString(36)}`);
   const owner = await join(browser, P.canvas, 'user1');
-  // ~17 MB of content + ledger: a big room just under the 20 MiB cap (the cap counts an upper
-  // bound until the next save, so 40 000 shapes can be refused near the end)
-  const n = 34_000;
+  // ~4 MB of content + ledger: a big room just under the 5 MiB cap (the cap counts an upper bound
+  // until the next save, so 10 000 shapes can be refused near the end). fv5 ran it on a ~17 MB
+  // room under the old 20 MiB cap; fv7 F1 lowered the cap to what a third of the memory holds.
+  const n = 8_000;
   for (let b = 0; b < n; b += 4000) {
     await owner.page.evaluate(([b, n]) => {
       const d = (window as any).__canvas.editor.doc;
@@ -70,7 +72,7 @@ test('P5: dozens of paused sockets of one ACL member on a ~20 MB room: memory fl
   await sleep(4000);
   expect((await wsCloses(owner.page)).filter((c) => c >= 4400 && c < 4500)).toEqual([]);
   const viewer = await join(browser, P.canvas, 'user3');
-  // an honest reader outside any browser (a 34 000-shape page re-renders slowly): what the
+  // an honest reader outside any browser (an 8 000-shape page re-renders slowly): what the
   // server relays, and how fast
   const viewerCookie = (await viewer.ctx.cookies()).map((c) => `${c.name}=${c.value}`).join('; ');
   const reader = new Y.Doc();
