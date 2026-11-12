@@ -1,38 +1,7 @@
 # Known issues
 
-Findings of the seventh independent verification (fv7) that are not fixed yet. They were
-published as known issues on purpose: none of them crashes the server or loses data, and
-F1 is the one to fix first. Each entry below is meant to become one GitHub issue.
-
-- [ ] **F1 — Room memory budget charging lets one user hold the whole budget (High,
-  availability).** Three pieces of the accounting do not add up. Growth of a room is charged to
-  the writer as `extra / room.principals.size` (`server/src/rooms.ts:241`), `held()` divides a
-  room's cost by the number of principals in it (`rooms.ts:161-163`), and nothing re-charges the
-  writer when the others detach (`server/src/room.ts:297`): the cost of a room grown while
-  others sat in it falls back on nobody. Growth is allowed up to 100 % of the budget
-  (`rooms.ts:240`) while loads stop at 90 % (`LOAD_FRACTION`, `rooms.ts:183`), so growth can
-  eat the margin that loads need. And the `share()` floor, `cost(1.25 × maxDocBytes)`
-  (600 MiB), is more than half of the 920 MiB budget of the 2 GiB default, and the whole
-  budget at 1 GiB, so the per-principal share is not a real fraction there.
-  Scenario: one user opens several rooms while others are in them and grows them (the charge
-  is split among the people present), the others leave, and that user now keeps loaded most of
-  the budget while being charged a fraction of it. Every new room load, for everybody, is then
-  refused with 1013 busy until some of those rooms are evicted. No crash, no data loss.
-  Suggested fix: charge growth in full to the writer and keep that charge after the others
-  leave (re-charge on detach, or account per room and attribute it to the principal that grew
-  it); keep growth below the load threshold (`LOAD_FRACTION`) so loads always have room; make
-  the per-principal share a real fraction of the budget with a clamped per-room cap instead of
-  a floor of one maximal room; log a warning at start when the budget is smaller than one full
-  room.
-
-- [ ] **F2 — The cost factors underestimate some shapes (Medium).** `ROOM_COST_FACTOR` and
-  `MESSAGE_COST_FACTOR` (both 24, `server/src/config.ts:399` and `:405`) turn encoded bytes
-  into resident bytes. Some shapes measure above that: up to 39.5× for a room and about 50×
-  for one message, so the budget can admit more rooms than the heap holds for those shapes.
-  No out-of-memory was reached at the 2 GiB default, but the margin is thinner than the
-  documentation says.
-  Suggested fix: raise the factors to about 40 (room) and 50 (message), or count Yjs structs
-  (items) instead of bytes, which is what the memory follows.
+Findings of the seventh independent verification (fv7) that are not fixed yet. None of them
+crashes the server or loses data. Each entry below is meant to become one GitHub issue.
 
 - [ ] **F3 — The global anonymous-mint bucket can be starved by many IPs (Low/Medium).**
   `AnonMint.mint` (`server/src/anon.ts:64-71`) takes a token from the global bucket of the
@@ -57,14 +26,42 @@ F1 is the one to fix first. Each entry below is meant to become one GitHub issue
   larger burst than its steady rate) and leave the global bucket as the real bound, or mint the
   cookie on the wrapper page, once per browser, instead of on every WebSocket join.
 
-- [ ] **F6 — A transient core authorization failure closes honest users with 4403 (Low).**
-  `recheck` (`server/src/ws.ts:1001`) treats every `allowed: false` as a revocation, and the
-  authz client fails closed, so a timeout or a 5xx of the core (`core_error`, `malformed`) is
-  also `allowed: false`. The user gets the `revoked` notice and 4403, which the client does
-  not reconnect from, although nothing was revoked.
-  Suggested fix: when the reason is `core_error` or `malformed`, do not close for revocation:
-  keep the connection and check again on the next tick, or close with 1013 so the client
-  reconnects.
+The fv7 findings F1, F2 and F6 are fixed:
+
+- [x] **F1 — Room memory budget charging let one user hold the whole budget (High,
+  availability).** Growth was charged to the writer as `extra / room.principals.size`, `held()`
+  divided each room's cost by the principals in it, nothing re-charged the writer when the others
+  detached, growth was allowed to 100% of the budget while loads stopped at 90%, and the
+  per-principal share had a floor of `cost(1.25 × MAX_DOC_BYTES)` (600 MiB of the 920 MiB budget,
+  more than the whole budget at 1 GiB). Live (2 GiB): user1 held 856 MiB against a 600 MiB share
+  and an 828 MiB load cap; user2 got 13 × 1013 opening a new artifact. Now (protocol §10, §11):
+  every loaded room's cost is charged to the principal whose join loaded it and what each update
+  adds to the principal that wrote it, in full, never divided; the charges stay while the room is
+  loaded, also after their principal left, and each save replaces the estimates by what the room
+  measures (only for the principals that wrote since the previous save); loads stop at 85% of
+  the budget and growth at 80%; a principal may be charged a third of the budget, an anonymous
+  visitor a twelfth, all anonymous visitors together a third, with no floor; the size caps are
+  lowered at start to what a share holds, with a warning (also when the budget is smaller than
+  one full room); a stored room bigger than the joiner's share is refused `4413`. Verifying the
+  bound also found that an update that only repeated deletions the room had (a full-state step 2
+  does) grew the size estimate by its size with no save to correct it: such updates now count
+  what they really deleted.
+- [x] **F2 — The cost factors underestimated some shapes (Medium).** `ROOM_COST_FACTOR` 24 → 44
+  (worst measured 39.5×, alternating overwrites with a new pair of client ids every 250 writes,
+  plus 10%) and `MESSAGE_COST_FACTOR` 24 → 60 (51-53× measured for one 7.98 MiB update of
+  alternating overwrites); measured by `server/test/fv7/ratio.ts` and `server/test/fv7/guardcost.ts`.
+  To keep the chart's 2 GiB sizing, the default caps are now 5 MiB per room (anonymous 1.25 MiB),
+  4 MiB per message (1 MiB) and 512 KiB per anonymous image.
+- [x] **F6 — A transient core authorization failure closed honest users with 4403 (Low).** A
+  `core_error` or `malformed` answer (timeout, network error, 5xx) during the periodic re-check
+  now closes `1013` with NOTICE `busy` (the client reconnects and is checked again) instead of
+  `4403` `revoked`, and a join while the core cannot answer is refused `1013` too (still fail
+  closed: nothing is let in unverified).
+
+Their regressions live in `server/test/fv7.test.ts` (the attack with and without other principals
+sitting in the rooms, charges kept after a detach, the thresholds, the share and the clamped caps,
+the startup warnings, the close codes) and `e2e-system/adversarial-fv7.spec.ts` (DOS with anonymous
+sitters and COVIEW with signed-in co-viewers, on the full system under the chart's memory limit).
 
 The findings of the sixth independent verification (fv6) are fixed: H-1 (no bound on the rooms
 loaded at once: one ACL member opening and filling rooms OOM-killed the pod in a loop; now a

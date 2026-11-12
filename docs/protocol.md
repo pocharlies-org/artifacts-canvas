@@ -175,14 +175,19 @@ interface Identity {
   anything else is denied with reason `anon_outside_pub` (§7).
 - Close codes (RFC 6455 private range; the client does not reconnect on 44xx): `4403`
   forbidden (authz denied, revoked, or a forbidden write, §5), `4404` artifact gone, `4410`
-  artifact expired, `4413` document/message too large, `4429` rate-limited, `4503`
+  artifact expired, `4413` document/message too large (also a stored room that costs more than
+  the joining principal's whole memory share, §10), `4429` rate-limited, `4503`
   restarting (client reconnects), `1013` try again later (room, principal or server capacity,
-  join rate, server CPU, server memory; the client reconnects with backoff — a join is never
-  refused with the terminal `4429`, fv5 M-6). `4401`
+  join rate, server CPU, server memory, the core unable to answer authz; the client reconnects
+  with backoff — a join is never refused with the terminal `4429`, fv5 M-6). `4401`
   (unauthenticated) is reserved and unused in v1 — the gate denies unauthenticated visitors
   as `4403`/`4404`. Send a NOTICE before closing when there is something to tell the user.
 - Re-check authz every `AUTHZ_RECHECK_SECONDS` (default 300; the chart ships 300) and on ACL
-  change; on a deny send NOTICE `revoked`/`expired` and close 4403/4410.
+  change; on a deny send NOTICE `revoked`/`expired` and close 4403/4410. When the core could not
+  answer (`core_error`: timeout, network error, 5xx; `malformed`) nothing was decided: the
+  connection is not kept unverified (fail closed) but is closed `1013` with NOTICE `busy`, and
+  the client reconnects and is checked again; a join while the core cannot answer is refused
+  the same way (fv7 F6: a core blip closed every open tab with the terminal `4403` `revoked`).
 - Without an IDENTITY message the production client stays read-only (it shows the document
   but never writes).
 
@@ -317,7 +322,7 @@ server announces `attribution: 'server'` and MUST:
    tiny edits in many big rooms cannot keep the server busy saving; the flush on last leave and
    on shutdown never waits. A visitor cookie whose join budget is used up, or whose principal is
    in CPU debt, is refused before the core is asked. One message costs at most O(its size), and its size is
-   capped (§10): about 3 s of guard on this hardware at the 8 MiB cap.
+   capped (§10): about 3 s of guard on this hardware at the old 8 MiB cap (4 MiB since fv7).
    **Whatever the apply does, the room never keeps pending state**: `applyGuarded` drops any
    parked structs/deletes in a `finally` — also when `Y.applyUpdate` throws half-way (a throw
    used to skip that check and leave the room pending, refusing every later writer as
@@ -429,7 +434,7 @@ Status codes and their handling:
 | `400` | malformed body, path outside `/artifacts/`, or key the gate refuses | deny (`bad_path`) — logged as a validation divergence |
 | `405` | non-POST | deny (`core_error`) |
 | `500` | identity-backend error | deny (`core_error`) |
-| network error / timeout / malformed JSON | — | deny (`core_error`) — **fail closed** |
+| network error / timeout / malformed JSON | — | deny (`core_error`) — **fail closed**, retryable: `1013` `busy` on the WebSocket (§4) |
 
 Body: `{allowed, reason, user:{id,name,anonymous}, artifact:{key,expires,ttl}}`.
 
@@ -499,8 +504,9 @@ that is gone or expired.
   identity; states for clientIds already owned by another connection are dropped; every state
   is reduced to the presence schema.
 - **Limits** (anonymous gets the stricter set): messages `120/s` burst 240 (anon 30/60) →
-  `4429`; message size 8 MiB (anon 2 MiB) → `4413`; room size 20 MiB (anon 5 MiB), **content
-  plus ledger** → `4413`, where a delete that splits live items counts 24 bytes per split on
+  `4429`; message size 4 MiB (anon 1 MiB) → `4413`; room size 5 MiB (anon 1.25 MiB), **content
+  plus ledger** → `4413` (all of them lowered at start to what the memory budget holds, see
+  "Loaded rooms" below), where a delete that splits live items counts 24 bytes per split on
   top of its size (fv5 L-2: deleting every other character grew a room 8x with "deletes only";
   an update that only removes whole items always passes); room connections 50 (anon rooms 10)
   → `1013`; connections per logged-in user 8 and per anonymous visitor 2, **over all rooms** →
@@ -529,15 +535,24 @@ that is gone or expired.
   join of a principal that holds nothing may go 25% over the budget (a peer that just stopped
   reading is known as stalled only after `WS_STALL_MS`); the sweep, every second, brings the
   total back under it.
-  **Loaded rooms** (fv6 H-1, §11): a join that would load a room past 90% of the room memory
-  budget (derived from the V8 heap limit, `ROOM_MEMORY_BUDGET_BYTES`), and an update that would
-  grow the loaded rooms past it, → `1013` (`busy`); rooms with no connection are evicted first;
-  one principal keeps at most half of it loaded, the rooms only anonymous visitors hold at most
-  half; at most 4 rooms load at once. Joins to rooms already loaded are never refused for
-  memory. Every penalty is per connection or per principal: an update that would grow the room
-  past the sender's cap is refused and only that connection is closed; the room stays open for
-  everyone else. Attribution entries of shapes deleted more than `ATTRIBUTION_RETENTION_DAYS`
-  (30) ago are pruned from the ledger.
+  **Loaded rooms** (fv6 H-1, fv7 F1, §11): every loaded room's estimated cost is charged to the
+  principal whose join loaded it, and what each accepted update adds to the room to the principal
+  that sent it, in full (never split with the others connected: readers pay nothing); a charge
+  stays while the room stays loaded, also after its principal left, and each save replaces the
+  estimates of the updates since the previous one by what the room measures. A join that would
+  load a room past **85%** of the room memory budget (derived from the V8 heap limit,
+  `ROOM_MEMORY_BUDGET_BYTES`), and an update that would grow the loaded rooms past **80%** of it,
+  → `1013` (`busy`): the 5% between them is always left for loads; rooms with no connection are
+  evicted first. A load or a growing update that would charge its principal past a **third** of
+  the budget (`ROOM_MEMORY_PRINCIPAL_SHARE`; an anonymous visitor a quarter of that, 1/12), or
+  all anonymous visitors together past a **third** (`ROOM_MEMORY_ANON_SHARE`) → `1013`; a stored
+  room whose cost alone passes the joiner's whole share → `4413` `too-large`. At most 4 rooms
+  load at once. Joins to rooms already loaded are never refused for memory. Every penalty is per
+  connection or per principal: an update that would grow the room past the sender's cap is
+  refused and only that connection is closed; the room stays open for everyone else. An update
+  that only removes whole items always passes, and counts what it really deleted. Attribution
+  entries of shapes deleted more than `ATTRIBUTION_RETENTION_DAYS` (30) ago are pruned from the
+  ledger.
 - **Origin** (§4): WebSocket upgrades only from `ALLOWED_ORIGINS`, else `4403`. The HTTP routes
   are `GET`/`HEAD` only (no state-changing HTTP route exists).
 
@@ -558,25 +573,58 @@ that is gone or expired.
   it redoes an item a concurrent edit split or removed (fv6 L-B, ~1 in 30 000 random concurrent
   operations): `CanvasDoc.undo/redo` catch it, the step is lost, the documents stay consistent
   (the throwing transaction still commits what it did, with the origin rewrite).
-- Memory (fv6 H-1): a loaded room costs `ROOM_COST_FACTOR` (24) x its encoded size (content +
-  ledger) plus 32 KiB, an estimate measured on Node 22 with the join frames encoded: geo shapes
-  with a text label 21.6x, geo shapes one per transaction 22.1x, tiny maps 15.6x, texts with
-  every other character deleted 17.5x, strokes grown two numbers at a time 4.2x. The server
-  keeps the estimate of the loaded rooms under a budget derived from the V8 heap limit
-  (`heap_size_limit` − 192 MiB − `WS_OUTGOING_BUDGET_BYTES` − 24 x `MAX_MESSAGE_BYTES`, at least
-  64 MiB; `ROOM_MEMORY_BUDGET_BYTES` overrides it), so it follows `--max-old-space-size` (920 MiB
-  with the chart's 1536 under its 2Gi limit, logged at start and exported as
-  `canvas_room_memory_budget_bytes`). Loads stop at 90% of it (after evicting rooms nobody is connected
-  to), growth at 100%, both with `1013` `busy`; a principal keeps at most
-  `ROOM_MEMORY_PRINCIPAL_SHARE` (half) loaded — each room's cost split between the principals
-  connected to it, never less than 1.25 rooms at the principal's size cap, a quarter for an
-  anonymous visitor — and the rooms only anonymous visitors hold share
-  `ROOM_MEMORY_ANON_SHARE` (half) of it. The estimate is between saves an upper bound (every
-  accepted update counts in full until the next save measures the room again), and content
-  that costs more than 24x its encoded size would be under-counted: none of the shapes measured
-  does. An update's growth counts more for the ledger the stamper writes with it: the room's own
-  ledger/content ratio, between 0.3 and 1.6 (measured at most 1.53, for tiny shapes). A room at `MAX_DOC_BYTES` costs 480 MiB, so the default
-  budget holds one full room plus ~18 MiB of others; size the pod with the chart's formula.
+- Memory (fv6 H-1, fv7 F1/F2): a loaded room costs `ROOM_COST_FACTOR` (44) x its encoded size
+  (content + ledger) plus 32 KiB, an estimate measured on Node 22 with the join frames encoded,
+  rooms built through the real guard and stamper (`server/test/fv7/ratio.ts`): a key overwritten
+  alternately by two client ids 37.7x (39.5x with a new pair of ids every 250 writes), geo shapes
+  whose fields alternate ids 25.1x, one client id per shape 24.8x, geo shapes with a text label
+  21.6x, create/delete 10.1x, strokes 4.2x — the worst plus 10%. Guarding and applying one
+  message needs up to 51-53x its size of heap (`server/test/fv7/guardcost.ts`):
+  `MESSAGE_COST_FACTOR` 60. The server keeps the estimate of the loaded rooms under a budget
+  derived from the V8 heap limit (`heap_size_limit` − 192 MiB − `WS_OUTGOING_BUDGET_BYTES` − 60 x
+  `MAX_MESSAGE_BYTES`, at least 64 MiB; `ROOM_MEMORY_BUDGET_BYTES` overrides it), so it follows
+  `--max-old-space-size` (872 MiB with the chart's 1536 under its 2Gi limit, logged at start and
+  exported as `canvas_room_memory_budget_bytes`; the shares as `canvas_room_memory_share_bytes`,
+  what the principals are charged for as `canvas_room_memory_charged_bytes`).
+  **Accounting.** Each room's cost is charged: at load, to the principal whose join loaded it;
+  then every accepted update, to the principal that sent it, by what it added to the room's
+  estimate (content, and the ledger the stamper wrote for it), in full. The charges of a room
+  stay while it is loaded, whoever keeps it loaded — a principal that leaves keeps paying for what
+  it loaded and wrote until the room is evicted — and are never moved to the principals that
+  only read. Every save measures the room: the principals that wrote since the previous save
+  share what the room really changed by since then, in proportion to the estimates of their own
+  updates (an over-estimate, or a delete, is given back to them; nobody else's charge moves).
+  So the charges of a room always add up to its cost, and the loaded rooms cost what the
+  principals are charged together.
+  **Bounds.** Loads stop at 85% of the budget (after evicting rooms nobody is connected to),
+  growth at 80%, both with `1013` `busy`. A principal may be charged at most
+  `ROOM_MEMORY_PRINCIPAL_SHARE` (a third of the budget; an anonymous visitor a quarter of that),
+  all anonymous visitors together `ROOM_MEMORY_ANON_SHARE` (a third; the two shares together may
+  not pass 80%). One user plus every anonymous visitor are therefore charged at most two thirds
+  of the budget: the loaded rooms of everybody else always have the rest to load into, and growth
+  never takes the last 5% loads need. Before (fv7 F1) a writer was charged its growth divided by
+  the principals present, nothing re-charged it when they left, and growth could take the budget
+  to 100% while loads stopped at 90%: one user who grew rooms while others sat in them held the
+  whole budget and every new room was refused for everybody.
+  **Caps.** A room at `MAX_DOC_BYTES` must fit one share with a 25% margin (44 x 1.25 x cap +
+  32 KiB ≤ a third of the budget), an anonymous room at `ANON_MAX_DOC_BYTES` an anonymous
+  visitor's share: when the memory is too small for them, the server lowers the caps to what
+  fits at start, the message caps to the room caps (and to the message size the budget reserves),
+  the image caps to 70% of the message caps, and logs a `memory sizing:` warning for each; it
+  also warns when the budget is smaller than one full room. The defaults fit the chart's 2 GiB
+  (a share of 290 MiB holds a full 5 MiB room, 220 MiB); at 1 GiB the caps go down to ~1.5 MiB.
+  A stored room whose cost alone passes the joiner's share (stored under a larger cap) is refused
+  `4413` `too-large`: it can never load for that principal. A `pub/` room written by signed-in
+  users past ~1.3 MiB costs more than an anonymous visitor's share: it opens for anonymous
+  visitors only while someone keeps it loaded.
+  **Known limits.** The shares are per principal: several signed-in accounts acting together
+  hold a third each. Writers of the same room within one save period share its measured growth
+  by their estimates, so a writer whose updates are over-estimated less than a co-writer's pays a
+  little of the co-writer's part (never more than its own estimates). A principal that loaded or
+  wrote a room keeps paying for it while others keep it loaded. The estimate is between saves an
+  upper bound (every accepted update counts in full until the next save measures the room
+  again); an update's growth counts more for the ledger the stamper writes with it: the room's
+  own ledger/content ratio, between 0.3 and 1.6 (measured at most 1.53, for tiny shapes).
 
 - A client that relays someone else's structs (e.g. a tab reconnecting after a server CRASH that
   lost unsaved edits of other people) delivers them in its own step 2: the stamper attributes

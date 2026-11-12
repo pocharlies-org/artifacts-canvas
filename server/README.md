@@ -69,9 +69,9 @@ an in-memory object store; the S3 store is covered against s3rver — no Docker 
 | `MAX_CONNS_PER_ROOM` / `MAX_CONNS_PER_ROOM_ANON` / `MAX_CONNS_PER_ANON_VISITOR` | `50` / `10` / `2` | Over capacity → close `1013`. |
 | `MSG_RATE_PER_SEC` / `MSG_BURST` | `120` / `240` | Over → NOTICE + `4429`. |
 | `ANON_MSG_RATE_PER_SEC` / `ANON_MSG_BURST` | `30` / `60` | |
-| `MAX_DOC_BYTES` / `ANON_MAX_DOC_BYTES` | `20 MiB` / `5 MiB` | An update that would grow the doc past the sender's cap → NOTICE + `4413` for that connection only. |
-| `MAX_MESSAGE_BYTES` / `ANON_MAX_MESSAGE_BYTES` | `8 MiB` / `2 MiB` | |
-| `MAX_IMAGE_BYTES` / `ANON_MAX_IMAGE_BYTES` | `2 MiB` / `1 MiB` | Advertised to the client in the wrapper config. |
+| `MAX_DOC_BYTES` / `ANON_MAX_DOC_BYTES` | `5 MiB` / `1.25 MiB` | An update that would grow the doc past the sender's cap → NOTICE + `4413` for that connection only. Lowered at start (warning) to what one share of the room memory budget holds. |
+| `MAX_MESSAGE_BYTES` / `ANON_MAX_MESSAGE_BYTES` | `4 MiB` / `1 MiB` | Never above the room caps. |
+| `MAX_IMAGE_BYTES` / `ANON_MAX_IMAGE_BYTES` | `2 MiB` / `512 KiB` | Advertised to the client in the wrapper config (at most 70% of the message cap). |
 | `ARTIFACT_PREFIXES` | *(any valid key)* | Optional key-space allowlist (comma separated). |
 | `ANON_ALLOWED_PREFIXES` | `pub/` | Anonymous is only ever accepted here. |
 | `EXPIRED_REASONS` / `GONE_REASONS` | `expired` / `object-missing` | Authz `reason` values (core gate vocabulary) treated as expired / gone. |

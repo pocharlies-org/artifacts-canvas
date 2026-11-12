@@ -99,12 +99,16 @@ limits:
   msgBurst: 240
   anonMsgRatePerSec: 30
   anonMsgBurst: 60
-  maxDocBytes: 20971520 # 20 MiB
-  anonMaxDocBytes: 5242880 # 5 MiB
-  maxMessageBytes: 8388608 # 8 MiB
-  anonMaxMessageBytes: 2097152 # 2 MiB
-  maxImageBytes: 2097152
-  anonMaxImageBytes: 1048576
+  # Size caps (content + ledger per room; per message; pasted images). A full room must fit one
+  # principal's share of the room memory budget (see "Memory" below): the server lowers these to
+  # what the budget holds and warns at start ("memory sizing: ...") when the pod's memory is too
+  # small for them. The defaults fit the default 2Gi.
+  maxDocBytes: 5242880 # 5 MiB
+  anonMaxDocBytes: 1310720 # 1.25 MiB
+  maxMessageBytes: 4194304 # 4 MiB
+  anonMaxMessageBytes: 1048576 # 1 MiB
+  maxImageBytes: 2097152 # 2 MiB
+  anonMaxImageBytes: 524288 # 512 KiB
   # A peer that stops reading is dropped once the server holds this much for it (beyond the
   # join burst).
   wsMaxBufferedBytes: 8388608 # 8 MiB
@@ -172,11 +176,12 @@ limits:
   # Loaded-room memory budget in bytes (see "Memory" below). 0 = derived by the server from the
   # V8 heap limit, so it follows nodeMaxOldSpaceMb; set it only to go lower.
   roomMemoryBudgetBytes: 0
-  # Share of it one principal may keep loaded (each room's cost split between the principals
-  # connected to it; never less than 1.25 rooms at the principal's size cap; an anonymous visitor
-  # gets a quarter), and the share of the rooms only anonymous visitors hold, together.
-  roomMemoryPrincipalShare: 0.5
-  roomMemoryAnonShare: 0.5
+  # What one logged-in principal may be charged for (the rooms it loaded and everything it wrote,
+  # in full, while those rooms stay loaded): a third of the budget; an anonymous visitor a quarter
+  # of that (1/12). And what all anonymous visitors together may be charged for: a third. The two
+  # together must stay <= 0.8 (the growth threshold), so others can always load and grow.
+  roomMemoryPrincipalShare: 0.3333
+  roomMemoryAnonShare: 0.3333
   # Optional key-space allowlist, e.g. ["runs/", "pub/"]. Empty = any structurally valid key.
   artifactPrefixes: []
   anonAllowedPrefixes: ["pub/"]
@@ -221,26 +226,37 @@ deployment:
 #   room budget  = heap limit
 #                  - 192 MiB                          (Node runtime, libraries, the HTTP side)
 #                  - limits.wsOutgoingBudgetBytes     (bytes held for slow peers)
-#                  - 24 x limits.maxMessageBytes      (one max-size message being processed)
-#   loaded room  = 24 x (content + ledger) + 32 KiB   (measured fv6 H-1: 4x-22x by content kind)
+#                  - 60 x limits.maxMessageBytes      (one max-size message being guarded and
+#                                                      applied: measured 51-53x, fv7 F2)
+#   loaded room  = 44 x (content + ledger) + 32 KiB   (measured 4x-39.5x by content kind, fv7 F2)
 #
-# A join that would load a room past 90% of the budget, and an update that would grow the loaded
-# rooms past it, are refused with 1013 (the client retries; joins to loaded rooms never are);
-# a principal keeps at most roomMemoryPrincipalShare of it loaded (never less than 1.25 rooms at
-# its size cap), the rooms only anonymous visitors hold at most roomMemoryAnonShare.
-# Defaults: 1560 - 192 - 256 - 192 = 920 MiB of rooms (the server logs it at start and exports
-# canvas_room_memory_budget_bytes): one full 20 MiB room (480 MiB) plus ~18 MiB of others, two
-# ~17 MB rooms, or (the anonymous half) three full anonymous 5 MiB rooms (120 MiB each).
+# Each loaded room's cost is charged to the principal whose join loaded it, and what every update
+# adds to the principal that wrote it, in full (readers pay nothing; a charge stays while the room
+# stays loaded, also after its principal left; each save replaces the estimates by what the room
+# measures). A join that would load a room past 85% of the budget, and an update that would grow
+# the loaded rooms past 80% of it, are refused with 1013 (the client retries; joins to loaded rooms
+# never are): the 5% between them is always left for loads. A principal may be charged at most
+# roomMemoryPrincipalShare (a third), an anonymous visitor a quarter of that, all anonymous
+# visitors together roomMemoryAnonShare (a third): one user and every anonymous visitor together
+# hold at most two thirds, and the rest can always load.
+# A room at the size cap must fit one share (44 x 1.25 x maxDocBytes + 32 KiB <= a third of the
+# budget): the server lowers the caps to what fits, and the message and image caps with them,
+# with a warning at start; with a budget smaller than one full room it warns too.
+# Defaults: 1560 - 192 - 256 - 240 = 872 MiB of rooms (the server logs it at start and exports
+# canvas_room_memory_budget_bytes and the shares as canvas_room_memory_share_bytes): a share of
+# 290 MiB holds one full 5 MiB room (220 MiB) and an anonymous visitor's 72 MiB one full 1.25 MiB
+# anonymous room; loads up to 741 MiB, growth up to 698 MiB. At 1Gi (nodeMaxOldSpaceMb 768) the
+# budget is ~252 MiB and the caps are lowered to ~1.5 MiB (anonymous ~0.38 MiB), with warnings.
 #
 # Everything the formula subtracts adds up to the heap limit; what lives outside the V8 heap
 # (socket buffers, encoded frames, native code) needs the rest of the container:
 #
 #   limits.memory >= nodeMaxOldSpaceMb / 0.75          (1536 / 0.75 = 2048 MiB = 2Gi)
 #
-# Change both together: the budget follows. Measured on the full system (fv6 Q4, 2 GiB): ten
-# rooms of ~17 MB each opened and filled by one user, then by three, then 14 anonymous rooms at
-# the 5 MiB cap: no OOM, no restart (before: OOM-killed in a loop). The previous sizing (fv5) had
-# no budget: the limit held two full rooms and the server loaded as many as were opened.
+# Change both together: the budget follows. Measured on the full system (fv7, 2 GiB and 1 GiB): one
+# user filling rooms while anonymous visitors or signed-in co-viewers sat in them, who then left,
+# is stopped at its share and a second user opens a new artifact; no OOM, no restart (before: that
+# user held 856 MiB of the 920 MiB budget and every new room was refused 1013 for everybody).
 nodeMaxOldSpaceMb: 1536
 resources:
   requests:
