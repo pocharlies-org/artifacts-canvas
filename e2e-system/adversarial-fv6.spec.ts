@@ -235,9 +235,15 @@ test('Q4b: three ACL members fill two rooms each: each is stopped at its share, 
   const principal0 = metric('canvas_ws_rejected_total', 'reason="room_memory_principal"');
   const total0 = metric('canvas_ws_rejected_total', 'reason="room_memory"');
   const held: Raw[] = [];
+  const keepers: Raw[] = [];
   const filled: number[] = [];
   let peak = mem();
   for (let r = 0; r < 6; r++) {
+    // a reader socket of the same user keeps the room loaded once the writer is refused (a room
+    // nobody is connected to is evicted, and its charge with it)
+    const keep = new Raw(wsUrl(pubs[r].canvas), cookies[Math.floor(r / 2)]);
+    keepers.push(keep);
+    await keep.ready();
     const c = new Raw(wsUrl(pubs[r].canvas), cookies[Math.floor(r / 2)]);
     held.push(c);
     await c.ready();
@@ -262,7 +268,8 @@ test('Q4b: three ACL members fill two rooms each: each is stopped at its share, 
   const rtt = await editRtt(visitor, held[0], `v${run}`);
   peak = Math.max(peak, mem());
   const s1 = state();
-  log('Q4b', { full, filled, closes: held.map((h) => h.closeCode), refusedPrincipal: principal, refusedTotal: total, visitorRttMs: rtt, peakMiB: peak, before: s0, after: s1 });
+  log('Q4b', { full, filled, closes: held.map((h) => h.closeCode), keepersOpen: keepers.filter((k) => k.closeCode === null).length, refusedPrincipal: principal, refusedTotal: total, visitorRttMs: rtt, peakMiB: peak, before: s0, after: s1 });
+  expect(keepers.every((k) => k.closeCode === null)).toBe(true);
   expect(s1).toEqual(s0);
   expect(peak).toBeLessThan(2048);
 });

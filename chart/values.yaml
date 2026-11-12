@@ -245,8 +245,9 @@ deployment:
 # Defaults: 1560 - 192 - 256 - 240 = 872 MiB of rooms (the server logs it at start and exports
 # canvas_room_memory_budget_bytes and the shares as canvas_room_memory_share_bytes): a share of
 # 290 MiB holds one full 5 MiB room (220 MiB) and an anonymous visitor's 72 MiB one full 1.25 MiB
-# anonymous room; loads up to 741 MiB, growth up to 698 MiB. At 1Gi (nodeMaxOldSpaceMb 768) the
-# budget is ~252 MiB and the caps are lowered to ~1.5 MiB (anonymous ~0.38 MiB), with warnings.
+# anonymous room; loads up to 741 MiB, growth up to 698 MiB. At 1Gi (nodeMaxOldSpaceMb 768, heap
+# limit 780 MiB in the image) the budget is 243 MiB and the caps are lowered to 1.48 MiB
+# (anonymous 0.37 MiB, messages with them), with a warning for each.
 #
 # Everything the formula subtracts adds up to the heap limit; what lives outside the V8 heap
 # (socket buffers, encoded frames, native code) needs the rest of the container:

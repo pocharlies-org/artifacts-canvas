@@ -615,7 +615,7 @@ that is gone or expired.
   (a share of 290 MiB holds a full 5 MiB room, 220 MiB); at 1 GiB the caps go down to ~1.5 MiB.
   A stored room whose cost alone passes the joiner's share (stored under a larger cap) is refused
   `4413` `too-large`: it can never load for that principal. A `pub/` room written by signed-in
-  users past ~1.3 MiB costs more than an anonymous visitor's share: it opens for anonymous
+  users past ~1.6 MiB costs more than an anonymous visitor's share: it opens for anonymous
   visitors only while someone keeps it loaded.
   **Known limits.** The shares are per principal: several signed-in accounts acting together
   hold a third each. Writers of the same room within one save period share its measured growth
