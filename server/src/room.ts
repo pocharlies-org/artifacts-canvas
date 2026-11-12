@@ -4,7 +4,7 @@ import * as awarenessProtocol from 'y-protocols/awareness';
 import * as syncProtocol from 'y-protocols/sync';
 import { writeUpdate } from 'y-protocols/sync';
 import type { WebSocket } from 'ws';
-import type { Config } from './config.js';
+import { roomCost, type Config } from './config.js';
 import type { Logger } from './logging.js';
 import type { Metrics } from './metrics.js';
 import { canvasLedgerKey, canvasObjectKey } from './paths.js';
@@ -139,6 +139,17 @@ export class Room {
   pendingJoins = 0;
   /** live connections per principal (`u:<id>` / `a:<visitor>`): who keeps the room loaded */
   readonly principals = new Map<string, number>();
+  /**
+   * The room's memory, charged to the principals that brought it in (fv7 F1, RoomManager): the
+   * room's cost at load to the principal that loaded it, and what every accepted update added to
+   * the room's size estimate to the principal that sent it, in full. Nobody else is charged for
+   * them (a principal that only reads in the room pays nothing), and they stay while the room is
+   * loaded, whoever keeps it loaded (a charged principal that leaves still pays). Together they
+   * are the room's cost (settleCharges). Cleared when the room is evicted.
+   */
+  private readonly charges = new Map<string, Charge>();
+  /** content bytes of the updates the document emitted (Yjs' own encoding of what changed) */
+  contentChangedBytes = 0;
   private lastPrune = 0;
   ttlTag: string | null = null;
   private saveTimer?: ReturnType<typeof setTimeout>;
@@ -169,6 +180,7 @@ export class Room {
     });
 
     this.doc.on('update', (update: Uint8Array, origin: unknown) => {
+      if (origin !== 'load') this.contentChangedBytes += update.byteLength;
       const e = encoding.createEncoder();
       encoding.writeVarUint(e, MSG_SYNC);
       writeUpdate(e, update);
@@ -289,7 +301,6 @@ export class Room {
   /** A joined connection: it counts for its principal (who keeps the room loaded). */
   attach(conn: Conn): void {
     this.conns.set(conn.ws, conn);
-    if (conn.identity.anonymous) this.anonConns++;
     this.principals.set(conn.principal, (this.principals.get(conn.principal) ?? 0) + 1);
   }
 
@@ -297,17 +308,79 @@ export class Room {
   detach(conn: Conn): void {
     if (this.conns.get(conn.ws) !== conn) return;
     this.conns.delete(conn.ws);
-    if (conn.identity.anonymous) this.anonConns--;
     const n = (this.principals.get(conn.principal) ?? 1) - 1;
     if (n > 0) this.principals.set(conn.principal, n);
     else this.principals.delete(conn.principal);
   }
 
-  /** Every live connection is anonymous (the room is held by anonymous visitors only). */
-  anonOnly(): boolean {
-    return this.conns.size > 0 && this.anonConns === this.conns.size;
+  /** Estimated resident cost of the room as it is now (the memory budget's measure). */
+  get cost(): number {
+    return roomCost(this.deps.cfg, this.bytes);
   }
-  private anonConns = 0;
+
+  /**
+   * Charge `bytes` of the memory budget to `principal` (see `charges`). `written`: it comes from
+   * an update the principal sent (settled against the room's size at the next save).
+   */
+  charge(principal: string, anonymous: boolean, bytes: number, written = true): void {
+    if (!(bytes > 0)) return;
+    let c = this.charges.get(principal);
+    if (!c) this.charges.set(principal, (c = { anonymous, bytes: 0, written: 0 }));
+    c.bytes += bytes;
+    if (written) c.written += bytes;
+  }
+
+  /** What `principal` is charged for this room. */
+  chargeOf(principal: string): number {
+    return this.charges.get(principal)?.bytes ?? 0;
+  }
+
+  /** What the anonymous visitors together are charged for this room. */
+  anonCharged(): number {
+    let n = 0;
+    for (const c of this.charges.values()) if (c.anonymous) n += c.bytes;
+    return n;
+  }
+
+  /** Every charge of the room, by principal (the largest first is not guaranteed). */
+  chargeEntries(): IterableIterator<[string, Readonly<Charge>]> {
+    return this.charges.entries();
+  }
+
+  /**
+   * Bring the charges to the room's measured cost (fv7 F1), after a save or a load measured the
+   * room. Between two measures each accepted update was charged its estimate in full; the
+   * principals that wrote since the previous measure now share, in proportion to those estimates,
+   * what the room really changed by since then (when it shrank, deletes, the shrink comes off
+   * them the same way, never below zero). Nobody else's charge moves, so a principal that wrote
+   * nothing since is never charged for others nor relieved by them. When nobody wrote since: a
+   * shrink (pruned attribution) comes off every charge in proportion, a growth (a load that
+   * migrated or repaired the stored room) goes to `fallback`, else to the largest charge.
+   */
+  settleCharges(fallback?: { principal: string; anonymous: boolean }): void {
+    if (this.charges.size === 0 && !fallback) return;
+    const target = this.cost;
+    let total = 0;
+    let written = 0;
+    for (const c of this.charges.values()) {
+      total += c.bytes;
+      written += c.written;
+    }
+    const changed = target - (total - written);
+    if (written > 0) {
+      for (const c of this.charges.values()) if (c.written > 0) c.bytes = Math.max(0, c.bytes - c.written + (changed * c.written) / written);
+    } else if (changed < 0 && total > 0) {
+      for (const c of this.charges.values()) c.bytes = (c.bytes * target) / total;
+    } else if (changed > 0) {
+      let to = fallback ? { principal: fallback.principal, anonymous: fallback.anonymous } : null;
+      if (!to) {
+        let max = -1;
+        for (const [p, c] of this.charges) if (c.bytes > max) (max = c.bytes), (to = { principal: p, anonymous: c.anonymous });
+      }
+      if (to) this.charge(to.principal, to.anonymous, changed, false);
+    }
+    for (const c of this.charges.values()) c.written = 0;
+  }
 
   /** Nobody is connected nor about to: the room can be evicted. */
   get idle(): boolean {
@@ -428,6 +501,8 @@ export class Room {
         const bytes = encodeIntegratedState(this.doc);
         this.approxBytes = bytes.byteLength;
         this.ledgerApproxBytes = ledgerBytes.byteLength;
+        // the room is measured: its charges follow (fv7 F1)
+        this.settleCharges();
         this.deps.saveBudget?.charge(performance.now() - t0);
         await store.put(this.ledgerKey, ledgerBytes, this.ttlTag ?? undefined);
         await store.put(this.objectKey, bytes, this.ttlTag ?? undefined);
@@ -530,6 +605,7 @@ export class Room {
     this.contentSnap = null;
     this.ledgerSnap = null;
     this.step1Cache = null;
+    this.charges.clear();
   }
 
   disposed = false;
@@ -545,11 +621,26 @@ export class Room {
   }
 }
 
-/** A refused join or load: the client is told `busy` and closed with 1013 (it retries). */
+/**
+ * A refused join or load: the client is told `busy` and closed with 1013 (it retries); a room too
+ * large to ever load for this principal (`room_too_large`) is closed 4413 `too-large` instead.
+ */
 export class BusyError extends Error {
   constructor(readonly reason: string) {
     super(`busy: ${reason}`);
   }
+
+  get terminal(): boolean {
+    return this.reason === 'room_too_large';
+  }
+}
+
+/** One principal's charge for a room (see Room.charges). */
+export interface Charge {
+  anonymous: boolean;
+  bytes: number;
+  /** charged for its updates since the room was last measured (see settleCharges) */
+  written: number;
 }
 
 /** A document encoded in full for joins, and the messages broadcast since (see Room). */

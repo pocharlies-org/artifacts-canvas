@@ -148,23 +148,29 @@ export interface Config {
   anonIpMintRatePerMin: number;
   anonIpMintBurst: number;
   /**
-   * Loaded-room memory (fv6 H-1). A loaded room costs about `roomCostFactor` x its encoded size
-   * (content + ledger) plus ROOM_BASE_COST_BYTES. Loading a room past `roomMemoryBudgetBytes`
-   * (after evicting idle rooms) is refused with 1013, and so is an update that grows the loaded
-   * rooms past it. Default budget: derived from the V8 heap limit (see roomMemoryBudget()).
+   * Loaded-room memory (fv6 H-1, fv7 F1). A loaded room costs about `roomCostFactor` x its encoded
+   * size (content + ledger) plus ROOM_BASE_COST_BYTES. Loads stop at LOAD_FRACTION of
+   * `roomMemoryBudgetBytes` (after evicting idle rooms), growth at GROWTH_FRACTION, both with
+   * 1013. Default budget: derived from the V8 heap limit (see deriveRoomLimits()).
    */
   roomMemoryBudgetBytes: number;
   /** where the budget came from: `env` (ROOM_MEMORY_BUDGET_BYTES) or `heap` (derived) */
   roomMemoryBudgetSource: 'env' | 'heap';
   roomCostFactor: number;
   /**
-   * Share of the budget one principal may keep loaded (each room's cost is split between the
-   * principals connected to it); never less than one room at the principal's size cap. An
-   * anonymous visitor gets a quarter of it, and the rooms only anonymous visitors hold share
-   * `roomMemoryAnonShare` of the budget together.
+   * Fraction of the budget one logged-in principal may be charged for (fv7 F1: the loads it made
+   * and every byte it wrote, in full, while those rooms stay loaded). An anonymous visitor gets a
+   * quarter of it (ANON_VISITOR_SHARE_RATIO), and all anonymous visitors together
+   * `roomMemoryAnonShare`. Their sum is at most GROWTH_FRACTION.
    */
   roomMemoryPrincipalShare: number;
   roomMemoryAnonShare: number;
+  /**
+   * The size caps as configured, before deriveRoomLimits() lowered them to what the memory
+   * budget holds (fv7 F1: a full room must fit one principal's share), and why (startup warnings).
+   */
+  configuredLimits: { maxDocBytes: number; anonMaxDocBytes: number; maxMessageBytes: number; anonMaxMessageBytes: number; maxImageBytes: number; anonMaxImageBytes: number };
+  memoryWarnings: string[];
   /** Advertised to the client in the wrapper config (client-side cap for pasted images). */
   maxImageBytes: number;
   anonMaxImageBytes: number;
@@ -305,10 +311,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     msgBurst: num(env, 'MSG_BURST', 240),
     anonMsgRatePerSec: num(env, 'ANON_MSG_RATE_PER_SEC', 30),
     anonMsgBurst: num(env, 'ANON_MSG_BURST', 60),
-    maxDocBytes: num(env, 'MAX_DOC_BYTES', 20 * 1024 * 1024),
-    anonMaxDocBytes: num(env, 'ANON_MAX_DOC_BYTES', 5 * 1024 * 1024),
-    maxMessageBytes: num(env, 'MAX_MESSAGE_BYTES', 8 * 1024 * 1024),
-    anonMaxMessageBytes: num(env, 'ANON_MAX_MESSAGE_BYTES', 2 * 1024 * 1024),
+    maxDocBytes: num(env, 'MAX_DOC_BYTES', 5 * 1024 * 1024),
+    anonMaxDocBytes: num(env, 'ANON_MAX_DOC_BYTES', 1280 * 1024),
+    maxMessageBytes: num(env, 'MAX_MESSAGE_BYTES', 4 * 1024 * 1024),
+    anonMaxMessageBytes: num(env, 'ANON_MAX_MESSAGE_BYTES', 1024 * 1024),
     wsMaxBufferedBytes: num(env, 'WS_MAX_BUFFERED_BYTES', 8 * 1024 * 1024),
     wsSlowConsumerMs: num(env, 'WS_SLOW_CONSUMER_MS', 10_000),
     wsOutgoingBudgetBytes: num(env, 'WS_OUTGOING_BUDGET_BYTES', 256 * 1024 * 1024),
@@ -345,10 +351,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     roomMemoryBudgetBytes: 0, // set below (depends on other limits)
     roomMemoryBudgetSource: 'heap',
     roomCostFactor: num(env, 'ROOM_COST_FACTOR', ROOM_COST_FACTOR),
-    roomMemoryPrincipalShare: frac(env, 'ROOM_MEMORY_PRINCIPAL_SHARE', 0.5),
-    roomMemoryAnonShare: frac(env, 'ROOM_MEMORY_ANON_SHARE', 0.5),
+    roomMemoryPrincipalShare: frac(env, 'ROOM_MEMORY_PRINCIPAL_SHARE', 1 / 3),
+    roomMemoryAnonShare: frac(env, 'ROOM_MEMORY_ANON_SHARE', 1 / 3),
+    configuredLimits: { maxDocBytes: 0, anonMaxDocBytes: 0, maxMessageBytes: 0, anonMaxMessageBytes: 0, maxImageBytes: 0, anonMaxImageBytes: 0 }, // set below
+    memoryWarnings: [],
     maxImageBytes: num(env, 'MAX_IMAGE_BYTES', 2 * 1024 * 1024),
-    anonMaxImageBytes: num(env, 'ANON_MAX_IMAGE_BYTES', 1 * 1024 * 1024),
+    anonMaxImageBytes: num(env, 'ANON_MAX_IMAGE_BYTES', 512 * 1024),
     artifactPrefixes: list(env, 'ARTIFACT_PREFIXES', []),
     anonAllowedPrefixes: list(env, 'ANON_ALLOWED_PREFIXES', ['pub/']),
     // Reason vocabulary of the core gate (gate/gate.py, docs/plugins.md §1): `expired` when the
@@ -379,38 +387,66 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (cfg.anonMaxDocBytes > cfg.maxDocBytes) {
     throw new Error('ANON_MAX_DOC_BYTES must be <= MAX_DOC_BYTES');
   }
-  if (env.ROOM_MEMORY_BUDGET_BYTES !== undefined && env.ROOM_MEMORY_BUDGET_BYTES !== '') {
-    cfg.roomMemoryBudgetBytes = num(env, 'ROOM_MEMORY_BUDGET_BYTES', 0);
-    cfg.roomMemoryBudgetSource = 'env';
-  } else {
-    cfg.roomMemoryBudgetBytes = roomMemoryBudget(v8.getHeapStatistics().heap_size_limit, cfg);
+  if (cfg.roomMemoryPrincipalShare + cfg.roomMemoryAnonShare > GROWTH_FRACTION + 1e-9) {
+    // fv7 F1: one logged-in user and every anonymous visitor together must leave room to load
+    throw new Error(`ROOM_MEMORY_PRINCIPAL_SHARE + ROOM_MEMORY_ANON_SHARE must be <= ${GROWTH_FRACTION}`);
   }
+  const envBudget = env.ROOM_MEMORY_BUDGET_BYTES !== undefined && env.ROOM_MEMORY_BUDGET_BYTES !== '' ? num(env, 'ROOM_MEMORY_BUDGET_BYTES', 0) : null;
+  deriveRoomLimits(cfg, v8.getHeapStatistics().heap_size_limit, envBudget);
   return cfg;
 }
 
 /**
  * Measured resident cost of a loaded room per encoded byte (content + ledger), V8 heap and
- * buffers together, with its join frames encoded (fv6 H-1; Node 22 on x86-64, `--expose-gc`,
- * rooms loaded through Room.load): geo shapes with a text label (the verifier's q4 room) 21.7x,
- * geo shapes one per transaction 22.1x, texts with every other character deleted 17.5x, tiny maps
- * 15.6x, text typed by two people one character at a time 12.7x, strokes grown two numbers at a
- * time 4.2x. The worst, rounded up.
+ * buffers together, with its join frames encoded (Node 22 on x86-64, `--expose-gc`, rooms built
+ * through the real guard and stamper and loaded through Room.load: server/test/fv7/ratio.ts).
+ * fv7 F2: a key overwritten alternately by two client ids 37.7x (`meta-overwrite`,
+ * `alt-overwrite`), the same with a new pair of ids every 250 writes 39.5x, geo shapes whose
+ * fields alternate ids 25.1x, one client id per shape 24.8x, create/delete 10.1x (fv6: geo shapes
+ * with a text label 21.7x, strokes 4.2x). The worst, plus 10%.
  */
-export const ROOM_COST_FACTOR = 24;
+export const ROOM_COST_FACTOR = 44;
 /** Resident cost of an empty loaded room (two documents, awareness, caches): measured 11-12 KiB. */
 export const ROOM_BASE_COST_BYTES = 32 * 1024;
+
+/** Estimated resident cost of a loaded room of `bytes` encoded bytes (content + ledger). */
+export function roomCost(cfg: Pick<Config, 'roomCostFactor'>, bytes: number): number {
+  return ROOM_BASE_COST_BYTES + cfg.roomCostFactor * bytes;
+}
+
 /** What the process needs besides rooms: runtime, libraries, the HTTP side (heap). */
 export const RUNTIME_RESERVE_BYTES = 192 * 1024 * 1024;
-/** Decoding, checking and applying one message costs about this many times its size (fv5 H-1). */
-export const MESSAGE_COST_FACTOR = 24;
+/**
+ * Heap needed to guard and apply one message, per byte (fv7 F2, server/test/fv7/guardcost.ts):
+ * the guard of a 7.98 MiB update of alternating overwrites needs a heap limit of 423-438 MiB (13
+ * MiB of it the runtime), 51-53x; geo shapes need less. Rounded up to 60.
+ */
+export const MESSAGE_COST_FACTOR = 60;
 /** The budget never goes below this (a heap too small for the limits gets a warning at start). */
 export const MIN_ROOM_MEMORY_BUDGET_BYTES = 64 * 1024 * 1024;
+/** Loads (rooms brought into memory) stop at this fraction of the budget (fv7 F1). */
+export const LOAD_FRACTION = 0.85;
+/**
+ * Growth (updates that make loaded rooms bigger) stops at this fraction: the gap to LOAD_FRACTION
+ * (5% of the budget, 43 MiB with the chart's defaults) is always left for loads, so a room of
+ * typical size still opens when the loaded rooms have grown as far as they may (fv7 F1).
+ */
+export const GROWTH_FRACTION = 0.8;
+/** An anonymous visitor's share is this fraction of a logged-in principal's (1/12 of the budget by default). */
+export const ANON_VISITOR_SHARE_RATIO = 0.25;
+/**
+ * A room at the size cap must fit its principal's share with this margin (the last update that
+ * reaches the cap is estimated with the ledger it will add): cost(1.25 x cap) <= share.
+ */
+export const FULL_ROOM_MARGIN = 1.25;
+/** A data-URL image (4/3 of its bytes) plus its shape must fit one message: image cap <= 0.7 x message cap. */
+const IMAGE_PER_MESSAGE = 0.7;
 
 /**
- * Default loaded-room budget: what the V8 heap can hold besides the runtime, the outgoing budget
- * and one message of the maximum size being processed:
+ * Loaded-room budget derived from the heap: what the V8 heap can hold besides the runtime, the
+ * outgoing budget and one message of `maxMessageBytes` being processed:
  *
- *   heap_size_limit - RUNTIME_RESERVE_BYTES - WS_OUTGOING_BUDGET_BYTES - 24 x MAX_MESSAGE_BYTES
+ *   heap_size_limit - RUNTIME_RESERVE_BYTES - WS_OUTGOING_BUDGET_BYTES - 60 x MAX_MESSAGE_BYTES
  *
  * heap_size_limit follows --max-old-space-size (the chart's nodeMaxOldSpaceMb), so the budget is
  * right for any memory setting. The outgoing buffers live outside the heap: counting them here
@@ -419,4 +455,83 @@ export const MIN_ROOM_MEMORY_BUDGET_BYTES = 64 * 1024 * 1024;
 export function roomMemoryBudget(heapLimit: number, cfg: Pick<Config, 'wsOutgoingBudgetBytes' | 'maxMessageBytes'>): number {
   const b = heapLimit - RUNTIME_RESERVE_BYTES - cfg.wsOutgoingBudgetBytes - MESSAGE_COST_FACTOR * cfg.maxMessageBytes;
   return Math.max(MIN_ROOM_MEMORY_BUDGET_BYTES, Math.floor(b));
+}
+
+/** The biggest room (encoded bytes) whose cost, with FULL_ROOM_MARGIN, fits `share` bytes of memory. */
+export function roomCapFor(share: number, costFactor: number): number {
+  return Math.max(0, Math.floor((share - ROOM_BASE_COST_BYTES) / (FULL_ROOM_MARGIN * costFactor)));
+}
+
+/**
+ * fv7 F1: the budget and the size caps that go with it. A principal is never charged more than
+ * its share, so a room at MAX_DOC_BYTES must fit that share (with FULL_ROOM_MARGIN); when it does
+ * not, the cap of this deployment is lowered to what fits and a warning is logged at start (the
+ * 1 GiB case: a full 20 MiB room cost more than the whole budget). A message can never add more
+ * than a room holds, so the message caps follow the room caps, and the heap budget is derived
+ * with the message cap that results (the largest m <= MAX_MESSAGE_BYTES with m <= the room cap
+ * of the budget left after reserving 60 x m). Image caps follow the message caps.
+ */
+export function deriveRoomLimits(cfg: Config, heapLimit: number, envBudget: number | null): void {
+  const MiB = (b: number) => `${(b / 1048576).toFixed(2)} MiB`;
+  const conf = {
+    maxDocBytes: cfg.maxDocBytes,
+    anonMaxDocBytes: cfg.anonMaxDocBytes,
+    maxMessageBytes: cfg.maxMessageBytes,
+    anonMaxMessageBytes: cfg.anonMaxMessageBytes,
+    maxImageBytes: cfg.maxImageBytes,
+    anonMaxImageBytes: cfg.anonMaxImageBytes,
+  };
+  cfg.configuredLimits = conf;
+  const warnings: string[] = [];
+  const f = cfg.roomCostFactor;
+  const userCap = (budget: number) => roomCapFor(budget * cfg.roomMemoryPrincipalShare, f);
+  let budget: number;
+  // the message size the budget leaves room for (the message caps never go above it)
+  let reserved = conf.maxMessageBytes;
+  if (envBudget !== null) {
+    budget = envBudget;
+    cfg.roomMemoryBudgetSource = 'env';
+  } else {
+    cfg.roomMemoryBudgetSource = 'heap';
+    const budgetFor = (m: number) => roomMemoryBudget(heapLimit, { wsOutgoingBudgetBytes: cfg.wsOutgoingBudgetBytes, maxMessageBytes: m });
+    const top = Math.min(conf.maxMessageBytes, conf.maxDocBytes);
+    let m = top;
+    if (userCap(budgetFor(top)) < top) {
+      // userCap(budgetFor(m)) - m decreases with m: the largest m that fits, by bisection
+      let lo = 0;
+      let hi = top;
+      while (hi - lo > 1) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (userCap(budgetFor(mid)) >= mid) lo = mid;
+        else hi = mid;
+      }
+      m = lo;
+    }
+    budget = budgetFor(m);
+    reserved = m;
+    if (heapLimit - RUNTIME_RESERVE_BYTES - cfg.wsOutgoingBudgetBytes - MESSAGE_COST_FACTOR * m < MIN_ROOM_MEMORY_BUDGET_BYTES) {
+      warnings.push(
+        `the V8 heap (${MiB(heapLimit)}) is too small for the runtime (${MiB(RUNTIME_RESERVE_BYTES)}), WS_OUTGOING_BUDGET_BYTES (${MiB(cfg.wsOutgoingBudgetBytes)}) and one message: the room budget is at its floor (${MiB(MIN_ROOM_MEMORY_BUDGET_BYTES)}); raise --max-old-space-size or lower WS_OUTGOING_BUDGET_BYTES`,
+      );
+    }
+  }
+  cfg.roomMemoryBudgetBytes = budget;
+  const fullRoom = ROOM_BASE_COST_BYTES + f * conf.maxDocBytes;
+  if (budget < fullRoom) {
+    warnings.push(`the room memory budget (${MiB(budget)}) is smaller than one full room at MAX_DOC_BYTES (${MiB(conf.maxDocBytes)} x ${f} = ${MiB(fullRoom)})`);
+  }
+  const lower = (name: string, key: keyof typeof conf, to: number, why: string) => {
+    const v = Math.max(0, Math.min(conf[key], to));
+    (cfg as unknown as Record<string, number>)[key] = v;
+    if (v < conf[key]) warnings.push(`${name} lowered from ${MiB(conf[key])} to ${MiB(v)}: ${why}`);
+  };
+  const share = budget * cfg.roomMemoryPrincipalShare;
+  const anonShare = share * ANON_VISITOR_SHARE_RATIO;
+  lower('MAX_DOC_BYTES', 'maxDocBytes', roomCapFor(share, f), `a full room (x ${f}, +25%) must fit one user's share of the room memory budget (${MiB(share)} of ${MiB(budget)})`);
+  lower('ANON_MAX_DOC_BYTES', 'anonMaxDocBytes', Math.min(cfg.maxDocBytes, roomCapFor(anonShare, f)), `a full anonymous room must fit one anonymous visitor's share (${MiB(anonShare)})`);
+  lower('MAX_MESSAGE_BYTES', 'maxMessageBytes', Math.min(cfg.maxDocBytes, reserved), 'a message cannot add more than a room holds (MAX_DOC_BYTES)');
+  lower('ANON_MAX_MESSAGE_BYTES', 'anonMaxMessageBytes', Math.min(cfg.maxMessageBytes, cfg.anonMaxDocBytes), 'a message cannot add more than a room holds (ANON_MAX_DOC_BYTES)');
+  lower('MAX_IMAGE_BYTES', 'maxImageBytes', Math.floor(IMAGE_PER_MESSAGE * cfg.maxMessageBytes), 'an image (as a data URL) must fit one message');
+  lower('ANON_MAX_IMAGE_BYTES', 'anonMaxImageBytes', Math.floor(IMAGE_PER_MESSAGE * cfg.anonMaxMessageBytes), 'an image (as a data URL) must fit one message');
+  cfg.memoryWarnings = warnings;
 }

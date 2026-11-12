@@ -1,3 +1,4 @@
+import v8 from 'node:v8';
 import {
   Counter,
   Gauge,
@@ -83,6 +84,46 @@ export class Metrics {
     help: 'Loaded-room memory budget (ROOM_MEMORY_BUDGET_BYTES, or derived from the V8 heap limit)',
     registers: [this.registry],
   });
+  /** Set by the RoomManager: what the principals are charged for (read at every scrape). */
+  heldProbe: (() => { user: number; anonVisitor: number; anon: number }) | null = null;
+  readonly roomMemoryHeld = new Gauge({
+    name: 'canvas_room_memory_charged_bytes',
+    help: 'Loaded-room memory charged to principals (fv7 F1): the most one logged-in user is charged for (who="user_max"), the most one anonymous visitor (who="anon_visitor_max"), all anonymous visitors together (who="anon_total")',
+    labelNames: ['who'],
+    registers: [this.registry],
+    collect: () => {
+      const h = this.heldProbe?.();
+      if (!h) return;
+      this.roomMemoryHeld.set({ who: 'user_max' }, h.user);
+      this.roomMemoryHeld.set({ who: 'anon_visitor_max' }, h.anonVisitor);
+      this.roomMemoryHeld.set({ who: 'anon_total' }, h.anon);
+    },
+  });
+  readonly roomMemoryShare = new Gauge({
+    name: 'canvas_room_memory_share_bytes',
+    help: 'The most one logged-in user (who="user"), one anonymous visitor (who="anon_visitor") and all anonymous visitors together (who="anon_total") may be charged for',
+    labelNames: ['who'],
+    registers: [this.registry],
+  });
+  readonly heapUsedPeak = new Gauge({
+    name: 'canvas_heap_used_peak_bytes',
+    help: 'Highest V8 used heap seen since start (sampled every 500 ms and after every message over 256 KiB)',
+    registers: [this.registry],
+  });
+  readonly heapLimit = new Gauge({
+    name: 'canvas_heap_size_limit_bytes',
+    help: 'V8 heap size limit (follows --max-old-space-size)',
+    registers: [this.registry],
+  });
+  private heapPeak = 0;
+  /** Sample the used heap into canvas_heap_used_peak_bytes. */
+  sampleHeap(): void {
+    const used = v8.getHeapStatistics().used_heap_size;
+    if (used > this.heapPeak) {
+      this.heapPeak = used;
+      this.heapUsedPeak.set(used);
+    }
+  }
   readonly joinEncodes = new Counter({
     name: 'canvas_join_encodes_total',
     help: 'Full encodings of a room document for joins (each one is shared by every join until the updates since outgrow it)',
@@ -121,5 +162,6 @@ export class Metrics {
 
   constructor() {
     collectDefaultMetrics({ register: this.registry });
+    this.heapLimit.set(v8.getHeapStatistics().heap_size_limit);
   }
 }

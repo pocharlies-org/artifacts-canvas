@@ -36,12 +36,24 @@ let portSeq = 25600;
 const apps: App[] = [];
 const silent = createLogger('silent');
 
+/**
+ * The size caps these regressions were written for (fv5: rooms of 20 MiB, messages of 8 MiB):
+ * since fv7 F1 the defaults are lower (what a third of the chart's 2 GiB budget holds) and the
+ * caps are clamped to the memory budget's share, so the tests set them, with a budget whose share
+ * holds them (the budget is only an estimate: nothing here loads that much).
+ */
+const FV5_LIMITS = {
+  ROOM_MEMORY_BUDGET_BYTES: String(4 * 1024 ** 3),
+  MAX_DOC_BYTES: String(20 * 1024 * 1024), ANON_MAX_DOC_BYTES: String(5 * 1024 * 1024),
+  MAX_MESSAGE_BYTES: String(8 * 1024 * 1024), ANON_MAX_MESSAGE_BYTES: String(2 * 1024 * 1024),
+};
+
 async function startApp(env: Record<string, string> = {}): Promise<App> {
   for (;;) {
     const cfg = loadConfig({
       GATE_AUTHZ_URL: core.authzUrl, ARTIFACT_BASE_URL: core.artifactBaseUrl, S3_BUCKET: 'canvas-test',
       STATIC_DIR: staticDir, LOG_LEVEL: 'silent', AUTHZ_RECHECK_SECONDS: '30', SAVE_DEBOUNCE_MS: '50',
-      READYZ_CACHE_MS: '10', PORT: String(++portSeq), ALLOWED_ORIGINS: TEST_ORIGIN, METRICS_PORT: '0', ...env,
+      READYZ_CACHE_MS: '10', PORT: String(++portSeq), ALLOWED_ORIGINS: TEST_ORIGIN, METRICS_PORT: '0', ...FV5_LIMITS, ...env,
     });
     const app = createApp({ config: cfg, store, logger: silent });
     try {

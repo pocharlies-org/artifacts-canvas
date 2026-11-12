@@ -59,7 +59,8 @@ async function waitForHealth(url: string, timeoutMs: number): Promise<void> {
   }
 }
 
-export async function startStack(): Promise<Stack> {
+/** `env`: extra server settings for one spec (e.g. the size caps a regression was written for). */
+export async function startStack(env: Record<string, string> = {}): Promise<Stack> {
   const core = await startFakeCore({ control: true });
   const s3 = await startS3Mock();
   const port = await freePort();
@@ -88,6 +89,7 @@ export async function startStack(): Promise<Stack> {
         ALLOWED_ORIGINS: `http://127.0.0.1:${port}`,
         METRICS_PORT: '0',
         LOG_LEVEL: 'warn',
+        ...env,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });

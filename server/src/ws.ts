@@ -171,6 +171,12 @@ export class WsServer {
           return;
         }
         if (!res.allowed) {
+          if (coreError(res.reason)) {
+            // fv7 F6: the core could not answer (timeout, 5xx, garbage): still refused (fail
+            // closed), but with 1013 so the client tries again instead of giving up for good
+            this.refuseBusy(req, socket, head, `authz_${res.reason}`, 'authorization unavailable');
+            return;
+          }
           this.deps.metrics.wsRejected.inc({ reason: `authz_${res.reason}` });
           // Complete the upgrade and close with the protocol close code so the client
           // sees 4403 (no reconnect) instead of a bare connection failure.
@@ -572,10 +578,11 @@ export class WsServer {
         return;
       }
       if (err instanceof BusyError) {
-        // fv6 H-1: loading this room would pass the memory budget (1013: the client retries)
+        // fv6 H-1: loading this room would pass the memory budget (1013: the client retries);
+        // fv7 F1: a room whose cost alone passes the loader's share never loads for it (4413)
         metrics.wsRejected.inc({ reason: err.reason });
-        sendWs(ws, encodeNotice({ kind: 'busy' }));
-        ws.close(CLOSE.tryAgain, 'server memory busy');
+        sendWs(ws, encodeNotice({ kind: err.terminal ? 'too-large' : 'busy' }));
+        ws.close(err.terminal ? CLOSE.tooLarge : CLOSE.tryAgain, err.terminal ? 'document too large for this server' : 'server memory busy');
         setTimeout(() => ws.terminate(), 1000).unref?.();
         return;
       }
@@ -671,6 +678,7 @@ export class WsServer {
         this.closeConn(conn, 1003, 'bad message');
       }
       this.chargeCpu(conn, room, performance.now() - t1);
+      if (buf.byteLength > 256 * 1024) metrics.sampleHeap();
     });
     ws.on('pong', () => {
       conn.awaitingPong = false;
@@ -850,9 +858,10 @@ export class WsServer {
         this.deps.metrics.wsRejected.inc({ reason: 'doc_too_large' });
         return;
       }
-      // fv6 H-1: the loaded rooms together may not grow past the memory budget, one principal
-      // past its share of it, the rooms only anonymous visitors hold past theirs. Refused with
-      // 1013 (busy, the client retries); nothing is applied.
+      // fv6 H-1, fv7 F1: the loaded rooms together may not grow past GROWTH_FRACTION of the
+      // memory budget, the sender past its share of it (it is charged what it writes, in full),
+      // the anonymous visitors past theirs. Refused with 1013 (busy, the client retries); nothing
+      // is applied.
       if (check.grows) {
         const why = this.deps.manager.growthRefusal(room, conn.principal, conn.identity.anonymous, growth);
         if (why) {
@@ -868,11 +877,20 @@ export class WsServer {
       // mid-way. A clean apply marks the room dirty through the document's update event;
       // anything else marks it here (what did integrate before a throw was broadcast).
       let outcome: ReturnType<typeof applyGuarded> | null = null;
+      const costBefore = room.cost;
+      const changedBefore = room.contentChangedBytes;
       try {
         outcome = applyGuarded(room.doc, update, conn);
       } finally {
-        room.approxBytes += growth;
+        // An update that only removes whole items counts what it really deleted (Yjs' own
+        // encoding of the change), not its size: a delete set that repeats deletions the room
+        // has (a full-state step 2 does) changes nothing, and counted at its size it grew the
+        // estimate with nothing behind it until a save, which no change triggers (fv7 F1).
+        room.approxBytes += check.grows ? growth : room.contentChangedBytes - changedBefore;
         if (!outcome || outcome.threw || outcome.droppedPending) room.markDirty();
+        // fv7 F1: what the update added (content, and the ledger the stamper wrote for it) is
+        // charged to its sender, in full
+        this.deps.manager.chargeUpdate(room, conn.principal, conn.identity.anonymous, costBefore);
       }
       if (outcome.threw || outcome.droppedPending) {
         this.deps.log.error(
@@ -884,7 +902,9 @@ export class WsServer {
         this.deps.metrics.wsRejected.inc({ reason: outcome.threw ? 'apply_threw' : 'pending_after_apply' });
         return;
       }
+      const costBeforeClaim = room.cost;
       room.claimWriters(check.writers, conn.identity.id);
+      this.deps.manager.chargeUpdate(room, conn.principal, conn.identity.anonymous, costBeforeClaim);
       return;
     }
     if (type === MSG_LEDGER) {
@@ -999,11 +1019,25 @@ export class WsServer {
       return;
     }
     if (!res.allowed) {
+      if (coreError(res.reason)) {
+        // fv7 F6: the core could not answer the re-check (timeout, 5xx): the connection is not
+        // kept unverified (fail closed), but nothing was revoked either: 1013, the client
+        // reconnects and is checked again (4403 made every tab give up during a core blip)
+        sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+        this.closeConn(conn, CLOSE.tryAgain, 'authorization unavailable');
+        this.deps.metrics.wsRejected.inc({ reason: `recheck_${res.reason}` });
+        return;
+      }
       sendWs(conn.ws, encodeNotice({ kind: 'revoked' }));
       conn.ws.close(CLOSE.forbidden, 'authorization revoked');
       this.deps.metrics.wsRejected.inc({ reason: 'revoked' });
     }
   }
+}
+
+/** An authz answer that says the core failed (not a decision): `core_error`, `malformed` (authz.ts). */
+function coreError(reason: string): boolean {
+  return reason === 'core_error' || reason === 'malformed';
 }
 
 /**

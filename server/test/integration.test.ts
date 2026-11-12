@@ -313,12 +313,14 @@ describe('authz enforcement', () => {
     expect(store.objects.has(objKey)).toBe(false);
   });
 
-  it('core down: fail closed (4403)', async () => {
+  it('core down: fail closed, and retryable (1013 busy: nothing was decided, fv7 F6)', async () => {
     core.broken = { status: 500, body: 'boom' };
     const app = await startApp();
     const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/x.html`);
     await c.connect().catch(() => undefined);
-    await expectClose(c, 4403);
+    await expectClose(c, 1013);
+    expect(c.notices.map((n) => n.kind)).toEqual(['busy']);
+    expect(c.identities).toEqual([]);
   });
 
   it('anonymous pub/ visitor gets the "Anónimo NNNN" pseudonym (the hint, when free), an id bound to its cookie and a signed cookie', async () => {
