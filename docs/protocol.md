@@ -514,7 +514,8 @@ that is gone or expired.
   watchdog (`WORKER_MESSAGE_TIMEOUT_MS` 1 000 + `WORKER_TIMEOUT_NS_PER_BYTE` 1 000 per byte of
   the message, the apply up to twice its estimate on top). A message that makes its room's
   worker miss the watchdog, run out of heap or crash closes its sender `4413` (notice
-  `too-large`) with a **strike**; `WORKER_STRIKES` (3) within `WORKER_STRIKE_WINDOW_MS` (10 min)
+  `too-large`) with a **strike**, and so does an update the guard refuses for the work it would
+  cost (cuts, merges, deletes, placement over the caps, client blocks: `4413`); `WORKER_STRIKES` (3) within `WORKER_STRIKE_WINDOW_MS` (10 min)
   refuse the principal's joins and writes for `WORKER_STRIKE_COOLDOWN_MS` (10 min) → `1013`;
   anonymous visitors also per client IP (when `CLIENT_IP_HOPS` says where it is) and all
   together after `WORKER_ANON_POOL_STRIKES` (10). The room is rebuilt in a fresh worker and

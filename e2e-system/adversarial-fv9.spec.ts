@@ -35,6 +35,13 @@ const restarts = () => Number(inspect('{{.RestartCount}}'));
 const oomKilled = () => inspect('{{.State.OOMKilled}}');
 const wsUrl = (canvas: string) => canvas.replace(/^http/, 'ws').replace('/_canvas/', '/_canvas/_/ws/');
 const canvasLogs = (since: string) => execFileSync('docker', ['logs', '--since', since, container('canvas')], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 << 20 });
+function metric(name: string, label = ''): number {
+  const out = execFileSync('docker', ['exec', container('canvas'), 'wget', '-qO-', 'http://127.0.0.1:9091/metrics'], { encoding: 'utf8' });
+  let n = 0;
+  for (const line of out.split('\n')) if (line.startsWith(name) && line.includes(label)) n += Number(line.split(' ').pop());
+  return n;
+}
+const strikes = () => metric('canvas_strikes_total', 'outcome="strike"');
 
 /** A raw y-websocket client (Node): answers the server's step 1, sends its own edits. */
 class Raw {
@@ -166,8 +173,9 @@ const view = (d: Y.Doc) => JSON.stringify(d.getMap('shapes').toJSON()) + JSON.st
  * of the attacked room) edits before and after; a fresh joiner of the attacked room must get exactly
  * what `victim` holds.
  */
-async function attack(name: string, o: { honest: Raw; victim: Raw; attacker: Raw; update: Uint8Array; joinUrl: string; joinCookie: string; want: number }) {
+async function attack(name: string, o: { honest: Raw; victim: Raw; attacker: Raw; update: Uint8Array; joinUrl: string; joinCookie: string; want: number; strikes: number }) {
   const r0 = restarts();
+  const k0 = strikes();
   const since = new Date().toISOString();
   for (let i = 0; i < 5; i++) o.victim.doc.getMap('shapes').set(`${name}-before${i}`, mapOf(geo(`${name}-before${i}`, i)));
   await sleep(500);
@@ -186,7 +194,7 @@ async function attack(name: string, o: { honest: Raw; victim: Raw; attacker: Raw
   await sleep(1500);
   const same = view(fresh.doc) === view(o.victim.doc);
   const attributed = [...o.victim.doc.getMap('shapes').keys()].filter((k) => k.startsWith(name)).every((k) => !!fresh.ledger.getMap('attribution').get(k));
-  const out = { bytes: o.update.byteLength, code, closedMs, rtt, restarts: restarts() - r0, oomKilled: oomKilled(), victimClose: o.victim.closeCode, honestClose: o.honest.closeCode, freshEqualsVictim: same, attributed, workerFaults: (canvasLogs(since).match(/room worker fault/g) ?? []).length };
+  const out = { bytes: o.update.byteLength, code, closedMs, rtt, restarts: restarts() - r0, oomKilled: oomKilled(), victimClose: o.victim.closeCode, honestClose: o.honest.closeCode, freshEqualsVictim: same, attributed, workerFaults: (canvasLogs(since).match(/room worker fault/g) ?? []).length, strikes: strikes() - k0 };
   log(name, out);
   expect(code).toBe(o.want);
   expect(rtt.max).toBeLessThan(200);
@@ -195,13 +203,13 @@ async function attack(name: string, o: { honest: Raw; victim: Raw; attacker: Raw
   expect(o.honest.closeCode).toBeNull();
   expect(same).toBe(true);
   expect(attributed).toBe(true);
+  expect(out.strikes).toBe(o.strikes);
   fresh.ws.terminate();
   return out;
 }
 
 test('fv9 A-E live: every PoC is refused in its room\'s worker; the canvas answers pings < 200 ms, never restarts, and the attacked rooms keep every honest edit', async ({ browser }) => {
   test.setTimeout(600_000);
-  const c1 = await cookieOf(browser, 'user1');
   const c2 = await cookieOf(browser, 'user2');
   // the signed-in user who pings the canvas from another room
   const other = publish({ users: ['test2@example.com'] }, `fv9-other-${Date.now()}`);
@@ -225,44 +233,47 @@ test('fv9 A-E live: every PoC is refused in its room\'s worker; the canvas answe
     const a = new Raw(wsUrl(pubRoom.canvas), '');
     expect(await a.ready()).toBe(true);
     Y.applyUpdate(a.doc, Y.encodeStateAsUpdate(victimPub.doc), 'remote');
-    results.A = await attack('A', { honest, victim: victimPub, attacker: a, update: mergeRun(points(a.doc, 'd'), 900_001, 20_000), joinUrl: wsUrl(pubRoom.canvas), joinCookie: '', want: 4413 });
+    results.A = await attack('A', { honest, victim: victimPub, attacker: a, update: mergeRun(points(a.doc, 'd'), 900_001, 20_000), joinUrl: wsUrl(pubRoom.canvas), joinCookie: '', want: 4413, strikes: 1 });
   }
   {
     const a = new Raw(wsUrl(pubRoom.canvas), '');
     expect(await a.ready()).toBe(true);
     Y.applyUpdate(a.doc, Y.encodeStateAsUpdate(victimPub.doc), 'remote');
     const text = (a.doc.getMap('shapes').get('n') as Y.Map<unknown>).get('text') as Y.Text;
-    results.D = await attack('D', { honest, victim: victimPub, attacker: a, update: formatting(text, 900_002, 60_000, 9_000), joinUrl: wsUrl(pubRoom.canvas), joinCookie: '', want: 4403 });
+    results.D = await attack('D', { honest, victim: victimPub, attacker: a, update: formatting(text, 900_002, 60_000, 9_000), joinUrl: wsUrl(pubRoom.canvas), joinCookie: '', want: 4403, strikes: 0 });
   }
 
-  // B, C, E: a signed-in user of the attacked room (user1); user2 is the honest participant there
-  const userRoom = publish({ users: ['test@example.com', 'test2@example.com'] }, `fv9-users-${Date.now()}`);
+  // B, C, E: a signed-in member of the attacked room (user3: each refusal is a strike, and three
+  // put it in a cooldown, so the users the other specs sign in with stay out of it; an ACL refusal
+  // is answered before strikes are looked at); user2 is the honest participant there
+  const c3 = await cookieOf(browser, 'user3');
+  const userRoom = publish({ users: ['test3@example.com', 'test2@example.com'] }, `fv9-users-${Date.now()}`);
   const victim = new Raw(wsUrl(userRoom.canvas), c2);
   expect(await victim.ready()).toBe(true);
   stroke(victim.doc, 'd0');
   stroke(victim.doc, 'd1');
   await sleep(1500);
   const mallory = async () => {
-    const a = new Raw(wsUrl(userRoom.canvas), c1);
+    const a = new Raw(wsUrl(userRoom.canvas), c3);
     expect(await a.ready()).toBe(true);
     await sleep(500);
     return a;
   };
   {
     const a = await mallory();
-    results.B = await attack('B', { honest, victim, attacker: a, update: mergePairs(points(a.doc, 'd0'), points(a.doc, 'd1'), 900_003, 100_000), joinUrl: wsUrl(userRoom.canvas), joinCookie: c2, want: 4413 });
+    results.B = await attack('B', { honest, victim, attacker: a, update: mergePairs(points(a.doc, 'd0'), points(a.doc, 'd1'), 900_003, 100_000), joinUrl: wsUrl(userRoom.canvas), joinCookie: c2, want: 4413, strikes: 1 });
   }
   {
     const a = await mallory();
-    results.E = await attack('E', { honest, victim, attacker: a, update: chain(points(a.doc, 'd0'), 900_100, 20_000, 20_000), joinUrl: wsUrl(userRoom.canvas), joinCookie: c2, want: 4413 });
+    results.E = await attack('E', { honest, victim, attacker: a, update: chain(points(a.doc, 'd0'), 900_100, 20_000, 20_000), joinUrl: wsUrl(userRoom.canvas), joinCookie: c2, want: 4413, strikes: 1 });
   }
   {
     // C: the attacker first fragments a stroke of its own room (two accepted updates of 180 000
     // alternating live / deleted items), then sends the delete-only update
-    const cRoom = publish({ users: ['test@example.com', 'test2@example.com'] }, `fv9-c-${Date.now()}`);
+    const cRoom = publish({ users: ['test3@example.com', 'test2@example.com'] }, `fv9-c-${Date.now()}`);
     const v = new Raw(wsUrl(cRoom.canvas), c2);
     expect(await v.ready()).toBe(true);
-    const a = new Raw(wsUrl(cRoom.canvas), c1);
+    const a = new Raw(wsUrl(cRoom.canvas), c3);
     expect(await a.ready()).toBe(true);
     stroke(a.doc, 'd');
     await sleep(1500);
@@ -276,9 +287,16 @@ test('fv9 A-E live: every PoC is refused in its room\'s worker; the canvas answe
       await sleep(4000);
     }
     expect(a.closeCode).toBeNull();
-    results.C = await attack('C', { honest, victim: v, attacker: a, update: deleteRanges(900_004, 360_000, 80_000), joinUrl: wsUrl(cRoom.canvas), joinCookie: c2, want: 4413 });
+    results.C = await attack('C', { honest, victim: v, attacker: a, update: deleteRanges(900_004, 360_000, 80_000), joinUrl: wsUrl(cRoom.canvas), joinCookie: c2, want: 4413, strikes: 1 });
   }
-  log('A-E', results);
+  // three strikes of user3 within the window: its joins wait out the cooldown (1013), user2's do not
+  const after = new Raw(wsUrl(userRoom.canvas), c3);
+  await after.ready(10_000);
+  const coolCode = await after.closed(10_000);
+  const other2 = new Raw(wsUrl(userRoom.canvas), c2);
+  expect(await other2.ready()).toBe(true);
+  log('A-E', { ...results, user3JoinAfterThreeStrikes: coolCode, cooldownRefusals: metric('canvas_ws_rejected_total', 'reason="cooldown"') });
+  expect(coolCode).toBe(1013);
 });
 
 test('fv9 F live: anonymous visitors cannot fill the memory with stored pub/ rooms; a signed-in user\'s edit is accepted', async ({ browser }) => {
@@ -328,23 +346,22 @@ test('fv9 F live: anonymous visitors cannot fill the memory with stored pub/ roo
 test('fv9 unknown paths live (SYSTEM_WORKER_TEST_HOOKS=1): a worker that loops forever or allocates without bound is replaced; the canvas lives on', async ({ browser }) => {
   test.skip(process.env.SYSTEM_WORKER_TEST_HOOKS !== '1', 'the stack runs without WORKER_TEST_HOOKS');
   test.setTimeout(300_000);
-  // the attacker is user3 (each hook is a strike: user1 and user2 stay out of any cooldown for the
-  // other specs of the suite; an ACL refusal is answered before strikes are looked at)
-  const c3 = await cookieOf(browser, 'user3');
+  // the attacker is a cookieless visitor of a pub/ canvas (each hook is a strike: user3 is cooling
+  // down after the A-E test, and user1 and user2 stay out of any cooldown for the other specs)
   const c2 = await cookieOf(browser, 'user2');
   const other = publish({ users: ['test2@example.com'] }, `fv9-hook-other-${Date.now()}`);
   const honest = new Raw(wsUrl(other.canvas), c2);
   expect(await honest.ready()).toBe(true);
-  const room = publish({ users: ['test2@example.com', 'test3@example.com'] }, `fv9-hook-${Date.now()}`);
+  const room = publish('pub', `fv9-hook-${Date.now()}`);
   const victim = new Raw(wsUrl(room.canvas), c2);
   expect(await victim.ready()).toBe(true);
   const out: Record<string, unknown> = {};
   for (const hook of ['busy', 'alloc']) {
-    const a = new Raw(wsUrl(room.canvas), c3);
+    const a = new Raw(wsUrl(room.canvas), '');
     expect(await a.ready()).toBe(true);
     const d = new Y.Doc();
     d.getMap('meta').set('k', `canvas-test-hook:${hook}`);
-    out[hook] = await attack(`hook-${hook}`, { honest, victim, attacker: a, update: Y.encodeStateAsUpdate(d), joinUrl: wsUrl(room.canvas), joinCookie: c2, want: 4413 });
+    out[hook] = await attack(`hook-${hook}`, { honest, victim, attacker: a, update: Y.encodeStateAsUpdate(d), joinUrl: wsUrl(room.canvas), joinCookie: c2, want: 4413, strikes: 1 });
     expect((out[hook] as { workerFaults: number }).workerFaults).toBe(1);
   }
   log('unknown paths', out);

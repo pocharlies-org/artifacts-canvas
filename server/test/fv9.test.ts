@@ -319,6 +319,11 @@ describe('fv9 A-E through the server: refused in the room\'s worker, the main th
     expect(Buffer.from(after.contentBytes).equals(Buffer.from(before.contentBytes))).toBe(true);
     expect(ana.closeCode).toBeNull();
     expect(await metric(app, 'workerFaults', 'kind', 'timeout')).toBe(0);
+    // A, B, E are refused for their work: a strike each (D is a schema refusal), the third a cooldown
+    expect(await metric(app, 'strikes', 'outcome', 'strike')).toBe(3);
+    expect(await metric(app, 'strikes', 'outcome', 'cooldown')).toBe(1);
+    const again = await join(app, key, 'sid=mallory');
+    expect(again.closeCode).toBe(1013);
     console.log('[fv9 through the server]', JSON.stringify(out));
     ana.close();
   }, 120_000);

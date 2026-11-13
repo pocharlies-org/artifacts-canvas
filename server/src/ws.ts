@@ -945,6 +945,10 @@ export class WsServer {
             // more client blocks, than one update may carry: Yjs would copy, splice and scan for
             // seconds. Refused like an update too large: only the sender closes.
             this.deps.log.warn({ room: room.name, user: conn.identity.id, bytes: update.byteLength, why: check.bad ?? 'work', merges: check.merges }, 'update refused: too much work');
+            // fv9: an honest client practically never sends one (only a delete of thousands of
+            // shapes written in one session can be over MAX_APPLY_MS): a strike, like a worker fault,
+            // so that retrying costly messages ends in a cooldown
+            this.deps.manager.strikes.strike({ principal: conn.principal, anonymous: conn.identity.anonymous, ip: conn.ip }, check.bad ?? 'work');
             sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
             this.closeConn(conn, CLOSE.tooLarge, check.bad === 'blocks' ? 'update carries too many clients' : 'update cuts too many items');
             this.deps.metrics.wsRejected.inc({ reason: check.bad === 'blocks' ? 'too_many_clients' : 'too_many_splits' });

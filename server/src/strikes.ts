@@ -11,7 +11,9 @@ export interface Striker {
 
 /**
  * Strikes (fv9 isolation). A client message that makes its room's worker fault (over the
- * watchdog, out of heap, crashed) closes its sender 4413 and gives a strike to its principal;
+ * watchdog, out of heap, crashed), or that the guard refuses for the work it would cost (cuts,
+ * merges, deletes or placement over MAX_APPLY_MS / MAX_SPLITS_PER_MESSAGE, client blocks over
+ * MAX_CLIENTS_PER_UPDATE), closes its sender 4413 and gives a strike to its principal;
  * WORKER_STRIKES of them within WORKER_STRIKE_WINDOW_MS refuse that principal's joins and writes
  * for WORKER_STRIKE_COOLDOWN_MS (1013: an honest client retries later). An anonymous visitor
  * without a cookie is a new principal on every connection, so anonymous strikes also count per
