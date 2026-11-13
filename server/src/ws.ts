@@ -944,7 +944,11 @@ export class WsServer {
             // fv8 P1/P2, fv9: more cuts of items, merges, or more work to make and place them, or
             // more client blocks, than one update may carry: Yjs would copy, splice and scan for
             // seconds. Refused like an update too large: only the sender closes.
-            this.deps.log.warn({ room: room.name, user: conn.identity.id, bytes: update.byteLength, why: check.bad ?? 'work', merges: check.merges }, 'update refused: too much work');
+            // (the messages are the fv8 ones: log scrapers and the fv8 full-system spec look for them)
+            this.deps.log.warn(
+              { room: room.name, user: conn.identity.id, bytes: update.byteLength, why: check.bad ?? 'work', merges: check.merges },
+              check.bad === 'blocks' ? 'update refused: too many clients' : 'update refused: too many cuts',
+            );
             // fv9: an honest client practically never sends one (only a delete of thousands of
             // shapes written in one session can be over MAX_APPLY_MS): a strike, like a worker fault,
             // so that retrying costly messages ends in a cooldown

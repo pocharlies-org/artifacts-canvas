@@ -167,7 +167,10 @@ function stroke(d: Y.Doc, id: string): void {
   ((d.getMap('shapes').get(id) as Y.Map<unknown>).get('points') as Y.Array<number>).insert(0, [1, 2]);
 }
 const points = (d: Y.Doc, id: string) => (d.getMap('shapes').get(id) as Y.Map<unknown>).get('points') as Y.Array<number>;
-const view = (d: Y.Doc) => JSON.stringify(d.getMap('shapes').toJSON()) + JSON.stringify(d.getMap('assets').toJSON()) + JSON.stringify(d.getMap('meta').toJSON());
+/** a document's content, keys sorted (a map's own key order follows the order its items arrived in) */
+const canon = (v: unknown): unknown =>
+  Array.isArray(v) ? v.map(canon) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v as object).sort().map((k) => [k, canon((v as Record<string, unknown>)[k])])) : v;
+const view = (d: Y.Doc) => JSON.stringify(canon({ shapes: d.getMap('shapes').toJSON(), assets: d.getMap('assets').toJSON(), meta: d.getMap('meta').toJSON() }));
 
 /**
  * One attack: `honest` (another room) pings the canvas meanwhile; `victim` (an honest participant
