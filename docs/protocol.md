@@ -516,7 +516,8 @@ When authz (connect, re-check, or HTTP gate) says expired/gone, the server refus
 the room (NOTICE + `4410`/`4404`) and **deletes both canvas objects** (content and ledger). A
 periodic sweep (`SWEEP_INTERVAL_SECONDS`, default 3600) lists the prefix, asks the gate once per
 artifact found (from a content or a ledger object), and deletes both objects of every artifact
-that is gone or expired.
+that is gone or expired. It asks with no credentials for the server itself, so the anonymous-drawing
+switch (§1) does not apply to it: with anonymous drawing off it still asks the gate.
 
 ## 10. Enforcement summary (the server enforces; defaults)
 

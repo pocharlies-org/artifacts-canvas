@@ -37,12 +37,16 @@ export class AuthzClient {
   /**
    * Ask the core whether this visitor may access `artifactKey` (a validated key, without the
    * `/artifacts/` prefix). `cookie` and `authorization` are the raw header values ('' if absent).
+   * `visitor: false` is the server asking for itself, not for a visitor (the orphan sweep,
+   * rooms.ts): the anonymous-drawing switch is a policy for visitors and does not apply, so the
+   * sweep still learns from the core that an artifact is gone or expired while it is off.
    */
-  async authorize(cookie: string, artifactKey: string, authorization = ''): Promise<AuthzResult> {
+  async authorize(cookie: string, artifactKey: string, authorization = '', { visitor = true }: { visitor?: boolean } = {}): Promise<AuthzResult> {
     // Anonymous drawing off (ANON_ENABLED=false): a visitor without any credential can only be
     // anonymous, so it is refused here and the core is not asked (no round trip, no visitor
     // cookie minted later). Counted as a denial, not as a call to the core (canvas_authz_total).
-    if (!this.cfg.anonEnabled && !bringsCredentials(cookie, authorization)) {
+    const anonOff = visitor && !this.cfg.anonEnabled;
+    if (anonOff && !bringsCredentials(cookie, authorization)) {
       this.metrics.authzDeny.inc({ reason: 'anon_disabled' });
       return deny('anon_disabled');
     }
@@ -111,7 +115,7 @@ export class AuthzClient {
       // Anonymous drawing off: the core may still open pub/ to anonymous visitors (reads of the
       // artifact itself), and a visitor whose session cookie it does not accept is one of them.
       // Refused whatever ANON_ALLOWED_PREFIXES holds.
-      if (!this.cfg.anonEnabled) return done(deny('anon_disabled'));
+      if (anonOff) return done(deny('anon_disabled'));
       // Defense in depth: the core only allows anonymous inside pub/ while its anonymous-pub
       // flag is on; a misconfigured core must not open every artifact.
       if (!anonAllowed(artifactKey, this.cfg.anonAllowedPrefixes)) {

@@ -511,7 +511,8 @@ export class RoomManager {
    * Periodic sweep of orphans (canvas objects whose artifact is gone or expired).
    * Runs authz with an empty cookie — conservative: only reasons in the gone/expired
    * sets delete; "needs login" answers keep the object (the core's ILM catch-all covers
-   * the rest, design §8.4).
+   * the rest, design §8.4). Asked for the server, not as a visitor: the anonymous-drawing switch
+   * (ANON_ENABLED) does not apply to it.
    */
   async sweep(): Promise<{ scanned: number; deleted: number }> {
     const { cfg, store, authz, log } = this.deps;
@@ -533,7 +534,7 @@ export class RoomManager {
     }
     for (const artifactKey of artifactKeys) {
       scanned++;
-      const res = await authz.authorize('', artifactKey);
+      const res = await authz.authorize('', artifactKey, '', { visitor: false });
       const gone = cfg.goneReasons.has(res.reason);
       const expired = cfg.expiredReasons.has(res.reason) || isPast(res.artifact?.expires);
       if (gone || expired) {

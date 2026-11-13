@@ -18,6 +18,7 @@ import { Metrics } from '../src/metrics.js';
 import { createLogger } from '../src/logging.js';
 import { createApp, type App } from '../src/app.js';
 import { MemoryCanvasObjectStore } from '../src/store.js';
+import { canvasObjectKey } from '../src/paths.js';
 import { startFakeCore, allowAnon, allowUser, type FakeCore } from './helpers/fakecore.js';
 import { TEST_ORIGIN, TestClient, expectClose } from './helpers/yclient.js';
 
@@ -131,14 +132,14 @@ let staticDir: string;
 let portSeq = 31400;
 const apps: App[] = [];
 
-async function startApp(env: Record<string, string>): Promise<App> {
+async function startApp(env: Record<string, string>, store = new MemoryCanvasObjectStore()): Promise<App> {
   for (;;) {
     const cfg = loadConfig({
       GATE_AUTHZ_URL: core.authzUrl, ARTIFACT_BASE_URL: core.artifactBaseUrl, S3_BUCKET: 'canvas-test',
       STATIC_DIR: staticDir, LOG_LEVEL: 'silent', AUTHZ_RECHECK_SECONDS: '300', SAVE_DEBOUNCE_MS: '50',
       READYZ_CACHE_MS: '10', PORT: String(++portSeq), ALLOWED_ORIGINS: TEST_ORIGIN, METRICS_PORT: '0', ...env,
     });
-    const app = createApp({ config: cfg, store: new MemoryCanvasObjectStore(), logger: silent });
+    const app = createApp({ config: cfg, store, logger: silent });
     try {
       await app.listen();
     } catch (e) {
@@ -234,5 +235,20 @@ describe('the server with ANON_ENABLED=false', () => {
     expect(open.status).toBe(200);
     expect(open.headers.get('set-cookie')).toMatch(/^canvas_anon=/);
     expect(await counter(on, 'anonMinted', 'outcome', 'minted')).toBe(1);
+  });
+
+  it('the orphan sweep still asks the core (the switch is for visitors, not for the server): the canvas objects of a gone and of an expired pub/ artifact are deleted, a live one is kept', async () => {
+    const store = new MemoryCanvasObjectStore();
+    const obj = (key: string) => canvasObjectKey('_plugins/canvas', key);
+    for (const k of ['pub/sw-gone/index.html', 'pub/sw-expired/index.html', 'pub/sw-alive/index.html']) store.objects.set(obj(k), { body: new Uint8Array([1]) });
+    // no rule: the fake core answers `object-missing`, as the gate does for a deleted artifact
+    core.rules.set('pub/sw-expired/index.html', allowAnon({ artifact: { expires: '2020-01-01T00:00:00Z' } }));
+    core.rules.set('pub/sw-alive/index.html', allowAnon());
+    const app = await startApp({ ANON_ENABLED: 'false' }, store);
+    expect(await app.manager.sweep()).toMatchObject({ scanned: 3, deleted: 2 });
+    expect(core.calls.filter((c) => c.cookie === '' && c.authorization === '')).toHaveLength(3);
+    expect(store.objects.has(obj('pub/sw-gone/index.html'))).toBe(false);
+    expect(store.objects.has(obj('pub/sw-expired/index.html'))).toBe(false);
+    expect(store.objects.has(obj('pub/sw-alive/index.html'))).toBe(true);
   });
 });
