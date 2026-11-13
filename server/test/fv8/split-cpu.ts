@@ -38,3 +38,5 @@ console.log('base', JSON.stringify(push(Y.encodeStateAsUpdate(a))));
 // the attack, crafted (building it through a Y.Doc cuts the client's own copy: as slow as the server)
 const items = Array.from({ length: shapesN }, (_, s) => itemAt((room.doc.getMap('shapes').get(`d${s}`) as Y.Map<unknown>).get('points') as Y.Array<number>, 0));
 console.log(capped ? 'attack (server caps)' : 'attack (no caps: before fv8)', JSON.stringify(push(insertsBetween(items.map((into) => ({ into, count: N })), 4294967001, 0))));
+// the room's save timer and awareness interval would keep the process alive
+process.exit(0);
