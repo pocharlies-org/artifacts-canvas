@@ -1,7 +1,7 @@
 /**
  * FULL-SYSTEM regressions of the sixth independent verification (fv6), against the live compose
- * stack, whose canvas container runs under the chart's memory limit (compose.yml: mem_limit 2g,
- * NODE_OPTIONS --max-old-space-size=1536, so the server derives an 872 MiB loaded-room budget;
+ * stack, whose canvas container runs under the chart's memory limit (compose.yml: mem_limit 2304m,
+ * HEAP_LIMIT_MB=1776 since fv9, so the server derives a 1088 MiB loaded-room budget (872 MiB before);
  * fv7 F1: a third of it per user, rooms of 5 MiB at most):
  *   Q4  one ACL member opens R rooms and fills each to the size cap through raw sockets (the
  *       verifier's q4-multi-room-oom.spec.ts filled ~17 MB rooms; before: the pod OOM-killed in a
@@ -23,6 +23,8 @@ import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
 import { BASE, USERS, container, editorReady, newContext, openWithLogin, publish, waitFor, type UserName } from './lib';
 
+/** the chart's default memory limit (fv9: 2304 MiB, a worker per loaded room; it was 2 GiB) */
+const LIMIT_MIB = 2304;
 test.describe.configure({ mode: 'serial' });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const log = (k: string, v: unknown) => console.log(`[fv6] ${k}: ${JSON.stringify(v)}`);
@@ -164,7 +166,7 @@ async function editRtt(who: Raw, reader: Raw, id: string): Promise<number> {
 
 test('Q4: one ACL member keeps R full rooms loaded: past its share of the memory budget the fills get 1013 busy, no OOM, no restart; an honest user in a loaded room is unaffected', async ({ browser }) => {
   test.setTimeout(900_000);
-  expect(Number(inspect('{{.HostConfig.Memory}}'))).toBe(2 * 1024 ** 3);
+  expect(Number(inspect('{{.HostConfig.Memory}}'))).toBe(LIMIT_MIB * 1024 ** 2);
   const s0 = state();
   const refused0 = memoryRefusals();
   const run = Date.now().toString(36);
@@ -219,7 +221,7 @@ test('Q4: one ACL member keeps R full rooms loaded: past its share of the memory
   expect(rejoin[0]).toBe('joined');
   expect(s1).toEqual(s0);
   expect(s1.oom).toBe('false');
-  expect(peak).toBeLessThan(2048);
+  expect(peak).toBeLessThan(LIMIT_MIB);
   expect(Math.max(...rtts)).toBeLessThan(2000);
 });
 
@@ -271,7 +273,7 @@ test('Q4b: three ACL members fill two rooms each: each is stopped at its share, 
   log('Q4b', { full, filled, closes: held.map((h) => h.closeCode), keepersOpen: keepers.filter((k) => k.closeCode === null).length, refusedPrincipal: principal, refusedTotal: total, visitorRttMs: rtt, peakMiB: peak, before: s0, after: s1 });
   expect(keepers.every((k) => k.closeCode === null)).toBe(true);
   expect(s1).toEqual(s0);
-  expect(peak).toBeLessThan(2048);
+  expect(peak).toBeLessThan(LIMIT_MIB);
 });
 
 test('Q4c: anonymous visitors fill pub/ rooms at the anonymous cap: they stop at a third of the budget together, no restart; a logged-in user still loads and edits', async ({ browser }) => {
@@ -329,6 +331,6 @@ test('Q4c: anonymous visitors fill pub/ rooms at the anonymous cap: they stop at
   // the rooms already loaded keep their readers
   expect(keepers.filter((k) => k.synced).every((k) => k.closeCode === null)).toBe(true);
   expect(s1).toEqual(s0);
-  expect(peak).toBeLessThan(2048);
+  expect(peak).toBeLessThan(LIMIT_MIB);
   expect(owner.closeCode).toBeNull();
 });

@@ -1,7 +1,7 @@
 /**
  * FULL-SYSTEM regressions of the fifth independent verification (fv5), against the live
  * compose stack, whose canvas container runs under the chart's memory limit (compose.yml:
- * mem_limit 2g, NODE_OPTIONS --max-old-space-size=1536):
+ * mem_limit 2304m and HEAP_LIMIT_MB=1776 since fv9; 2g and --max-old-space-size=1536 before):
  *   P5  one ACL member, a room near the size cap (fv5: ~20 MB under the old 20 MiB cap; ~4 MB
  *       under the 5 MiB cap since fv7), dozens of paused sockets (before, at the old 1 GiB
  *       limit: +400-700 MiB and the container OOM-killed) -> 8 accepted, memory flat, dropped
@@ -16,6 +16,8 @@ import * as Y from 'yjs';
 import * as decoding from 'lib0/decoding';
 import { BASE, USERS, container, editorReady, newContext, openWithLogin, publish, waitFor, wsCloses } from './lib';
 
+/** the chart's default memory limit (fv9: 2304 MiB, a worker per loaded room; it was 2 GiB) */
+const LIMIT_MIB = 2304;
 test.describe.configure({ mode: 'serial' });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const log = (k: string, v: unknown) => console.log(`[fv5] ${k}: ${JSON.stringify(v)}`);
@@ -51,7 +53,7 @@ function metric(name: string, label = ''): number {
 test('P5: dozens of paused sockets of one ACL member on a room near the size cap: memory flat under the chart limit, no restart, honest users unaffected', async ({ browser }) => {
   test.setTimeout(420_000);
   // the container runs with the chart's memory limit
-  expect(Number(inspect('{{.HostConfig.Memory}}'))).toBe(2 * 1024 ** 3);
+  expect(Number(inspect('{{.HostConfig.Memory}}'))).toBe(LIMIT_MIB * 1024 ** 2);
   const restarts0 = inspect('{{.RestartCount}}');
   const started0 = inspect('{{.State.StartedAt}}');
   const P = publish({ users: [USERS.user1.email, USERS.user2.email, USERS.user3.email] }, `fv5-p5-${Date.now().toString(36)}`);

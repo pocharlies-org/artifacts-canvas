@@ -1,6 +1,6 @@
 /**
  * FULL-SYSTEM regressions of the eighth independent verification (fv8), against the live compose
- * stack (the canvas container under the chart's memory limit: 2 GiB, --max-old-space-size=1536 by
+ * stack (the canvas container under the chart's memory limit: 2304 MiB, HEAP_LIMIT_MB=1776 by
  * default). Sizes come from the server's own startup log, so the spec runs at any memory setting.
  *   P1+P2  one ACL writer sends ONE update of 200 000 inserts between the points of two strokes
  *          (3.97 MB). Before: accepted (estimated 4.28 MiB < 5 MiB), the event loop stood 53-65 s,
