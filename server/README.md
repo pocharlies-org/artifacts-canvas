@@ -91,7 +91,8 @@ an in-memory object store; the S3 store is covered against s3rver — no Docker 
 docker build -f server/Dockerfile -t artifacts-canvas:dev .
 ```
 
-The image runs as uid 1000, read-only friendly (writes nothing).
+The image runs as the numeric uid/gid 1000:1000, read-only friendly (writes nothing). Published images,
+provenance verification and the smoke test: the root README, [Image](../README.md#image).
 
 ## Deployment
 

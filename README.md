@@ -42,6 +42,7 @@ y-websocket, y-protocols, lib0, [perfect-freehand](https://github.com/steveruizo
 | `deploy/compose/` | The full system: the core's compose stack plus the canvas as its plugin (real gate, real MinIO, Dex). |
 | `e2e-system/` | Playwright suite against that full system (`npm run e2e:system`). |
 | `chart/` | Helm chart for the service. |
+| `tests/` | Smoke test of the built server image (`tests/image_smoke.sh`, see [Image](#image)). |
 | `docs/protocol.md` | The single authoritative protocol: routes, key chain, frame, WebSocket messages, attribution, document schema, authz contract, enforcement. |
 | `docs/design.md` | Product decisions and design. |
 | `docs/mockups/` | The approved UI mockup. |
@@ -194,7 +195,8 @@ The canvas is a core plugin (design §8): the core answers *who may see this art
    helm install canvas ./chart -n sso \
      --set core.publicHost=<your artifacts host> \
      --set s3.bucket=artifacts \
-     --set s3.endpoint=http://minio.minio.svc.cluster.local:9000
+     --set s3.endpoint=http://minio.minio.svc.cluster.local:9000 \
+     --set image.digest=sha256:<digest>          # a verified image digest: see "Image"
    ```
 
    The defaults match the core chart, so `core.publicHost` (the core's `artifactsHost`) is the only
@@ -283,14 +285,43 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `ANON_COOKIE_SECRET` | (random per process) | Signs the anonymous-visitor cookie: the server assigns the *Anónimo NNNN* pseudonym (`?anon=` is only a hint for the number shown) and the anonymous attribution id `anon:<visitor id>` is derived from the cookie's nonce. Chart: `anon.cookieSecretRef` (a Secret reference, never a value); required with more than one replica, since every pod must verify the same cookie. |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. |
 
-### Container image
+## Image
 
 ```sh
-docker build -f server/Dockerfile -t artifacts-canvas-server:dev .
+docker build -f server/Dockerfile --build-arg REVISION="$(git rev-parse HEAD)" -t artifacts-canvas-server:dev .
+tests/image_smoke.sh artifacts-canvas-server:dev "$(git rev-parse HEAD)"    # Docker + jq; pushes nothing
 ```
 
-The image builds all three workspaces from the root lockfile and runs `server/dist/index.js` as a non-root
-user; the built client bundle ships as the static dir (`STATIC_DIR=/app/static`).
+[`server/Dockerfile`](server/Dockerfile) builds all three workspaces with `npm ci` from the root lockfile
+(the only network fetch of the build), drops the dev dependencies and copies the result onto
+`node:22-alpine` pinned by its index digest, in both stages. The runtime image holds `node_modules`,
+`server/dist`, `shared/dist` and the client bundle as the static dir (`STATIC_DIR=/app/static`), and
+nothing else: no tests, no sources, no npm, npx, corepack or yarn. The code is root-owned and not writable
+by the numeric non-root user `1000:1000` that runs it, and the server writes no file, so it runs with a
+read-only root filesystem and a writable `/tmp` (the chart's settings). It runs with
+`NODE_ENV=production` and no `--max-old-space-size`, which the server refuses (size it with
+`HEAP_LIMIT_MB`); it also refuses `WORKER_TEST_HOOKS` under that `NODE_ENV`. It carries the labels
+`org.opencontainers.image.source`, `.revision` (the commit), `.licenses`, `.title` and `.description`. The
+root [`.dockerignore`](.dockerignore) is an allow-list: tests, e2e suites, docs, `.git` and every
+`node_modules` stay out of the build context.
+
+Every commit on `main` is published by [`.github/workflows/publish.yml`](.github/workflows/publish.yml)
+(and only there: branches and pull requests build and smoke-test the image in CI, never push it) as
+`ghcr.io/pocharlies-org/artifacts-canvas-server:<40-hex commit>` for `linux/amd64`, with a signed build
+provenance attestation. The tag is only for finding the image: **reference the image by digest, never by
+tag**, and verify the digest before you deploy it:
+
+```bash
+# <sha>: a 40-hex commit on main. The digest of its image (sha256:<digest>):
+crane digest ghcr.io/pocharlies-org/artifacts-canvas-server:<sha>
+#   or: docker buildx imagetools inspect ghcr.io/pocharlies-org/artifacts-canvas-server:<sha> --format '{{json .Manifest}}' | jq -r .digest
+gh attestation verify oci://ghcr.io/pocharlies-org/artifacts-canvas-server@sha256:<digest> --repo pocharlies-org/artifacts-canvas --signer-workflow pocharlies-org/artifacts-canvas/.github/workflows/publish.yml --source-ref refs/heads/main --source-digest <sha> --deny-self-hosted-runners
+```
+
+`--source-digest` binds the attestation to that commit; without it any commit built by the workflow would
+pass. Deploy the verified digest: the chart renders `image.repository@image.digest` when `image.digest` is
+set (`--set image.digest=sha256:<digest>`). If you copy the image into your own registry, copy it by digest
+and point `image.repository` at the copy (the digest stays the same).
 
 ## License
 
