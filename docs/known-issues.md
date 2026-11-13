@@ -42,6 +42,16 @@ leaves open:
   with 4413. Deleting them in smaller selections, or from a later session (another client id),
   works.
 
+- [ ] **One honest refusal under constant forced rebuilds, not reproduced (Low, open).** The
+  honest-edit fuzzer with the room's worker replaced at 1% of its steps (~1 rebuild per 100
+  steps, far more than any fault rate) refused one honest tab once: `4403 write to pending not
+  allowed` (its resync budget, 20 step-1 requests, ran out) in seed 204, y-websocket order, run 8,
+  on a loaded host; 45 514 updates and 8 190 rebuilds on x86 plus 21 623 updates and 2 680
+  rebuilds on a Mac otherwise gave 0 refusals and 0 divergence, and that seed did not repeat it.
+  Without rebuilds: 0 in 107 254 updates. Suspected: the resync budget, not the rebuilt state
+  (`canvas_worker_recoveries_total{outcome="differs"}` stays 0).
+  Suggested fix: reproduce with `HONEST_DUMP`; reset a connection's resync budget on a rebuild.
+
 - [ ] **A rebuild that fails drops the room's log (Low).** If a room cannot be rebuilt after a
   fault (its saved objects unreadable, the replay failing — never seen), its connections are
   closed 1013 and its write-ahead log is lost: the reconnecting tabs resend those edits, with the
