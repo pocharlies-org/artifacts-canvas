@@ -530,6 +530,8 @@ describe('alert series exposed at 0 (review S7)', () => {
       'canvas_saves_total{outcome="error"}',
       'canvas_ws_paused_total{why="connection"}',
       'canvas_ws_paused_total{why="principal"}',
+      // review I-3: the third reason a connection is no longer read
+      'canvas_ws_paused_total{why="server"}',
       'canvas_ws_rejected_total{reason="delete_too_costly"}',
       // S8: a message read ahead on a paused connection, an unfinished message held past its deadline
       'canvas_ws_rejected_total{reason="inflight_paused"}',

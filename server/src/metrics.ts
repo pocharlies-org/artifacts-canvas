@@ -221,6 +221,8 @@ export class Metrics {
     this.saves.inc({ outcome: 'error' }, 0);
     this.wsPaused.inc({ why: 'connection' }, 0);
     this.wsPaused.inc({ why: 'principal' }, 0);
+    // review I-3: the third reason a connection is no longer read
+    this.wsPaused.inc({ why: 'server' }, 0);
     // review S8: a message read ahead on a paused connection; an unfinished message past its deadline
     this.wsRejected.inc({ reason: 'inflight_paused' }, 0);
     this.wsRejected.inc({ reason: 'incoming_timeout' }, 0);

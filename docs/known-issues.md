@@ -78,7 +78,7 @@ measurement: `server/test/inflight/flood.ts`; probe: `server/test/fv9/delete-bat
   its content's encoding differed in 8 of 168 rebuilds under concurrent edits (Yjs merged structs
   in another order), the ledger's never. The documentation says so now.
 
-### Second round (S8)
+### Second round (S8, I-3, T-1)
 
 What the in-flight bound of M-1 left out (security S8, Low while anonymous drawing is off: each
 needs many signed-in accounts acting together; it gates anonymous drawing, because with anonymous
@@ -110,6 +110,13 @@ visitors accounts and connections are not scarce). Regressions: `server/test/fv9
 - [x] **S8 — The floor of a queued message was an estimate.** `INFLIGHT_MIN_COST` was 1 KiB;
   measured, a queued 4-byte update holds 1 689 bytes of the main thread's heap (Node 22.23.5,
   x86-64, 11 520 messages, after a GC). Now 2 KiB.
+- [x] **I-3 — `canvas_ws_paused_total{why="server"}` was not exposed at 0.** It is, with the two
+  new S8 reasons of `canvas_ws_rejected_total` (`inflight_paused`, `incoming_timeout`).
+- [x] **T-1 — The full-system suite could pick the wrong container.** `e2e-system/lib.ts`
+  `container()` took the first running container with the compose project and service labels;
+  Compose puts them on the image it builds, so a `docker run` of that image during a run was read
+  and restarted by the suite. Now it also filters on `com.docker.compose.oneoff=False` (only the
+  service's own container has it) and fails on more than one match.
 
 ## Ninth verification (fv9)
 
