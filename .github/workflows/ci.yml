@@ -2,9 +2,13 @@ name: ci
 
 on:
   push:
-    branches: [main, 'feat/**', 'fix/**']
+    # every branch: CI only reads (permissions below), so a branch of any name gets its run
+    # before a pull request exists. Publishing stays in publish.yml, on main only.
+    branches: ["**"]
   pull_request:
 
+# Read-only token for every job. Nothing here publishes: the server image is pushed only by
+# publish.yml, on push to main.
 permissions:
   contents: read
 
@@ -12,8 +16,10 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
@@ -22,6 +28,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run test
       - run: npm run build
+      - name: shell syntax
+        run: bash -n tests/image_smoke.sh
       - name: helm chart lints and renders
         run: |
           # `! cmd` never fails a step (bash -e ignores negated commands): renders that must fail go through fails
@@ -46,7 +54,7 @@ jobs:
       - run: npm run e2e
         env:
           CI: '1'
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: e2e-results
@@ -56,11 +64,30 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  server-image:
+    # Builds server/Dockerfile exactly as publish.yml does and smoke-tests it (labels, uid 1000,
+    # read-only code, refusals, healthz). Never pushes.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: build server image (linux/amd64)
+        run: |
+          docker build --platform linux/amd64 --provenance=false --sbom=false \
+            --build-arg REVISION="$GITHUB_SHA" \
+            --build-arg SOURCE="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            -f server/Dockerfile -t "artifacts-canvas-server:$GITHUB_SHA" .
+      - name: smoke test the image
+        run: tests/image_smoke.sh "artifacts-canvas-server:$GITHUB_SHA" "$GITHUB_SHA"
+
   secrets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: gitleaks
-        run: docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:latest detect --source /repo --redact --verbose
+        # gitleaks v8.30.1, pinned by digest
+        run: docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f detect --source /repo --redact --verbose

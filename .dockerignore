@@ -1,8 +1,23 @@
+# Build context of server/Dockerfile (built from the repository root): an allow-list.
+# Only what `npm ci` and `npm run build` read goes in. Tests, e2e suites, docs, deploy/, chart/,
+# .git, .github and every node_modules or build output stay out.
+*
+!package.json
+!package-lock.json
+!shared/package.json
+!shared/tsconfig.json
+!shared/src/
+!client/package.json
+!client/tsconfig.json
+!client/vite.config.ts
+!client/index.html
+!client/src/
+!client/public/
+!client/dev/*.ts
+!server/package.json
+!server/tsconfig.json
+!server/src/
+# never, even inside an allowed directory
 **/node_modules
 **/dist
-**/test-results
-**/playwright-report
-**/screenshots
-.git
-.github
-docs
+**/*.test.ts
