@@ -265,6 +265,21 @@ export interface GuardOptions {
    * someone else's (another principal writes with it). Omitted = every id is allowed.
    */
   mayWriteClient?: (client: number) => boolean;
+  /**
+   * Caps of UpdateCheck.splits and UpdateCheck.splitWork (fv8 P1/P2): an update over either is
+   * refused as `splits` as soon as the count passes it (the server closes the sender 4413).
+   * Omitted = no cap (the counts are still returned).
+   */
+  maxSplits?: number;
+  maxSplitWork?: number;
+  /** Cap of UpdateCheck.scanWork (fv8 P2): over it, refused as `splits` too. */
+  maxScanWork?: number;
+  /**
+   * Client blocks one update may carry (fv9 E): an honest update carries its sender's client
+   * id, and a resync the few ids the room lacks; over it, refused as `blocks` (the server closes
+   * the sender 4413). Omitted = no cap.
+   */
+  maxClients?: number;
 }
 
 export interface UpdateCheck {
@@ -278,16 +293,94 @@ export interface UpdateCheck {
    * a text grew the room ~8x with "deletes only"); false = it only removes whole items
    */
   grows: boolean;
-  /** item boundaries the delete set creates in live room items (see SPLIT_COST_BYTES) */
+  /**
+   * item boundaries the update creates (see SPLIT_COST_BYTES, fv8 P1): wherever one of its
+   * structs names a clock inside an item as its origin or right origin, and wherever a delete
+   * range starts or ends inside a live item — room items and the update's own new items alike
+   */
   splits: number;
+  /**
+   * Upper bound of the work Yjs does to make those cuts (fv8 P2), in elements: for every cut,
+   * the elements of the item's content it copies (a points list is copied whole on every cut)
+   * plus the structs of that client it moves to make room for the new one, plus
+   * SPLIT_BASE_WORK. The server refuses an update over its cap and pre-charges its CPU time.
+   */
+  splitWork: number;
+  /**
+   * Upper bound of the items Yjs scans to place the update's new items (fv8 P2): for each, the
+   * room items between its origin and its right origin, plus the update's own new items in the
+   * same list or key unless it continues a run. The server refuses an update over its cap and
+   * pre-charges its CPU time.
+   */
+  scanWork: number;
+  /**
+   * Struct merges Yjs makes when it cleans up after the update (fv9 A/B/C): runs of the update's
+   * own structs that continue each other, the room's structs its deletes leave next to each
+   * other. Their work (the copies of a merged list, the splices of the client's struct array) is
+   * part of `splitWork`; this is how many merges there are (diagnostics).
+   */
+  merges: number;
+  /**
+   * shapes the update writes or deletes (distinct ids), and the UTF-8 bytes of those ids: the
+   * stamper writes one attribution entry and one history line per shape touched, so they bound
+   * what the update adds to the ledger (the server's memory budget counts it ahead)
+   */
+  shapes: number;
+  shapeKeyBytes: number;
+  /**
+   * the update carries no new struct: only deletes (and structs the room has). Set on refusals
+   * too, once the structs were read: the server does not strike the sender of a delete the guard
+   * refuses for its work (an honest bulk delete can be one, see docs/protocol.md §10)
+   */
+  deletesOnly: boolean;
 }
 
 /**
- * Upper bound of what one split of a live item adds to the encoded room (a struct header with
- * its origin ids, plus its delete-set range). The server charges `splits x SPLIT_COST_BYTES`
- * on top of the update's own size against the document size cap.
+ * Upper bound of what one cut of an item adds to the encoded room (a struct header with its
+ * origin ids, plus its delete-set range). The server charges `splits x SPLIT_COST_BYTES` on top
+ * of the update's own size against the document size cap and the memory budget. Measured
+ * (server/test/fv8/split-growth.ts, every kind of cut): 6-9 B with short ids, 22 B with 5-byte
+ * client ids and clocks past 2^28 (inserts with a right origin), 20.8 B for delete ranges; the
+ * worst plus ~45% (fv5 L-2 had 24 for delete cuts only).
  */
-export const SPLIT_COST_BYTES = 24;
+export const SPLIT_COST_BYTES = 32;
+
+/**
+ * UpdateCheck.splitWork, in units of one element of content copied (fv8 P2, measured on x86-64
+ * with server/test/fv8/split-cpu-cal.ts): a cut costs Yjs a fixed part (the new struct, the
+ * lookups, the transaction's bookkeeping: 7-9 us, as much as copying ~1 500 elements), one
+ * pointer move per SPLIT_MOVE_DIVISOR structs of that client after it, and the item's content
+ * copied (4.0-4.5 ns per element for a long points list): once for a cut that stays, about
+ * SPLIT_REMERGE_COPIES times for one Yjs merges back at the end of the update (a known struct's
+ * origin: 2.3-2.5 ns per unit counted so). The server turns units into time with SPLIT_WORK_NS.
+ */
+export const SPLIT_BASE_WORK = 1536;
+export const SPLIT_MOVE_DIVISOR = 4;
+export const SPLIT_REMERGE_COPIES = 4;
+
+/**
+ * Struct merges (fv9 A/B/C, UpdateCheck.merges), in UpdateCheck.splitWork units: a merge costs
+ * MERGE_BASE_WORK (Item.mergeWith and its bookkeeping), the elements of a list content it copies
+ * (ContentAny/JSON concatenate their arrays into a new one: two units per element), and every
+ * run merged splices the client's struct array: one unit per MERGE_MOVE_DIVISOR structs after it.
+ * Measured on x86-64 (server/test/fv9/merge-cal.ts): 3.3-4.8 ns per unit for bulk deletes,
+ * 3.1-3.2 for runs, 2.2-9.7 for separate pairs (SPLIT_WORK_NS counts 6).
+ */
+export const MERGE_BASE_WORK = 128;
+export const MERGE_MOVE_DIVISOR = 4;
+/**
+ * A live struct of the room the update deletes (fv9), in splitWork units: Yjs marks it deleted,
+ * drops its content (a deleted type's items become GC structs) and tries to merge it: 1.2-1.3 us
+ * each when one transaction deletes 2 000-12 000 shapes (204 000 structs), the merges apart
+ * (server/test/fv9/merge-cal.ts). An honest delete-only update is a few bytes for any number of
+ * shapes, so this is what bounds its apply time.
+ */
+export const DELETE_WORK = 256;
+
+/** Contents Yjs copies element by element when it cuts an item (ContentAny/JSON slice their array). */
+function copiesOnSplit(content: ItemContent): boolean {
+  return content instanceof Y.ContentAny || content instanceof Y.ContentJSON || content instanceof Y.ContentString;
+}
 
 /**
  * Server-side guard of the CONTENT document (protocol §5.3). Returns null when a client may
@@ -310,7 +403,10 @@ export const SPLIT_COST_BYTES = 24;
  *     allow (docs/protocol.md §6: Y.Map shapes with a valid `type` that never goes away,
  *     style enums from the allow-lists, numeric geometry, capped point lists, no forbidden
  *     keys, string assets, plain JSON meta, ...);
- *   - `room-pending`: the room itself holds pending state (it must be cleaned first).
+ *   - `room-pending`: the room itself holds pending state (it must be cleaned first);
+ *   - `splits`: the update would make Yjs work too long (fv8 P2): more cuts of items, or more
+ *     copying or placement scanning for them, than GuardOptions.maxSplits / maxSplitWork /
+ *     maxScanWork allow (see UpdateCheck.splitWork / scanWork).
  * `doc` is never modified.
  *
  * One pass, O(update) plus O(log room) per lookup: every struct is checked for length and
@@ -334,8 +430,23 @@ export function forbiddenRootWrite(doc: Y.Doc, update: Uint8Array, opts: GuardOp
 
 /** forbiddenRootWrite plus the client ids the update writes with. */
 export function checkClientUpdate(doc: Y.Doc, update: Uint8Array, opts: GuardOptions = {}): UpdateCheck {
-  if (hasPending(doc)) return { bad: 'room-pending', writers: [], grows: false, splits: 0 };
+  if (hasPending(doc)) return { bad: 'room-pending', writers: [], grows: false, splits: 0, splitWork: 0, scanWork: 0, merges: 0, shapes: 0, shapeKeyBytes: 0, deletesOnly: false };
   return fastCheck(doc, update, opts);
+}
+
+/** UTF-8 length of a string (what Yjs writes for it). */
+export function utf8Length(str: string): number {
+  let n = 0;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+      n += 4;
+      i++;
+    } else n += 3;
+  }
+  return n;
 }
 
 /** True when Yjs parked structs or deletes in `doc` that wait for missing clocks. */
@@ -412,6 +523,8 @@ interface Loc {
   parent: string;
   /** id of the item that created the parent type (absent for a root) */
   parentId?: Y.ID;
+  /** the list or map key it is in (cached by the placement check) */
+  region?: string;
 }
 type LocOf = Loc | typeof GC_ROOT | typeof UNRESOLVED | typeof MISSING;
 
@@ -427,12 +540,22 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
   const serverClient = opts.serverClient ?? doc.clientID;
   const decoded = Y.decodeUpdate(update);
   const writers: number[] = [];
-  const no = (bad: string): UpdateCheck => ({ bad, writers, grows: false, splits: 0 });
+  /** known once the structs were read (see UpdateCheck.deletesOnly) */
+  let deletesOnly = false;
+  const no = (bad: string): UpdateCheck => ({ bad, writers, grows: false, splits: 0, splitWork: 0, scanWork: 0, merges: 0, shapes: 0, shapeKeyBytes: 0, deletesOnly });
+  /** shape ids written or deleted (see UpdateCheck.shapes) */
+  const touchedShapes = new Set<string>();
+  const touchShape = (loc: Loc) => {
+    if (loc.root === ROOT.shapes && typeof loc.keys[0] === 'string') touchedShapes.add(loc.keys[0]);
+  };
   // One struct block per client. Yjs keeps only the LAST block of a client that appears in
   // several (and an empty block wipes the earlier ones), while decodeUpdate lists all of
   // them: what this check sees would not be what Yjs integrates.
   const blocks = decoding.readVarUint(decoding.createDecoder(update));
   if (blocks !== new Set((decoded.structs as Y.Item[]).map((s) => s.id.client)).size) return no('malformed');
+  // fv9 E: the work of the dependency check below grows with the client blocks; an honest update
+  // carries a handful
+  if (blocks > (opts.maxClients ?? Infinity)) return no('blocks');
   // The delete set as it is on the wire (fv5 M-4): Yjs applies every range as listed, but
   // decodeUpdate neither sorts nor merges the ranges, and Y.isDeleted() binary-searches them.
   // Unsorted ranges hid "this update also deletes its own new `type`" (a shape left with no
@@ -480,10 +603,17 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
     arr.push(s);
     if (s instanceof Y.Item) items.push(s);
   }
+  deletesOnly = fresh.size === 0;
 
   const findFresh = (id: Y.ID): Y.Item | Y.GC | null => {
     const arr = fresh.get(id.client);
     if (!arr) return null;
+    // most structs of a crafted update are one clock long: try the index that clock would have
+    const guess = id.clock - arr[0].id.clock;
+    if (guess >= 0 && guess < arr.length) {
+      const g = arr[guess];
+      if (id.clock >= g.id.clock && id.clock < g.id.clock + g.length) return g;
+    }
     let lo = 0;
     let hi = arr.length - 1;
     while (lo <= hi) {
@@ -495,6 +625,187 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
     }
     return null;
   };
+
+  // Cuts (fv8 P1, P2). Yjs cuts an item in two wherever a struct of the update names a clock
+  // inside it as its origin (cut after that clock) or right origin (cut before it) — the new
+  // structs and the ones the room has alike: Yjs resolves the origins of a known struct before
+  // it skips it — and wherever a delete range starts or ends inside a live item, the room's or
+  // the update's own new ones. Every cut is a struct of its own in the encoded room (fv8: an
+  // insert between every two points of two 100 000-point strokes, 3.97 MB, grew the stored room
+  // by 7.5 MB, uncounted), and Yjs copies the item's content to make it (the same update froze
+  // the server for 53-65 s). One count per boundary, however many structs name it.
+  const cuts = new Map<number, Set<number>>();
+  let splits = 0;
+  let splitWork = 0;
+  /** the struct holding `clock` of `client`: the room's when it has that clock, else the update's */
+  const structAt = (client: number, clock: number): Y.Item | Y.GC | null => {
+    if (clock < Y.getState(doc.store, client)) {
+      const structs = doc.store.clients.get(client) as (Y.Item | Y.GC)[] | undefined;
+      if (!structs) return null;
+      try {
+        return structs[Y.findIndexSS(structs, clock)] ?? null;
+      } catch {
+        return null;
+      }
+    }
+    return findFresh(Y.createID(client, clock));
+  };
+  const maxSplits = opts.maxSplits ?? Infinity;
+  const maxSplitWork = opts.maxSplitWork ?? Infinity;
+  const overCap = () => splits > maxSplits || splitWork > maxSplitWork;
+  /** a cut right before `clock` of `client`, when that is inside an item (not its first clock, never a GC) */
+  const cutBefore = (client: number, clock: number, st: Y.Item | Y.GC | null, copies = 1) => {
+    if (!(st instanceof Y.Item) || clock <= st.id.clock || clock >= st.id.clock + st.length) return;
+    let set = cuts.get(client);
+    if (!set) cuts.set(client, (set = new Set()));
+    if (set.has(clock)) return;
+    set.add(clock);
+    splits++;
+    // Yjs copies the item's content (both halves) and splices the new struct into the client's
+    // struct array (a pointer move per struct after it: SPLIT_MOVE_DIVISOR of them per unit)
+    const structs = (doc.store.clients.get(client)?.length ?? 0) + (fresh.get(client)?.length ?? 0);
+    splitWork += SPLIT_BASE_WORK + Math.ceil(structs / SPLIT_MOVE_DIVISOR) + (copiesOnSplit(st.content) ? copies * st.length : 0);
+  };
+  // counted before anything else is resolved (an origin nobody has cuts nothing), so that an
+  // update over the caps is refused early
+  for (const list of [items, known]) {
+    // a known struct is skipped once its origins are resolved: nothing goes between the two
+    // halves and Yjs merges them back at the end of the update, copying the item again
+    const copies = list === known ? SPLIT_REMERGE_COPIES : 1;
+    for (const s of list) {
+      if (s.origin) cutBefore(s.origin.client, s.origin.clock + 1, structAt(s.origin.client, s.origin.clock + 1), copies);
+      if (s.rightOrigin) cutBefore(s.rightOrigin.client, s.rightOrigin.clock, structAt(s.rightOrigin.client, s.rightOrigin.clock), copies);
+      if (overCap()) return no('splits');
+    }
+  }
+
+  // Merges (fv9 A/B/C). Once the update is in, Yjs merges structs of one client that continue
+  // each other (Item.mergeWith, GC.mergeWith): the update's own new structs, the room's last
+  // struct of that client with the first new one, and the deleted structs a delete leaves next to
+  // each other. Merging list contents (ContentAny/JSON) concatenates their arrays, right to left,
+  // so a run of k items copies its tail k times (20 000 one-number items, 143 KB, made 2 x 10^8
+  // copies and ran the server out of heap); every run merged splices the client's struct array and
+  // moves the structs after it (100 000 separate pairs, or 80 000 delete ranges in a fragmented
+  // room: seconds each). An honest encoder never sends structs that continue each other (its own
+  // Yjs merged them before encoding), and an honest delete merges a few runs: next to nothing.
+  // The work is counted into splitWork (refused over MAX_APPLY_MS, pre-charged otherwise).
+  let merges = 0;
+  {
+    const mergeable = (c: ItemContent): 'list' | 'string' | 'deleted' | null =>
+      c instanceof Y.ContentAny || c instanceof Y.ContentJSON ? 'list' : c instanceof Y.ContentString ? 'string' : c instanceof Y.ContentDeleted ? 'deleted' : null;
+    const sameId = (a: Y.ID | null, b: Y.ID | null) => (a === null || b === null ? a === b : a.client === b.client && a.clock === b.clock);
+    /** what a struct is once the update is in: GC or not, deleted (null: the update deletes part of it), its content class */
+    interface After {
+      s: Y.Item | Y.GC;
+      gc: boolean;
+      del: boolean | null;
+      cls: 'list' | 'string' | 'deleted' | null;
+    }
+    const deletedBy = (s: Y.Item | Y.GC): number => deletedIn(decoded.ds, s.id.client, s.id.clock, s.length);
+    const after = (s: Y.Item | Y.GC, room: boolean): After => {
+      if (!(s instanceof Y.Item)) return { s, gc: true, del: true, cls: null };
+      const covered = room && s.deleted ? s.length : deletedBy(s);
+      const del = s.deleted || s.content instanceof Y.ContentDeleted || covered >= s.length ? true : covered === 0 ? false : null;
+      // a deleted item's content is dropped at the end of the transaction (ContentDeleted); the
+      // items of a deleted type are replaced by GC structs
+      const parent = (s.parent && typeof s.parent === 'object' && '_item' in (s.parent as object) ? (s.parent as Y.AbstractType<unknown>)._item : null) as Y.Item | null;
+      const parentGone = !!parent && (parent.deleted || deletedBy(parent) >= parent.length);
+      if (del === true && room && !s.deleted && parentGone && !s.keep) return { s, gc: true, del: true, cls: null };
+      return { s, gc: false, del, cls: del === true && !s.keep ? 'deleted' : mergeable(s.content) };
+    };
+    /** would Yjs merge `r` into `l` (its left neighbour in the client's struct array)? */
+    const follows = (l: After, r: After): boolean => {
+      if (l.gc || r.gc) return l.gc && r.gc;
+      const li = l.s as Y.Item;
+      const ri = r.s as Y.Item;
+      if (l.del !== null && r.del !== null && l.del !== r.del) return false;
+      if (l.cls === null || r.cls === null) return false;
+      // a part the update deletes (it is cut) may become either
+      if (l.del !== null && r.del !== null && l.cls !== r.cls) return false;
+      if (li.redone !== null || ri.redone !== null) return false;
+      if (!ri.origin || ri.origin.client !== li.id.client || ri.origin.clock !== li.id.clock + li.length - 1) return false;
+      return sameId(li.rightOrigin, ri.rightOrigin);
+    };
+    /** a run of `k` structs (lengths `lens`, right to left) merged: its copies, one splice moving `tail` structs */
+    const run = (items: After[], tail: number) => {
+      const k = items.length;
+      merges += k - 1;
+      let copies = 0;
+      if (items.every((a) => a.cls === 'list' && a.del === false)) {
+        // right to left: each merge copies the left item and everything merged into it so far
+        // (into a new array: two units per element, measured 6.2-6.4 ns on x86)
+        let suffix = items[k - 1].s.length;
+        for (let i = k - 2; i >= 0; i--) {
+          suffix += items[i].s.length;
+          copies += 2 * suffix;
+        }
+      } else if (items.some((a) => a.cls === 'string')) {
+        for (const a of items) copies += a.s.length;
+      }
+      splitWork += copies + (k - 1) * MERGE_BASE_WORK + Math.ceil(tail / MERGE_MOVE_DIVISOR);
+    };
+    // the update's new structs (and the room's last struct of their client)
+    for (const [client, arr] of fresh) {
+      const roomStructs = doc.store.clients.get(client) as (Y.Item | Y.GC)[] | undefined;
+      const chain: After[] = [];
+      if (roomStructs?.length && arr[0].id.clock === Y.getState(doc.store, client)) chain.push(after(roomStructs[roomStructs.length - 1], true));
+      for (const s of arr) chain.push(after(s, false));
+      // runs right to left, the way the cleanup goes: a splice moves the structs after the run
+      // that earlier merges (right of it) left in place
+      let removed = 0;
+      let cur: After[] = [chain[chain.length - 1]];
+      for (let i = chain.length - 2; i >= -1; i--) {
+        if (i >= 0 && follows(chain[i], chain[i + 1])) {
+          cur.push(chain[i]);
+          continue;
+        }
+        if (cur.length > 1) {
+          run(cur.reverse(), Math.max(0, chain.length - (i + 1) - cur.length - removed));
+          removed += cur.length - 1;
+        }
+        if (i >= 0) cur = [chain[i]];
+      }
+      if (overCap()) return no('splits');
+    }
+    // the room's structs the update deletes: per range it deleted (right to left, the way
+    // tryMergeDeleteSet goes), Yjs merges every run that ends between the range's first struct
+    // and the struct after its last one, then goes on left of that run
+    for (const [client, ranges] of decoded.ds.clients) {
+      const structs = doc.store.clients.get(client) as (Y.Item | Y.GC)[] | undefined;
+      const roomClock = Y.getState(doc.store, client);
+      if (!structs?.length) continue;
+      const n = structs.length + (fresh.get(client)?.length ?? 0);
+      let limit = structs.length; // structs from here on are counted already
+      let removed = 0; // structs merged away right of where we are (they no longer move)
+      for (let ri = ranges.length - 1; ri >= 0; ri--) {
+        const r = ranges[ri];
+        if (r.clock >= roomClock) continue;
+        const end = Math.min(r.clock + r.len, roomClock);
+        const first = Y.findIndexSS(structs, r.clock);
+        const last = Math.min(structs.length - 1, Y.findIndexSS(structs, end - 1) + 1);
+        // only a range that deletes something: an already deleted struct is not in the
+        // transaction's delete set (a full-state step 2 repeats every delete of the room)
+        let deletes = false;
+        for (let j = first; j <= last && !deletes; j++) {
+          const st = structs[j];
+          if (st instanceof Y.Item && !st.deleted && st.id.clock < end) deletes = true;
+        }
+        if (!deletes) continue;
+        for (let j = Math.min(last, limit - 1); j >= Math.max(first, 1); ) {
+          const items: After[] = [after(structs[j], true)];
+          let k = j;
+          while (k > 0 && follows(after(structs[k - 1], true), items[items.length - 1])) items.push(after(structs[--k], true));
+          if (items.length > 1) {
+            run(items.reverse(), Math.max(0, n - j - 1 - removed));
+            removed += items.length - 1;
+          }
+          limit = k;
+          j = k - 1;
+        }
+        if (overCap()) return no('splits');
+      }
+    }
+  }
 
   // Dependencies: Yjs only integrates (or skips) a struct once its origins/parent exist;
   // a same-client dependency it does not even check, and resolving a missing one throws.
@@ -705,6 +1016,7 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
     if (loc === UNRESOLVED) return no('malformed');
     if (loc === GC_ROOT) continue;
     if (!CLIENT_WRITABLE_ROOTS.has(loc.root)) return no(loc.root);
+    touchShape(loc);
     if (s.content instanceof Y.ContentDeleted) {
       // a deleted item at a map key replaces (= deletes) the value there: same rules as a
       // delete — the key must be one a client may use, and a live shape keeps its `type`
@@ -733,8 +1045,182 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
   }
   if (pending) return no('pending');
 
+  // Placement (fv8 P2). Yjs places a new item by scanning what lies between its left (origin)
+  // and its right (right origin) — the inserts others made at that spot meanwhile —, and a map
+  // value with no origin first walks back through the whole history of its key. An honest client
+  // names neighbours that were adjacent when it wrote, so the scan walks only what others
+  // inserted since. A forged item whose right origin is far away (or none, at the end of a long
+  // list) makes Yjs walk the whole list for every such item: 4 000 of them, 28 KB, held the
+  // server for 40 s with no cut at all. Bounded here, per new item, by what lies between its
+  // anchors (its origin and right origin, followed through the update's own new items down to
+  // the room's): the room items there, plus the update's own new items anchored there (they may
+  // be placed in between first) — except for an item that only continues a run (its origin is a
+  // new item with the same right origin and no other new item names that origin: Yjs puts it
+  // right after it). Each pair of anchors is walked once, never past the cap.
+  let scanWork = 0;
+  const maxScanWork = opts.maxScanWork ?? Infinity;
+  if (items.length) {
+    const sameId = (a: Y.ID | null, b: Y.ID | null) => (a === null || b === null ? a === b : a.client === b.client && a.clock === b.clock);
+    const anchorMemo = { origin: new Map<Y.Item, Y.ID | null>(), rightOrigin: new Map<Y.Item, Y.ID | null>() };
+    /** the room clock a new item's left (`origin`) or right (`rightOrigin`) anchor comes down to; null = the list's start / end */
+    const anchor = (s: Y.Item, side: 'origin' | 'rightOrigin'): Y.ID | null => {
+      const memo = anchorMemo[side];
+      const path: Y.Item[] = [];
+      let cur = s;
+      let res: Y.ID | null = null;
+      for (;;) {
+        const hit = memo.get(cur);
+        if (hit !== undefined) {
+          res = hit;
+          break;
+        }
+        path.push(cur);
+        const id = cur[side];
+        if (!id) break;
+        if (isRoomClock(id)) {
+          res = id;
+          break;
+        }
+        const f = findFresh(id);
+        if (!(f instanceof Y.Item) || path.length > items.length) break;
+        cur = f;
+      }
+      for (const p of path) memo.set(p, res);
+      return res;
+    };
+    /** the room type a new item goes into (null: a type this update creates: nothing of the room in it) */
+    const roomType = (loc: Loc): Y.AbstractType<unknown> | null => {
+      if (!loc.parentId) return (doc.share.get(loc.root) as Y.AbstractType<unknown> | undefined) ?? null;
+      if (!isRoomClock(loc.parentId)) return null;
+      const st = structAt(loc.parentId.client, loc.parentId.clock);
+      return st instanceof Y.Item && st.content instanceof Y.ContentType ? (st.content.type as Y.AbstractType<unknown>) : null;
+    };
+    /** a list, or one key of a map */
+    const regionOf = (loc: Loc) => (loc.region ??= `${loc.parent}\u0000${loc.keys[loc.keys.length - 1] ?? ''}`);
+    // where the new items are anchored: clocks per room struct (sorted), and counts at list starts
+    const anchoredIn = new Map<Y.Item, number[]>();
+    const anchoredAtStart = new Map<string, number>();
+    /** new items naming a new item's clock as origin, per client and clock (a run continues only with one) */
+    const children = new Map<number, Map<number, number>>();
+    const childrenOf = (id: Y.ID) => children.get(id.client)?.get(id.clock) ?? 0;
+    const placed: { s: Y.Item; loc: Loc; region: string; left: Y.ID | null; right: Y.ID | null }[] = [];
+    const resolve = (s: Y.Item, side: 'origin' | 'rightOrigin'): Y.ID | null => {
+      const id = s[side];
+      return !id ? null : isRoomClock(id) ? id : anchor(s, side);
+    };
+    /** keys written with no neighbours into each map this update creates (see below) */
+    const newMapKeys = new Map<string, string[] | Map<string, number>>();
+    for (const s of items) {
+      const loc = updMemo.get(s);
+      if (!loc || typeof loc !== 'object') continue; // integrated as GC (no placement)
+      const sub = loc.keys[loc.keys.length - 1];
+      if (!s.origin && !s.rightOrigin && typeof sub === 'string' && loc.parentId && !isRoomClock(loc.parentId)) {
+        // a value of a map this update creates, with no neighbours (every field of a new shape):
+        // Yjs walks back over the values this update wrote to that key before it
+        const seen = newMapKeys.get(loc.parent);
+        if (!seen) newMapKeys.set(loc.parent, [sub]);
+        else if (Array.isArray(seen)) {
+          for (const k of seen) if (k === sub) scanWork++;
+          if (seen.length < 32) seen.push(sub);
+          else {
+            const m = new Map<string, number>();
+            for (const k of [...seen, sub]) m.set(k, (m.get(k) ?? 0) + 1);
+            newMapKeys.set(loc.parent, m);
+          }
+        } else {
+          scanWork += seen.get(sub) ?? 0;
+          seen.set(sub, (seen.get(sub) ?? 0) + 1);
+        }
+        if (scanWork > maxScanWork) return no('splits');
+        continue;
+      }
+      const region = regionOf(loc);
+      const left = resolve(s, 'origin');
+      const right = resolve(s, 'rightOrigin');
+      placed.push({ s, loc, region, left, right });
+      if (s.origin && !isRoomClock(s.origin)) {
+        let m = children.get(s.origin.client);
+        if (!m) children.set(s.origin.client, (m = new Map()));
+        m.set(s.origin.clock, (m.get(s.origin.clock) ?? 0) + 1);
+      }
+      const l = left ? structAt(left.client, left.clock) : null;
+      if (l instanceof Y.Item) {
+        let arr = anchoredIn.get(l);
+        if (!arr) anchoredIn.set(l, (arr = []));
+        arr.push(left!.clock);
+      } else if (!left) anchoredAtStart.set(region, (anchoredAtStart.get(region) ?? 0) + 1);
+    }
+    for (const arr of anchoredIn.values()) arr.sort((a, b) => a - b);
+    /** new items anchored in room struct `it` at clocks in [from, to) */
+    const anchoredBetween = (it: Y.Item, from: number, to: number): number => {
+      const arr = anchoredIn.get(it);
+      if (!arr) return 0;
+      const lower = (x: number) => {
+        let lo = 0;
+        let hi = arr.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (arr[mid] < x) lo = mid + 1;
+          else hi = mid;
+        }
+        return lo;
+      };
+      return lower(to) - lower(from);
+    };
+    const limit = Number.isFinite(maxScanWork) ? maxScanWork + 1 : Infinity;
+    const walked = new Map<string, number>();
+    /**
+     * What Yjs may scan between `left` and `right` in `type` (a list, or key `sub` of a map): the
+     * room items, and the new items anchored there. Memoised per pair; never walks past the cap.
+     */
+    const between = (region: string, type: Y.AbstractType<unknown> | null, sub: string | null, left: Y.ID | null, right: Y.ID | null): number => {
+      const key = `${left ? idKey(left) : '^'}>${right ? idKey(right) : '$'}>${region}`;
+      const hit = walked.get(key);
+      if (hit !== undefined) return hit;
+      const l = left ? structAt(left.client, left.clock) : null;
+      const r = right ? structAt(right.client, right.clock) : null;
+      let n = 0;
+      if ((left && !(l instanceof Y.Item)) || (right && !(r instanceof Y.Item))) {
+        n = 0; // a GC neighbour: Yjs integrates the item as GC, no scan
+      } else if (l instanceof Y.Item && l === r) {
+        n = (right!.clock > left!.clock + 1 ? 1 : 0) + anchoredBetween(l, left!.clock, right!.clock);
+      } else {
+        let o: Y.Item | null = null;
+        if (l instanceof Y.Item) {
+          if (left!.clock < l.id.clock + l.length - 1) n++; // the rest of the left item
+          n += anchoredBetween(l, left!.clock, Infinity);
+          o = l.right;
+        } else {
+          n += anchoredAtStart.get(region) ?? 0;
+          if (type && sub !== null) {
+            // a map value with no origin: Yjs first walks back through the key's history
+            o = (type as unknown as { _map: Map<string, Y.Item> })._map.get(sub) ?? null;
+            while (o && o.left && n < limit) {
+              o = o.left;
+              n++;
+            }
+          } else if (type) o = type._start;
+        }
+        while (o && o !== r && n < limit) {
+          n += 1 + anchoredBetween(o, -Infinity, Infinity);
+          o = o.right;
+        }
+        if (r instanceof Y.Item) n += (right!.clock > r.id.clock ? 1 : 0) + anchoredBetween(r, -Infinity, right!.clock);
+      }
+      walked.set(key, n);
+      return n;
+    };
+    for (const { s, loc, region, left, right } of placed) {
+      const prev = s.origin && !isRoomClock(s.origin) ? findFresh(s.origin) : null;
+      // continues a run: right after its origin, nothing to scan
+      if (prev instanceof Y.Item && sameId(prev.rightOrigin, s.rightOrigin) && childrenOf(s.origin!) === 1) continue;
+      // minus the item itself (it is anchored there too)
+      scanWork += Math.max(0, between(region, roomType(loc), loc.keys[loc.keys.length - 1] ?? null, left, right) - 1);
+      if (scanWork > maxScanWork) return no('splits');
+    }
+  }
+
   const dsHas = (id: Y.ID) => Y.isDeleted(decoded.ds, id);
-  let splits = 0;
   for (const [client, ranges] of decoded.ds.clients) {
     const roomClock = Y.getState(doc.store, client);
     const structs = doc.store.clients.get(client) as (Y.Item | Y.GC)[] | undefined;
@@ -750,6 +1236,12 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
           // itself inserts it (checked above); otherwise it would wait as a pending delete
           const it = findFresh(Y.createID(client, clock));
           if (!it) return no('pending');
+          // a range that starts or ends inside one of the update's own new items cuts it too
+          // (the delete set is applied once the structs are in; fv8 P1)
+          if (!(it instanceof Y.Item && it.content instanceof Y.ContentDeleted)) {
+            cutBefore(client, clock, it);
+            cutBefore(client, Math.min(r.clock + r.len, it.id.clock + it.length), it);
+          }
           clock = it.id.clock + it.length;
           continue;
         }
@@ -757,14 +1249,16 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
         if (!item || item.id.clock > clock || clock >= item.id.clock + item.length) return no('malformed');
         // already-deleted items are a no-op (a full-state update repeats the whole delete set)
         if (item instanceof Y.Item && !item.deleted) {
+          splitWork += DELETE_WORK;
           const loc = locOfRoomItem(item);
           if (loc === UNRESOLVED) return no('malformed');
           if (!CLIENT_WRITABLE_ROOTS.has(loc.root)) return no(loc.root);
+          touchShape(loc);
           const from = Math.max(clock, item.id.clock);
           const to = Math.min(r.clock + r.len, item.id.clock + item.length);
           // a range that starts or ends inside a live item splits it (fv5 L-2)
-          if (from > item.id.clock) splits++;
-          if (to < item.id.clock + item.length) splits++;
+          cutBefore(client, from, item);
+          cutBefore(client, to, item);
           if (loc.root === ROOT.shapes && loc.keys.length === 3 && (loc.keys[1] === 'text' || loc.keys[1] === 'points')) {
             // a delete of room text / points: the part of the item inside the range leaves it
             const delta = loc.keys[1] === 'text' ? (item.content instanceof Y.ContentString ? textDelta : null) : pointsDelta;
@@ -787,6 +1281,7 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
       }
     }
   }
+  if (overCap()) return no('splits');
   for (const { id, n } of textDelta.values()) {
     if (n > 0 && roomTextLength(id) + n > MAX_TEXT_LENGTH) return no('shapes-schema');
   }
@@ -806,7 +1301,9 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
   for (const m of newShapeMaps) {
     if (!dsHas(m.id) && !typeParents.has(idKey(m.id))) return no('shapes-schema');
   }
-  return { bad: null, writers, grows: fresh.size > 0 || splits > 0, splits };
+  let shapeKeyBytes = 0;
+  for (const k of touchedShapes) shapeKeyBytes += utf8Length(k);
+  return { bad: null, writers, grows: fresh.size > 0 || splits > 0, splits, splitWork, scanWork, merges, shapes: touchedShapes.size, shapeKeyBytes, deletesOnly };
 }
 
 /** Clocks of [clock, clock + len) of `client` that the (canonical: sorted, disjoint) delete set deletes. */
@@ -936,6 +1433,12 @@ function skipContent(dec: Y.UpdateDecoderV1, ref: number): void {
  * Would every struct of the update integrate? Per client in clock order (known structs
  * first: Yjs resolves their dependencies too before it skips them), each once its
  * cross-client dependencies exist in the room or were integrated earlier in this pass.
+ *
+ * A worklist (fv9 E): a client whose next struct lacks a dependency waits on that one clock of
+ * that one client, and is woken when that client's integration passes it. Every struct is
+ * looked at once per dependency it waits on (at most three), so the check is O(n log n) in the
+ * update's structs, whatever the number of client blocks. (It made one pass over every block per
+ * struct integrated: 20 000 items chained backwards over 20 000 blocks held the server 27 s.)
  */
 function integrates(
   doc: Y.Doc,
@@ -955,28 +1458,68 @@ function integrates(
     idx.set(client, 0);
     reached.set(client, Math.min(a[0].id.clock, Y.getState(doc.store, client)));
   }
-  const ready = (s: Y.Item | Y.GC) => {
-    if (!(s instanceof Y.Item)) return true;
+  /** the first cross-client dependency of `s` that is neither in the room nor integrated yet */
+  const blocker = (s: Y.Item | Y.GC): Y.ID | null => {
+    if (!(s instanceof Y.Item)) return null;
     for (const dep of depsOf(s)) {
       if (!dep || dep.client === s.id.client) continue;
       if (dep.clock < Y.getState(doc.store, dep.client)) continue;
       if (dep.clock < (reached.get(dep.client) ?? 0)) continue;
-      return false;
+      return dep;
     }
-    return true;
+    return null;
   };
-  let progress = true;
-  while (progress) {
-    progress = false;
-    for (const [client, a] of seq) {
-      let i = idx.get(client)!;
-      while (i < a.length && ready(a[i])) {
-        reached.set(client, Math.max(reached.get(client)!, a[i].id.clock + a[i].length));
-        i++;
-        progress = true;
-      }
-      idx.set(client, i);
+  /** per client: the clients waiting for one of its clocks (a binary min-heap by clock) */
+  const waiting = new Map<number, [number, number][]>();
+  const wait = (dep: Y.ID, client: number) => {
+    let h = waiting.get(dep.client);
+    if (!h) waiting.set(dep.client, (h = []));
+    h.push([dep.clock, client]);
+    for (let i = h.length - 1; i > 0; ) {
+      const p = (i - 1) >> 1;
+      if (h[p][0] <= h[i][0]) break;
+      [h[p], h[i]] = [h[i], h[p]];
+      i = p;
     }
+  };
+  const ready: number[] = [...seq.keys()];
+  /** `client` integrated up to `end`: everyone waiting for a clock below it may go on */
+  const wake = (client: number, end: number) => {
+    const h = waiting.get(client);
+    while (h && h.length && h[0][0] < end) {
+      ready.push(h[0][1]);
+      const last = h.pop()!;
+      if (h.length) {
+        h[0] = last;
+        for (let i = 0; ; ) {
+          const l = 2 * i + 1;
+          const r = l + 1;
+          let m = i;
+          if (l < h.length && h[l][0] < h[m][0]) m = l;
+          if (r < h.length && h[r][0] < h[m][0]) m = r;
+          if (m === i) break;
+          [h[m], h[i]] = [h[i], h[m]];
+          i = m;
+        }
+      }
+    }
+  };
+  while (ready.length) {
+    const client = ready.pop()!;
+    const a = seq.get(client)!;
+    let i = idx.get(client)!;
+    while (i < a.length) {
+      const dep = blocker(a[i]);
+      if (dep) {
+        wait(dep, client);
+        break;
+      }
+      const end = Math.max(reached.get(client)!, a[i].id.clock + a[i].length);
+      reached.set(client, end);
+      i++;
+      wake(client, end);
+    }
+    idx.set(client, i);
   }
   for (const [client, a] of seq) if (idx.get(client)! < a.length) return false;
   return true;
@@ -1015,7 +1558,9 @@ function schemaProblem(loc: Loc, content: ItemContent): string | null {
     }
     if (keys.length === 3) {
       if (keys[2] !== null) return bad;
-      if (keys[1] === 'text') return content instanceof Y.ContentString || content instanceof Y.ContentFormat ? null : bad;
+      // characters only (fv9 D): the client never formats text, and formatting items make Yjs copy
+      // the attribute map of every character after the update (60 000 of them froze the server 60 s)
+      if (keys[1] === 'text') return content instanceof Y.ContentString ? null : bad;
       // the elements of one item; how many the array ends up with is checked on the whole
       // update (an item Yjs merged from inserts the update also deletes can be longer: fv5 M-1)
       if (keys[1] === 'points') return vals && vals.every(pointNumberOk) ? null : bad;

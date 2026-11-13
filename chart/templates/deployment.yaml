@@ -7,6 +7,7 @@ metadata:
 spec:
   # Rooms are in-memory: replicas > 1 needs sticky routing per artifact key (or a shared
   # backend) or two pods would serve divergent documents for the same artifact.
+  {{- include "artifacts-canvas.validateMemory" . }}
   {{- if and (gt (int .Values.deployment.replicas) 1) (not .Values.anon.cookieSecretRef.name) }}
   {{- fail "anon.cookieSecretRef.name is required when deployment.replicas > 1 (every pod must sign and verify the same anonymous-visitor cookie)" }}
   {{- end }}
@@ -59,9 +60,10 @@ spec:
             - configMapRef:
                 name: {{ include "artifacts-canvas.fullname" . }}
           env:
-            # V8 heap cap below the memory limit (values.yaml: the memory formula)
-            - name: NODE_OPTIONS
-              value: {{ printf "--max-old-space-size=%d" (int64 .Values.nodeMaxOldSpaceMb) | quote }}
+            # the heap the process sizes its room budget from (values.yaml: the memory formula); not
+            # --max-old-space-size: that V8 flag overrides every room worker's own heap limit (fv9)
+            - name: HEAP_LIMIT_MB
+              value: {{ int64 .Values.heapLimitMb | quote }}
             {{- if .Values.s3.secretRef.name }}
             - name: S3_ACCESS_KEY_ID
               valueFrom:

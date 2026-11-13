@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, 'feat/**']
+    branches: [main, 'feat/**', 'fix/**']
   pull_request:
 
 permissions:
@@ -24,13 +24,24 @@ jobs:
       - run: npm run build
       - name: helm chart lints and renders
         run: |
+          # `! cmd` never fails a step (bash -e ignores negated commands): renders that must fail go through fails
+          fails() { if "$@" >/dev/null 2>&1; then echo "expected to fail: $*"; exit 1; fi; }
           helm lint chart/ -f chart/ci/ci-values.yaml
           helm template chart/ -f chart/ci/ci-values.yaml >/dev/null
           # required values fail the render
-          ! helm template chart/ >/dev/null 2>&1
-          ! helm template chart/ --set core.publicHost=artifacts.example.com >/dev/null 2>&1
-          ! helm template chart/ -f chart/ci/ci-values.yaml --set deployment.replicas=2 >/dev/null 2>&1
+          fails helm template chart/
+          fails helm template chart/ --set core.publicHost=artifacts.example.com
+          fails helm template chart/ -f chart/ci/ci-values.yaml --set deployment.replicas=2
           helm template chart/ -f chart/ci/ci-values.yaml --set deployment.replicas=2 --set anon.cookieSecretRef.name=canvas-anon | grep -q 'name: ANON_COOKIE_SECRET'
+          # the memory limit must hold heapLimitMb (values.yaml "Memory"): a bad pair fails the render
+          helm template chart/ -f chart/ci/ci-values.yaml --set heapLimitMb=816 --set resources.limits.memory=1Gi >/dev/null
+          fails helm template chart/ -f chart/ci/ci-values.yaml --set heapLimitMb=2000
+          fails helm template chart/ -f chart/ci/ci-values.yaml --set resources.limits.memory=2Gi
+          fails helm template chart/ -f chart/ci/ci-values.yaml --set resources.limits.memory=2304X
+          helm template chart/ -f chart/ci/ci-values.yaml | grep -q 'WORKER_INFLIGHT_BYTES: "67108864"'
+          # the worker test hooks are never rendered, alerts or not
+          if helm template chart/ -f chart/ci/ci-values.yaml --set alerts.enabled=true | grep -q WORKER_TEST_HOOKS; then exit 1; fi
+          helm template chart/ -f chart/ci/ci-values.yaml --set alerts.enabled=true | grep -q 'kind: PrometheusRule'
       - run: npx playwright install --with-deps chromium
       - run: npm run e2e
         env:

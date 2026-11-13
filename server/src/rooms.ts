@@ -1,4 +1,4 @@
-import { ROOM_BASE_COST_BYTES, type Config } from './config.js';
+import { ANON_VISITOR_SHARE_RATIO, GROWTH_FRACTION, LOAD_FRACTION, roomCost, type Config } from './config.js';
 import { encodeNotice } from '@pocharlies/artifacts-canvas-shared/protocol';
 import type { Logger } from './logging.js';
 import type { Metrics } from './metrics.js';
@@ -8,6 +8,8 @@ import type { CanvasObjectStore } from './store.js';
 import { artifactKeyFromObject, canvasLedgerKey, canvasObjectKey } from './paths.js';
 import type { AuthzClient } from './authz.js';
 import type { NoticeKind } from './types.js';
+import { StrikeBook } from './strikes.js';
+import { Semaphore } from './worker-host.js';
 
 /** Who is loading a room (the memory budget's per-principal share, fv6 H-1). */
 export interface Loader {
@@ -15,14 +17,31 @@ export interface Loader {
   anonymous: boolean;
 }
 
-/** Loads (rooms brought into memory) stop at this fraction of the budget; growth may use the rest. */
-export const LOAD_FRACTION = 0.9;
+export { GROWTH_FRACTION, LOAD_FRACTION };
 /**
- * Ledger bytes the stamper writes per content byte, at most (measured, fv6 H-1: tiny shapes one
- * attribution entry each 1.53, geo shapes 0.21-0.28): an update's growth counts the room's own
- * ratio more, between 0.3 and this.
+ * What the stamper adds to the ledger for one update, at most (fv7 F1, server/test/fv7/ledger.ts):
+ * per shape the update writes or deletes, one attribution entry (the shape id, its creator's and
+ * the writer's ids, two timestamps) and one history line (the shape id, the writer's id, the
+ * creator's as owner, the verb and type), each LEDGER_LINE_BYTES plus those ids; history lines
+ * are at most HISTORY_LIMIT per update; plus the writer's `users` entry and the update's headers,
+ * LEDGER_UPDATE_BYTES. Measured with 768-byte ids: 3.4-3.9 KiB per shape against a bound of
+ * 4.3 KiB; with short ids 0.3 KiB per shape. (fv6 counted the ledger as a ratio of the content,
+ * 0.3-1.6: one image of 2 MiB in a new room was counted at 2.6 x its size, more than a share.)
  */
-export const LEDGER_PER_CONTENT = 1.6;
+export const LEDGER_LINE_BYTES = 192;
+export const LEDGER_UPDATE_BYTES = 2048;
+const HISTORY_LIMIT = 300;
+/** A shape id is at most MAX_KEY_LENGTH (256) characters, 3 UTF-8 bytes each. */
+const MAX_KEY_BYTES = 3 * 256;
+
+/** Bound of the ledger the stamper writes for an update (see LEDGER_LINE_BYTES). */
+export function ledgerBound(shapes: number, shapeKeyBytes: number, userIdBytes: number): number {
+  if (shapes <= 0) return 0;
+  const line = LEDGER_LINE_BYTES + 2 * userIdBytes;
+  const lines = Math.min(shapes, HISTORY_LIMIT);
+  // the history keeps the update's LAST lines: their ids may be the longest ones
+  return LEDGER_UPDATE_BYTES + shapes * line + shapeKeyBytes + lines * line + Math.min(shapeKeyBytes, lines * MAX_KEY_BYTES);
+}
 /** Rooms fetched from storage and decoded at once (each fetch holds up to MAX_DOC_BYTES). */
 export const MAX_CONCURRENT_LOADS = 4;
 
@@ -53,10 +72,26 @@ export class RoomManager {
 
   /** server CPU for debounced saves, shared by every room (see RoomDeps.saveBudget) */
   private readonly saveBudget: TokenBucket;
+  /** strikes of the principals whose messages made room workers fault (fv9) */
+  readonly strikes: StrikeBook;
+  /** client messages processed at once over all rooms (Config.workerApplyConcurrency) */
+  readonly applySlots: Semaphore;
+  /**
+   * Bytes of client messages received and not processed yet, over all connections (review M-1:
+   * they wait for their room's queue and the apply slots); kept under WORKER_INFLIGHT_BYTES by
+   * the WebSocket server (ws.ts admitInflight)
+   */
+  inflightBytes = 0;
 
   constructor(private readonly deps: ManagerDeps) {
     deps.metrics.roomMemoryBudget.set(deps.cfg.roomMemoryBudgetBytes);
+    deps.metrics.roomMemoryShare.set({ who: 'user' }, this.share(false));
+    deps.metrics.roomMemoryShare.set({ who: 'anon_visitor' }, this.share(true));
+    deps.metrics.roomMemoryShare.set({ who: 'anon_total' }, this.anonShare());
+    deps.metrics.heldProbe = () => this.heldStats();
     this.saveBudget = new TokenBucket(deps.cfg.saveCpuMsPerSec, deps.cfg.saveCpuBurstMs);
+    this.strikes = new StrikeBook(deps.cfg, deps.metrics, deps.log);
+    this.applySlots = new Semaphore(deps.cfg.workerApplyConcurrency);
   }
 
   get(name: string): Room | undefined {
@@ -85,7 +120,22 @@ export class RoomManager {
         log: this.deps.log,
         metrics: this.deps.metrics,
         onEmpty: (n) => this.rooms.delete(n),
+        // an idle room kept for its unsaved changes (saves were failing) goes once one succeeded
+        onSaved: (r) => {
+          if (r.idle && !r.disposed && this.rooms.get(r.name) === r) void this.leave(r.name, r);
+        },
         saveBudget: this.saveBudget,
+        shareOf: (anonymous) => this.share(anonymous),
+        applySlots: this.applySlots,
+        onStrike: (conn, kind) => this.strikes.strike({ principal: conn.principal, anonymous: conn.identity.anonymous, ip: conn.ip }, kind),
+        onBroken: (r) => {
+          // its connections were closed (1013): they reconnect to a room loaded afresh
+          if (this.rooms.get(r.name) === r) {
+            this.rooms.delete(r.name);
+            this.deps.metrics.rooms.set(this.rooms.size);
+          }
+          r.dispose();
+        },
       });
       room = fresh;
       this.rooms.set(name, fresh);
@@ -133,57 +183,134 @@ export class RoomManager {
     }
   }
 
-  // ---------- loaded-room memory budget (fv6 H-1) ----------
+  // ---------- loaded-room memory budget (fv6 H-1, fv7 F1) ----------
+  //
+  // Every loaded room has an estimated cost (cost(), ROOM_COST_FACTOR x content + ledger), and
+  // that cost is charged to principals (Room.charges):
+  //   load     the room's cost when it was loaded, to the principal whose join loaded it;
+  //   growth   what each accepted update added to the room's estimate, in full, to the principal
+  //            that sent it (never split with the others connected, who pay nothing for reading);
+  //   settle   every save measures the room, and the principals that wrote since the previous
+  //            save share what it really changed by since then (in proportion to their own
+  //            estimates): an over-estimate or a delete is given back to the writers, nobody
+  //            else's charge moves.
+  // A charge stays while the room stays loaded, whoever keeps it loaded (a charged principal
+  // that leaves still pays) and goes with the room when it is evicted. So the charges of a room
+  // always add up to (at least) its cost, and the loaded rooms cost at most what the principals
+  // are charged together. The bounds, both refused with 1013 busy:
+  //   total     loads stop at LOAD_FRACTION (85%) of the budget, growth at GROWTH_FRACTION (80%):
+  //             the 5% between them is always left for loads;
+  //   share     a load or a growing update may not take its principal past its share (a third
+  //             of the budget; an anonymous visitor a quarter of that, 1/12) nor all anonymous
+  //             visitors together past theirs (a third).
+  // One logged-in principal plus every anonymous visitor are then charged at most 2/3 of the
+  // budget: everybody else can always load (fv7 F1: a user who grew rooms while other principals
+  // sat in them was charged a fraction of each, kept them loaded alone once they left, and held
+  // the whole budget: every load, for everybody, was refused 1013).
 
   /** Estimated resident cost of a room of `bytes` encoded bytes (content + ledger). */
   cost(bytes: number): number {
-    return ROOM_BASE_COST_BYTES + this.deps.cfg.roomCostFactor * bytes;
+    return roomCost(this.deps.cfg, bytes);
   }
 
   /**
-   * Estimated memory of the loaded rooms: in total, of the idle ones (evicted first under
-   * pressure), and of the rooms only anonymous visitors hold.
+   * Estimated memory of the loaded rooms: in total, and of the idle ones (evicted first under
+   * pressure). A room's write-ahead log counts where it holds more than the room's own size
+   * (review F-6: while saves fail, edits that churn a small room grow the log, not the room).
    */
-  memory(): { total: number; idle: number; anon: number } {
+  memory(): { total: number; idle: number } {
     let total = this.reserved;
     let idle = 0;
-    let anon = 0;
     for (const r of this.rooms.values()) {
-      const c = this.cost(r.bytes);
+      const c = r.cost + r.walExcess;
       total += c;
-      if (r.idle && !r.disposed) idle += c;
-      if (r.anonOnly()) anon += c;
+      // a room whose changes are not in storage is not evicted (F-6): it is not free either
+      if (r.idle && !r.disposed && !r.unsaved) idle += c;
     }
-    return { total, idle, anon };
+    return { total, idle };
   }
 
-  /** What `principal` keeps loaded: every room it is connected to, split between its principals. */
+  /**
+   * What `principal` is charged for: what it loaded and wrote, in every loaded room (idle rooms,
+   * evicted before any refusal, count as free).
+   */
   held(principal: string): number {
     let h = 0;
-    for (const r of this.rooms.values()) if (r.principals.has(principal)) h += this.cost(r.bytes) / r.principals.size;
+    for (const r of this.rooms.values()) if (!r.idle) h += r.chargeOf(principal);
+    return h;
+  }
+
+  /** What the anonymous visitors together are charged for (idle rooms count as free). */
+  anonHeld(): number {
+    let h = 0;
+    for (const r of this.rooms.values()) if (!r.idle) h += r.anonCharged();
     return h;
   }
 
   /**
-   * The share of the budget one principal may keep loaded: never less than one room at its cap
-   * (with a quarter more, for the estimate of the last update that reaches the cap).
+   * The largest charge of one logged-in principal and of one anonymous visitor, and what the
+   * anonymous visitors hold together (metrics, tests).
    */
+  heldStats(): { user: number; anonVisitor: number; anon: number } {
+    const by = new Map<string, { anonymous: boolean; bytes: number }>();
+    for (const r of this.rooms.values()) {
+      if (r.idle) continue;
+      for (const [p, c] of r.chargeEntries()) {
+        const e = by.get(p);
+        if (e) e.bytes += c.bytes;
+        else by.set(p, { anonymous: c.anonymous, bytes: c.bytes });
+      }
+    }
+    let user = 0;
+    let anonVisitor = 0;
+    let anon = 0;
+    for (const e of by.values()) {
+      if (e.anonymous) {
+        anon += e.bytes;
+        anonVisitor = Math.max(anonVisitor, e.bytes);
+      } else user = Math.max(user, e.bytes);
+    }
+    return { user, anonVisitor, anon };
+  }
+
+  /** The most one principal may be charged for: a fixed fraction of the budget, never more. */
   share(anonymous: boolean): number {
     const { cfg } = this.deps;
-    const s = cfg.roomMemoryBudgetBytes * cfg.roomMemoryPrincipalShare * (anonymous ? 0.25 : 1);
-    return Math.max(s, this.cost(1.25 * (anonymous ? cfg.anonMaxDocBytes : cfg.maxDocBytes)));
+    return cfg.roomMemoryBudgetBytes * cfg.roomMemoryPrincipalShare * (anonymous ? ANON_VISITOR_SHARE_RATIO : 1);
+  }
+
+  /** The most the anonymous visitors together may be charged for. */
+  anonShare(): number {
+    return this.deps.cfg.roomMemoryBudgetBytes * this.deps.cfg.roomMemoryAnonShare;
   }
 
   /**
-   * Why a load of `extra` bytes of resident memory by `loader` is refused, or null. Idle rooms
-   * count as free: they are evicted before a refusal.
+   * Why a load that adds `extra` bytes to the loaded rooms and charges `charge` to `loader` is
+   * refused, or null. Idle rooms count as free: they are evicted before a refusal.
    */
-  private loadRefusal(extra: number, loader: Loader | undefined, m = this.memory()): string | null {
+  private loadRefusal(extra: number, charge: number, loader: Loader | undefined, m = this.memory()): string | null {
     const { cfg } = this.deps;
+    // fv8 P1: a room the server stored is never refused for good because a share cannot hold it
+    // (one update grew a room past every share and it was refused 4413 to everyone, for good): it
+    // loads, its loader charged one share at most (loadCharge). Only a room the whole load budget
+    // cannot hold (stored by a deployment with more memory) never loads here: 4413, no retry.
+    if (charge > cfg.roomMemoryBudgetBytes * LOAD_FRACTION) return 'room_too_large';
+    // fv9 F: the anonymous pool pays the FULL cost of a room an anonymous visitor loads (the
+    // visitor itself one visitor's share at most, P1): a room whose cost alone passes the pool
+    // never loads for anonymous visitors (4413), one that does not fit beside what the pool holds
+    // waits (1013). Three visitors each loading a 5 MiB pub/ room were charged 72.67 MiB each
+    // while the rooms took 651 MiB of the 872 MiB budget.
+    if (loader?.anonymous && charge > this.anonShare()) return 'room_too_large';
+    const own = loader ? this.loadCharge(charge, loader) : 0;
     if (m.total - m.idle + extra > cfg.roomMemoryBudgetBytes * LOAD_FRACTION) return 'room_memory';
-    if (loader && this.held(loader.principal) + extra > this.share(loader.anonymous)) return 'room_memory_principal';
-    if (loader?.anonymous && m.anon + extra > cfg.roomMemoryBudgetBytes * cfg.roomMemoryAnonShare) return 'room_memory_anon';
+    if (loader && this.held(loader.principal) + own > this.share(loader.anonymous)) return 'room_memory_principal';
+    if (loader?.anonymous && this.anonHeld() + charge > this.anonShare()) return 'room_memory_anon';
     return null;
+  }
+
+  /** What a load of a room costing `cost` charges its loader: the cost, one share at most (fv8 P1). */
+  loadCharge(cost: number, loader: Loader): number {
+    return Math.min(cost, this.share(loader.anonymous));
   }
 
   /**
@@ -191,31 +318,47 @@ export class RoomManager {
    * even an empty room fits.
    */
   mayLoad(loader: Loader): string | null {
-    return this.loadRefusal(ROOM_BASE_COST_BYTES, loader);
+    const base = this.deps.cfg.roomBaseCostBytes;
+    return this.loadRefusal(base, base, loader);
   }
 
   /**
    * Admission of a load once its encoded size is known, before anything is decoded: evicts idle
-   * rooms when they are in the way, reserves the room's cost until its documents are in, or
-   * throws BusyError.
+   * rooms when they are in the way, charges the room's cost to the loader and reserves it until
+   * the documents are in (then the charge follows what was really loaded), or throws BusyError.
    */
   private async admitLoad(room: Room, bytes: number, loader: Loader | undefined): Promise<() => void> {
     const { cfg, log } = this.deps;
+    // rooms nobody is connected to anymore are on their way out (flushed, then evicted) and count
+    // as free: when the loader is still charged for one, it goes first, so that what the loader
+    // is charged for is exact when its share is checked below
+    if (loader && [...this.rooms.values()].some((r) => r.idle && !r.disposed && r.chargeOf(loader.principal) > 0)) await this.evictIdle();
+    // the room's base is counted already (it is in `rooms`, empty, while it loads)
     const extra = this.cost(bytes) - this.cost(0);
+    const charge = this.cost(bytes);
     for (let attempt = 0; ; attempt++) {
       const m = this.memory();
-      const why = this.loadRefusal(extra, loader, m) ?? (attempt > 0 && m.total + extra > cfg.roomMemoryBudgetBytes * LOAD_FRACTION ? 'room_memory' : null);
+      const why = this.loadRefusal(extra, charge, loader, m) ?? (attempt > 0 && m.total + extra > cfg.roomMemoryBudgetBytes * LOAD_FRACTION ? 'room_memory' : null);
       if (why) {
         log.warn({ room: room.name, bytes, estimate: Math.round(extra), loaded: Math.round(m.total), budget: cfg.roomMemoryBudgetBytes, why }, 'room load refused: memory budget');
         throw new BusyError(why);
       }
       if (m.total + extra <= cfg.roomMemoryBudgetBytes * LOAD_FRACTION) {
         this.reserved += extra;
+        if (loader && charge > this.share(loader.anonymous)) {
+          log.warn(
+            { room: room.name, bytes, cost: Math.round(charge), share: Math.round(this.share(loader.anonymous)), anonymous: loader.anonymous },
+            'stored room costs more than a share: loaded, its loader charged one share; the size cap refuses it any growth',
+          );
+        }
+        if (loader) room.charge(loader.principal, loader.anonymous, this.loadCharge(charge, loader), false);
         let released = false;
         return () => {
           if (released) return;
           released = true;
           this.reserved -= extra;
+          // the documents are in (a stored room repaired or migrated at load may differ)
+          room.settleCharges(loader);
           this.deps.metrics.roomMemory.set(this.memory().total);
         };
       }
@@ -225,22 +368,81 @@ export class RoomManager {
   }
 
   /**
-   * Why an update that grows `room` by `growthBytes` (encoded) is refused, or null (fv6 H-1):
-   * the loaded rooms may not grow past the budget, a principal past its share, the rooms only
-   * anonymous visitors hold past theirs. Idle rooms count as free and are evicted.
+   * Why an update that grows `room` by `growthBytes` (encoded) and adds at most `ledgerBytes` to
+   * its ledger (ledgerBound()), sent by `principal`, is refused, or null (fv6 H-1, fv7 F1): the
+   * loaded rooms may not grow past GROWTH_FRACTION of the budget, the principal past its share,
+   * the anonymous visitors past theirs. Idle rooms count as free and are evicted. An update that
+   * is let through is charged with chargeUpdate() once applied.
    */
-  growthRefusal(room: Room, principal: string, anonymous: boolean, growthBytes: number): string | null {
+  growthRefusal(room: Room, principal: string, anonymous: boolean, growthBytes: number, ledgerBytes: number): string | null {
+    const extra = this.deps.cfg.roomCostFactor * (growthBytes + ledgerBytes);
     const { cfg } = this.deps;
-    // the ledger grows with the content (the stamper writes it after the apply): counted ahead,
-    // at this room's ledger/content ratio (at least 0.3, at most LEDGER_PER_CONTENT)
-    const ratio = room.approxBytes > 64 * 1024 ? room.ledgerApproxBytes / room.approxBytes : LEDGER_PER_CONTENT;
-    const extra = cfg.roomCostFactor * growthBytes * (1 + Math.min(LEDGER_PER_CONTENT, Math.max(0.3, ratio)));
     const m = this.memory();
-    if (m.idle > 0 && m.total + extra > cfg.roomMemoryBudgetBytes) void this.evictIdle();
-    if (m.total - m.idle + extra > cfg.roomMemoryBudgetBytes) return 'room_memory';
-    if (this.held(principal) + extra / Math.max(1, room.principals.size) > this.share(anonymous)) return 'room_memory_principal';
-    if (room.anonOnly() && m.anon + extra > cfg.roomMemoryBudgetBytes * cfg.roomMemoryAnonShare) return 'room_memory_anon';
+    const limit = cfg.roomMemoryBudgetBytes * GROWTH_FRACTION;
+    if (m.idle > 0 && m.total + extra > limit) void this.evictIdle();
+    if (m.total - m.idle + extra > limit) return 'room_memory';
+    if (this.held(principal) + extra > this.share(anonymous)) return 'room_memory_principal';
+    if (anonymous && this.anonHeld() + extra > this.anonShare()) return 'room_memory_anon';
     return null;
+  }
+
+  /**
+   * An update of `principal` was applied to `room`, whose cost was `costBefore`: what it added
+   * (content and the ledger the stamper wrote for it) is charged to that principal, in full.
+   */
+  chargeUpdate(room: Room, principal: string, anonymous: boolean, costBefore: number): void {
+    room.charge(principal, anonymous, room.cost - costBefore);
+  }
+
+  /**
+   * fv8 U2: a principal's last connection left `room` while others keep it loaded. The load
+   * charges of the principals no longer connected (what the room cost when they loaded it, or
+   * what was handed over to them) move to the principals still connected, split evenly, each at
+   * most what its share still holds (an anonymous visitor's also within the anonymous share);
+   * what nobody can take stays where it was, and moves at a later leave. Before, a user who
+   * opened a big room and left it to colleagues kept paying for it, and could not open a second
+   * one (refused 1013 for as long as they kept it open). What a principal WROTE stays charged to
+   * it (fv7 F1: a writer pays for its growth while the room is loaded, whoever keeps it loaded).
+   */
+  handOver(room: Room): void {
+    if (room.idle || room.disposed) return;
+    const takers = new Map<string, boolean>();
+    for (const c of room.conns.values()) takers.set(c.principal, c.identity.anonymous);
+    if (!takers.size) return;
+    for (const [from, charge] of [...room.chargeEntries()]) {
+      if (takers.has(from) || !(charge.load > 0)) continue;
+      let left = charge.load;
+      const head = new Map<string, number>();
+      for (const [p, anon] of takers) head.set(p, Math.max(0, this.share(anon) - this.held(p)));
+      // fv9 F: load handed to anonymous visitors brings its part of what nobody is charged for
+      // (a room past a share) to the anonymous pool: each byte moved costs the pool `k`
+      let charged = 0;
+      let loads = 0;
+      for (const [, c] of room.chargeEntries()) {
+        charged += c.bytes;
+        loads += c.load;
+      }
+      const k = loads > 0 ? 1 + Math.max(0, room.cost - charged) / loads : 1;
+      let anonRoom = Math.max(0, this.anonShare() - this.anonHeld()) / k;
+      let open = [...takers.keys()].filter((p) => head.get(p)! > 0);
+      while (left > 1 && open.length) {
+        const part = left / open.length;
+        const next: string[] = [];
+        let round = 0;
+        for (const p of open) {
+          const anon = takers.get(p)!;
+          const give = Math.min(part, head.get(p)!, anon ? anonRoom : Infinity);
+          const moved = give > 0 ? room.handOverLoad(from, p, anon, give) : 0;
+          round += moved;
+          left -= moved;
+          head.set(p, head.get(p)! - moved);
+          if (anon) anonRoom -= moved;
+          if (head.get(p)! > 1 && (!anon || anonRoom > 1)) next.push(p);
+        }
+        if (round < 1) break;
+        open = next;
+      }
+    }
   }
 
   /** Flush and evict every idle room (no connection, no join waiting for it). */
@@ -250,13 +452,21 @@ export class RoomManager {
     await Promise.all(all);
   }
 
-  /** Last connection left: flush and evict (once: concurrent callers await the same eviction). */
+  /**
+   * Last connection left: flush and evict (once: concurrent callers await the same eviction). A room
+   * whose save failed stays loaded, its changes in its log, until a save reaches storage (its retries
+   * go on; review F-6, fv4 L2: the room was evicted and the edits since the last save were lost).
+   */
   leave(name: string, room: Room): Promise<void> {
     if (!room.idle) return Promise.resolve();
     let p = this.evicting.get(room);
     if (!p) {
       p = (async () => {
         await room.flush();
+        if (room.unsaved && !room.disposed) {
+          this.deps.log.warn({ room: name, walBytes: room.walBytes }, 'idle room kept loaded: its changes are not in storage yet (saves failing)');
+          return;
+        }
         if (room.idle && this.rooms.get(name) === room) {
           this.rooms.delete(name);
           room.dispose();
@@ -355,6 +565,7 @@ export class RoomManager {
     }
     await Promise.all(all.map((r) => r.flush()));
     for (const r of all) r.dispose();
+    await Promise.all(all.map((r) => r.stopped));
     this.rooms.clear();
     this.deps.metrics.rooms.set(0);
   }

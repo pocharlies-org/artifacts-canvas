@@ -85,3 +85,42 @@ core.publicHost, validated: required (no default) and never an example.* placeho
 {{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) -}}
 {{- end -}}
 {{- end -}}
+
+{{/* Bytes of a Kubernetes memory quantity (a number, or one with k, M, G, T, Ki, Mi, Gi, Ti). */}}
+{{- define "artifacts-canvas.quantityBytes" -}}
+{{- if or (kindIs "float64" .) (kindIs "int" .) (kindIs "int64" .) -}}
+{{- float64 . -}}
+{{- else -}}
+{{- $q := toString . -}}
+{{- $num := regexFind "^[0-9]+(\\.[0-9]+)?" $q -}}
+{{- $unit := trimPrefix $num $q -}}
+{{- $mult := dict "" 1 "k" 1000 "M" 1000000 "G" 1000000000 "T" 1000000000000 "Ki" 1024 "Mi" 1048576 "Gi" 1073741824 "Ti" 1099511627776 -}}
+{{- if or (not $num) (not (hasKey $mult $unit)) -}}
+{{- fail (printf "resources.limits.memory %q: use a number, optionally with k, M, G, T, Ki, Mi, Gi or Ti" $q) -}}
+{{- end -}}
+{{- mulf (float64 $num) (float64 (get $mult $unit)) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The memory limit must hold what the process can (values.yaml, "Memory"): the loaded rooms and one
+worker's message headroom from the budget heapLimitMb leaves, the runtime, the outgoing budget and
+the messages in flight, plus 64 MiB. Without a memory limit there is nothing to check.
+*/}}
+{{- define "artifacts-canvas.validateMemory" -}}
+{{- if not (gt (float64 .Values.heapLimitMb) 0.0) -}}
+{{- fail "heapLimitMb must be a positive number of MiB (the heap the room budget is derived from)" -}}
+{{- end -}}
+{{- $lim := dig "limits" "memory" "" (.Values.resources | default dict) -}}
+{{- if $lim -}}
+{{- $mem := divf (float64 (include "artifacts-canvas.quantityBytes" $lim)) 1048576.0 -}}
+{{- $h := float64 .Values.heapLimitMb -}}
+{{- $s := float64 .Values.limits.roomMemoryPrincipalShare -}}
+{{- $out := divf (float64 .Values.limits.wsOutgoingBudgetBytes) 1048576.0 -}}
+{{- $in := divf (float64 .Values.worker.inflightBytes) 1048576.0 -}}
+{{- $need := addf (mulf (addf 0.85 $s) $h) (mulf (subf 0.15 $s) (addf 192.0 $out)) $in 64.0 -}}
+{{- if lt $mem $need -}}
+{{- fail (printf "resources.limits.memory (%.0f MiB) is too small for heapLimitMb %v: the process can hold up to %.0f MiB with these values (values.yaml, \"Memory\"); raise the memory limit or lower heapLimitMb" $mem .Values.heapLimitMb $need) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

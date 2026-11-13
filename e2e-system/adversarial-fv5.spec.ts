@@ -1,8 +1,9 @@
 /**
  * FULL-SYSTEM regressions of the fifth independent verification (fv5), against the live
  * compose stack, whose canvas container runs under the chart's memory limit (compose.yml:
- * mem_limit 2g, NODE_OPTIONS --max-old-space-size=1536):
- *   P5  one ACL member, a ~20 MB room, dozens of paused sockets (before, at the old 1 GiB
+ * mem_limit 2304m and HEAP_LIMIT_MB=1776 since fv9; 2g and --max-old-space-size=1536 before):
+ *   P5  one ACL member, a room near the size cap (fv5: ~20 MB under the old 20 MiB cap; ~4 MB
+ *       under the 5 MiB cap since fv7), dozens of paused sockets (before, at the old 1 GiB
  *       limit: +400-700 MiB and the container OOM-killed) -> 8 accepted, memory flat, dropped
  *       by the ping timeout, the container never restarts, honest users keep editing
  *   M-2 offline typing + a keystroke while the tab reconnects after a canvas restart
@@ -15,6 +16,8 @@ import * as Y from 'yjs';
 import * as decoding from 'lib0/decoding';
 import { BASE, USERS, container, editorReady, newContext, openWithLogin, publish, waitFor, wsCloses } from './lib';
 
+/** the chart's default memory limit (fv9: 2304 MiB, a worker per loaded room; it was 2 GiB) */
+const LIMIT_MIB = 2304;
 test.describe.configure({ mode: 'serial' });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const log = (k: string, v: unknown) => console.log(`[fv5] ${k}: ${JSON.stringify(v)}`);
@@ -47,30 +50,33 @@ function metric(name: string, label = ''): number {
   return n;
 }
 
-test('P5: dozens of paused sockets of one ACL member on a ~20 MB room: memory flat under the chart limit, no restart, honest users unaffected', async ({ browser }) => {
+test('P5: dozens of paused sockets of one ACL member on a room near the size cap: memory flat under the chart limit, no restart, honest users unaffected', async ({ browser }) => {
   test.setTimeout(420_000);
   // the container runs with the chart's memory limit
-  expect(Number(inspect('{{.HostConfig.Memory}}'))).toBe(2 * 1024 ** 3);
+  expect(Number(inspect('{{.HostConfig.Memory}}'))).toBe(LIMIT_MIB * 1024 ** 2);
   const restarts0 = inspect('{{.RestartCount}}');
   const started0 = inspect('{{.State.StartedAt}}');
   const P = publish({ users: [USERS.user1.email, USERS.user2.email, USERS.user3.email] }, `fv5-p5-${Date.now().toString(36)}`);
   const owner = await join(browser, P.canvas, 'user1');
-  // ~17 MB of content + ledger: a big room just under the 20 MiB cap (the cap counts an upper
-  // bound until the next save, so 40 000 shapes can be refused near the end)
-  const n = 34_000;
-  for (let b = 0; b < n; b += 4000) {
-    await owner.page.evaluate(([b, n]) => {
+  // ~4.5 MB of content + ledger: a big room just under the 5 MiB cap. fv5 ran it on a ~17 MB room
+  // under the old 20 MiB cap; fv7 F1 lowered the cap to what a third of the memory holds, and
+  // counts the attribution and history an update adds against it ahead (per shape: a paste of
+  // 4 000 shapes reserves ~1 MB of ledger), so the room is filled in pastes of 1 000.
+  const n = 8_000;
+  const batch = 1000;
+  for (let b = 0; b < n; b += batch) {
+    await owner.page.evaluate(([b, n, batch]) => {
       const d = (window as any).__canvas.editor.doc;
       d.transact(() => {
-        for (let i = b; i < Math.min(n, b + 4000); i++) d.create({ type: 'geo', geo: 'rectangle', x: i % 900, y: Math.floor(i / 900) * 20, w: 10, h: 10, text: 'label ' + i });
+        for (let i = b; i < Math.min(n, b + batch); i++) d.create({ type: 'geo', geo: 'rectangle', x: i % 900, y: Math.floor(i / 900) * 20, w: 10, h: 10, text: 'label ' + i });
       });
-    }, [b, n]);
-    await sleep(1500);
+    }, [b, n, batch]);
+    await sleep(1000);
   }
   await sleep(4000);
   expect((await wsCloses(owner.page)).filter((c) => c >= 4400 && c < 4500)).toEqual([]);
   const viewer = await join(browser, P.canvas, 'user3');
-  // an honest reader outside any browser (a 34 000-shape page re-renders slowly): what the
+  // an honest reader outside any browser (an 8 000-shape page re-renders slowly): what the
   // server relays, and how fast
   const viewerCookie = (await viewer.ctx.cookies()).map((c) => `${c.name}=${c.value}`).join('; ');
   const reader = new Y.Doc();

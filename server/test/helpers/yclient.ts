@@ -66,9 +66,11 @@ export class TestClient {
         encoding.writeVarUint(e, 0);
         syncProtocol.writeSyncStep1(e, this.doc);
         ws.send(encoding.toUint8Array(e));
-        // IDENTITY follows the upgrade once the room is loaded: resolve when it arrived (or
-        // the server closed), so callers can assert on `identity` right away
-        waitFor(() => this.lastIdentity !== null || ws.readyState !== WebSocket.OPEN, 3000).then(resolve, () => resolve());
+        // resolve once the join is complete — the server's sync step 1 comes after the identity,
+        // the ledger and the content (fv9: the frames come from the room's worker, so the content
+        // can arrive a while after the identity) — or the server closed, so callers can assert on
+        // `identity` and on the room's documents right away
+        waitFor(() => this.step1Received > 0 || ws.readyState !== WebSocket.OPEN, 15_000).then(resolve, () => resolve());
       });
       ws.on('error', reject);
       ws.on('close', (code) => {
@@ -154,20 +156,45 @@ export class TestClient {
 }
 
 /** Resolve when `pred()` holds or reject after `ms`. */
-export function waitFor(pred: () => boolean, ms = 3000, what = ''): Promise<void> {
+export function waitFor(pred: () => boolean | Promise<boolean>, ms = 3000, what = ''): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (pred()) return resolve();
     const started = Date.now();
-    const t = setInterval(() => {
-      if (pred()) {
+    let busy = false;
+    const check = async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        if (await pred()) {
+          clearInterval(t);
+          resolve();
+        } else if (Date.now() - started > ms) {
+          clearInterval(t);
+          reject(new Error('waitFor timed out: ' + what));
+        }
+      } catch (err) {
         clearInterval(t);
-        resolve();
-      } else if (Date.now() - started > ms) {
-        clearInterval(t);
-        reject(new Error('waitFor timed out: ' + what));
+        reject(err);
+      } finally {
+        busy = false;
       }
-    }, 10);
+    };
+    const t = setInterval(() => void check(), 10);
+    void check();
   });
+}
+
+/**
+ * The room's two documents as its worker holds them now (fv9: they live in the room's worker
+ * thread; this decodes the worker's encoding of them), or undefined when the room is not loaded.
+ */
+export async function roomDocs(app: { manager: { get(key: string): { inspect(): Promise<{ doc: Y.Doc; ledger: Y.Doc }> } | undefined } }, key: string): Promise<{ doc: Y.Doc; ledger: Y.Doc } | undefined> {
+  const r = app.manager.get(key);
+  if (!r) return undefined;
+  try {
+    return await r.inspect();
+  } catch {
+    return undefined;
+  }
 }
 
 /** Wait until a client's connection closes with the given code. */
@@ -177,4 +204,25 @@ export async function expectClose(client: TestClient, code: number, ms = 5000): 
   );
   const got = await Promise.race([client.closed, timer]);
   if (got !== code) throw new Error(`expected close code ${code}, got ${got}`);
+}
+
+/**
+ * The room's documents: as its worker holds them while it is loaded, else as stored (fv9: an
+ * evicted room has no documents in this process any more; its last leave saved them).
+ */
+export async function roomOrStored(
+  app: { manager: { get(key: string): { inspect(): Promise<{ doc: Y.Doc; ledger: Y.Doc }> } | undefined } },
+  store: { objects: Map<string, { body: Uint8Array }> },
+  key: string,
+  prefix = '_plugins/canvas',
+): Promise<{ doc: Y.Doc; ledger: Y.Doc }> {
+  const live = await roomDocs(app, key);
+  if (live) return live;
+  const doc = new Y.Doc();
+  const ledger = new Y.Doc();
+  const c = store.objects.get(`${prefix}/${key}.ydoc`)?.body;
+  const l = store.objects.get(`${prefix}/${key}.ydoc.ledger`)?.body;
+  if (c) Y.applyUpdate(doc, c);
+  if (l) Y.applyUpdate(ledger, l);
+  return { doc, ledger };
 }

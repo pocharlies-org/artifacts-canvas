@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { CanvasDoc, compareOrder } from '../src/model/doc';
+import { CanvasDoc, DELETE_BATCH, compareOrder } from '../src/model/doc';
 import type { GeoShape, NoteShape } from '../src/model/types';
 import { linkedDocs } from './helpers';
 
@@ -88,6 +88,38 @@ describe('CanvasDoc', () => {
     const a = d.create({ type: 'arrow', start: { x: 50, y: 50 }, end: { x: 5, y: 5, bind: { shapeId: r, nx: 0.5, ny: 0.5 } }, bend: 0 } as never);
     d.delete([r]);
     expect((d.get(a) as { end: object }).end).toEqual({ x: 5, y: 5 });
+  });
+
+  it('deletes a big selection in parts of DELETE_BATCH shapes (one update each, review F-1), one undo step, arrows unbound', () => {
+    const d = new CanvasDoc();
+    const n = 2 * DELETE_BATCH + 500;
+    const ids: string[] = [];
+    d.transact(() => {
+      for (let i = 0; i < n; i++) ids.push(d.create({ type: 'geo', geo: 'rectangle', x: i, y: 0, w: 10, h: 10 } as never));
+    });
+    // an arrow bound to the LAST shape deleted (in the last part)
+    const a = d.create({ type: 'arrow', start: { x: 50, y: 50 }, end: { x: 5, y: 5, bind: { shapeId: ids[n - 1], nx: 0.5, ny: 0.5 } }, bend: 0 } as never);
+    d.endGesture();
+    const parts: number[] = [];
+    d.doc.on('update', (u: Uint8Array) => {
+      const dec = Y.decodeUpdate(u);
+      let deleted = 0;
+      for (const ranges of dec.ds.clients.values()) for (const r of ranges) deleted += r.len;
+      parts.push(deleted);
+    });
+    d.delete(ids);
+    d.endGesture();
+    expect(parts.length).toBe(3);
+    expect(d.ids()).toEqual([a]);
+    expect((d.get(a) as { end: object }).end).toEqual({ x: 5, y: 5 });
+    // one step undoes the whole delete (and the unbinding)
+    expect(d.undo()).toBe(true);
+    expect(d.ids().length).toBe(n + 1);
+    expect((d.get(a) as { end: { bind?: { shapeId: string } } }).end.bind?.shapeId).toBe(ids[n - 1]);
+    // a small selection is one update, as before
+    parts.length = 0;
+    d.delete(ids.slice(0, 10));
+    expect(parts.length).toBe(1);
   });
 
   it('notifies changed shape ids', () => {

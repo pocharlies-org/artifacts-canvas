@@ -1,6 +1,5 @@
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
-import * as Y from 'yjs';
 import * as decoding from 'lib0/decoding';
 import * as encoding from 'lib0/encoding';
 import * as syncProtocol from 'y-protocols/sync';
@@ -14,10 +13,11 @@ import { artifactState } from './expiry.js';
 import { TokenBucket, clientIp } from './limits.js';
 import { composeIdentity, sanitizeAwarenessUpdate } from './identity.js';
 import { AnonIssuer, assignNum } from './anon.js';
-import { normalizeOrigin } from './config.js';
+import { INFLIGHT_MIN_COST, applyEstimateMs, inflightConnBytes, normalizeOrigin } from './config.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
-import type { RoomManager } from './rooms.js';
-import { BusyError, Room, bufferCap, limitBuffered, sendWs, sentBytes, underBufferCap, type Conn } from './room.js';
+import { ledgerBound, type RoomManager } from './rooms.js';
+import { BusyError, Room, RoomGone, bufferCap, limitBuffered, sendConn, sendWs, sentBytes, underBufferCap, type Conn } from './room.js';
+import { WorkerFault } from './worker-host.js';
 import {
   CLOSE,
   MSG_AWARENESS,
@@ -28,7 +28,7 @@ import {
   encodeLedger,
   encodeNotice,
 } from '@pocharlies/artifacts-canvas-shared/protocol';
-import { SPLIT_COST_BYTES, applyGuarded, checkClientUpdate, type UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { SPLIT_COST_BYTES, utf8Length, type UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
 
 export const WS_ROUTE = '/_canvas/_/ws/';
 /** Same route when the ingress controller strips the plugin prefix. */
@@ -72,8 +72,13 @@ export class WsServer {
    * a visitor cookie (`r:<key>`) and per client IP for anonymous joins (`i:<ip>`)
    */
   private readonly joins = new Map<string, TokenBucket>();
-  /** per principal (`u:<id>` / `a:<visitor>`): live connections and the CPU bucket they share */
-  private readonly principals = new Map<string, { conns: number; cpu: TokenBucket }>();
+  /**
+   * per principal (`u:<id>` / `a:<visitor>`): live connections, the CPU bucket they share, and
+   * the bytes of their messages in flight (review M-1)
+   */
+  private readonly principals = new Map<string, Principal>();
+  /** connections the server stopped reading for their messages in flight (review M-1) */
+  private readonly paused = new Set<Conn>();
   /** server CPU of all connections, and of all anonymous ones (fv5 M-5) */
   private readonly cpuAll: TokenBucket;
   private readonly cpuAnon: TokenBucket;
@@ -171,6 +176,12 @@ export class WsServer {
           return;
         }
         if (!res.allowed) {
+          if (coreError(res.reason)) {
+            // fv7 F6: the core could not answer (timeout, 5xx, garbage): still refused (fail
+            // closed), but with 1013 so the client tries again instead of giving up for good
+            this.refuseBusy(req, socket, head, `authz_${res.reason}`, 'authorization unavailable');
+            return;
+          }
           this.deps.metrics.wsRejected.inc({ reason: `authz_${res.reason}` });
           // Complete the upgrade and close with the protocol close code so the client
           // sees 4403 (no reconnect) instead of a bare connection failure.
@@ -186,6 +197,13 @@ export class WsServer {
         const identity = composeIdentity(res, num, visitor ? this.anon.visitorId(visitor.nonce) : '');
         const principal = visitor ? `a:${visitor.nonce}` : `u:${identity.id}`;
         const ip = clientIp(req, cfg.clientIpHops);
+        // fv9: a principal (or, anonymous, its IP or every anonymous visitor) whose messages made
+        // room workers fault too often waits out its cooldown
+        const cool = this.deps.manager.strikes.coolingDown({ principal, anonymous: !!visitor, ip });
+        if (cool) {
+          this.refuseBusy(req, socket, head, cool, 'cooldown');
+          return;
+        }
         // fv6 M-A: a new visitor is a new principal (budgets of its own): minted within the
         // mint rate only, else refused with 1013 and no cookie (the client retries).
         if (visitor?.fresh && !this.anon.mint(ip, 'ws')) {
@@ -267,7 +285,7 @@ export class WsServer {
           ws.once('close', () => this.releasePrincipal(principal));
           // nothing the client sends is read before join() listens (the room may still load)
           ws.pause();
-          void this.join(ws, key.key, cookie, authorization, identity, visitor ? { nonce: visitor.nonce, num } : null, res.artifact?.ttl ?? null, principal, !!visitor);
+          void this.join(ws, key.key, cookie, authorization, identity, visitor ? { nonce: visitor.nonce, num } : null, res.artifact?.ttl ?? null, principal, !!visitor, ip);
         });
       })
       .catch((err) => {
@@ -307,13 +325,14 @@ export class WsServer {
     });
   }
 
-  private principalOf(key: string, anonymous: boolean): { conns: number; cpu: TokenBucket } {
+  private principalOf(key: string, anonymous: boolean): Principal {
     const { cfg } = this.deps;
     let p = this.principals.get(key);
     if (!p) {
       p = {
         conns: 0,
         cpu: anonymous ? new TokenBucket(cfg.anonCpuMsPerSec, cfg.anonCpuBurstMs) : new TokenBucket(cfg.cpuMsPerSec, cfg.cpuBurstMs),
+        inflight: 0,
       };
       this.principals.set(key, p);
     }
@@ -325,7 +344,98 @@ export class WsServer {
     if (!p) return;
     p.conns = Math.max(0, p.conns - 1);
     // the CPU bucket outlives the connections until it refilled: reconnecting does not reset it
-    if (p.conns === 0 && p.cpu.full()) this.principals.delete(key);
+    if (p.conns === 0 && p.cpu.full() && p.inflight === 0) this.principals.delete(key);
+  }
+
+  // ---------- messages in flight (review M-1) ----------
+  //
+  // A client message (sync step 1, step 2, update) waits for its room's queue and the apply slots
+  // before its room's worker processes it; on main it was guarded and applied in the handler, so
+  // the one thread did not read the socket meanwhile and TCP backpressure bounded what a client
+  // could make the server hold. Now every such message counts, until it is processed, against:
+  //   its connection and its principal: at inflightConnBytes() (two messages of the largest size,
+  //     1 MiB at least) the connection is no longer read (ws.pause(): TCP backpressure again) until
+  //     they are processed;
+  //   the server: a message bigger than CPU_SHED_MIN_BYTES that would take the total past
+  //     WORKER_INFLIGHT_BYTES is refused (1013 `busy`: the client sends it again after it
+  //     reconnected), a small one (an honest edit) is taken and its connection, if it had more in
+  //     flight, is no longer read until the total is under the cap or its own messages are done.
+
+  /** What one connection, and its principal over all its connections, may have in flight before it is not read. */
+  private inflightCap(conn: Conn): number {
+    const { cfg } = this.deps;
+    return inflightConnBytes(conn.identity.anonymous ? cfg.anonMaxMessageBytes : cfg.maxMessageBytes);
+  }
+
+  /**
+   * Count a client message of `bytes` in flight (see above), at INFLIGHT_MIN_COST at least (review
+   * S6: what a tiny message holds is not its bytes). Returns the release to call once it was
+   * processed, or null when it was refused (the connection is closed 1013).
+   */
+  private admitInflight(conn: Conn, bytes: number): (() => void) | null {
+    const { cfg, manager, metrics, log } = this.deps;
+    const cost = Math.max(bytes, INFLIGHT_MIN_COST);
+    const over = manager.inflightBytes + cost > cfg.workerInflightBytes;
+    if (over && bytes > cfg.cpuShedMinBytes) {
+      log.warn({ room: conn.artifactKey, user: conn.identity.id, bytes, inflight: manager.inflightBytes }, 'ws refused: messages in flight over WORKER_INFLIGHT_BYTES');
+      metrics.wsRejected.inc({ reason: 'inflight' });
+      sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+      this.closeConn(conn, CLOSE.tryAgain, 'server busy');
+      return null;
+    }
+    const p = this.principalOf(conn.principal, conn.identity.anonymous);
+    conn.inflight += cost;
+    p.inflight += cost;
+    manager.inflightBytes += cost;
+    metrics.inflightBytes.set(manager.inflightBytes);
+    const cap = this.inflightCap(conn);
+    const why = conn.inflight >= cap ? 'connection' : p.inflight >= cap ? 'principal' : over && conn.inflight > cost ? 'server' : null;
+    if (why) this.pause(conn, why);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      conn.inflight -= cost;
+      p.inflight -= cost;
+      manager.inflightBytes -= cost;
+      metrics.inflightBytes.set(manager.inflightBytes);
+      if (this.paused.size) this.resumePaused();
+    };
+  }
+
+  /** Stop reading a connection (its messages in flight are over a cap). */
+  private pause(conn: Conn, why: 'connection' | 'principal' | 'server'): void {
+    if (conn.paused || conn.closing) return;
+    conn.paused = true;
+    this.paused.add(conn);
+    this.deps.metrics.wsPaused.inc({ why });
+    try {
+      conn.ws.pause();
+    } catch {
+      /* closing */
+    }
+  }
+
+  /** Read again every paused connection whose messages in flight, its principal's and the server's allow it. */
+  private resumePaused(): void {
+    const { cfg, manager } = this.deps;
+    for (const c of this.paused) {
+      if (c.closing || c.ws.readyState !== c.ws.OPEN) {
+        this.paused.delete(c);
+        c.paused = false;
+        continue;
+      }
+      const cap = this.inflightCap(c);
+      if (c.inflight >= cap || (this.principals.get(c.principal)?.inflight ?? 0) >= cap) continue;
+      if (c.inflight > 0 && manager.inflightBytes > cfg.workerInflightBytes) continue;
+      this.paused.delete(c);
+      c.paused = false;
+      try {
+        c.ws.resume();
+      } catch {
+        /* closing */
+      }
+    }
   }
 
   /**
@@ -491,7 +601,7 @@ export class WsServer {
         }
       }
     }
-    for (const [k, p] of this.principals) if (p.conns === 0 && p.cpu.full()) this.principals.delete(k);
+    for (const [k, p] of this.principals) if (p.conns === 0 && p.cpu.full() && p.inflight === 0) this.principals.delete(k);
     let out = this.outgoing();
     if (out.total > cfg.wsOutgoingBudgetBytes) {
       // over the budget: stalled peers first, then principals over their share, then the
@@ -552,6 +662,7 @@ export class WsServer {
     ttl: number | null,
     principal: string,
     anonymous: boolean,
+    ip: string | null = null,
   ): Promise<void> {
     const { cfg, manager, metrics, log } = this.deps;
     let room: Room;
@@ -572,11 +683,20 @@ export class WsServer {
         return;
       }
       if (err instanceof BusyError) {
-        // fv6 H-1: loading this room would pass the memory budget (1013: the client retries)
+        // fv6 H-1: loading this room would pass the memory budget (1013: the client retries);
+        // fv7 F1: a room whose cost alone passes the loader's share never loads for it (4413)
         metrics.wsRejected.inc({ reason: err.reason });
-        sendWs(ws, encodeNotice({ kind: 'busy' }));
-        ws.close(CLOSE.tryAgain, 'server memory busy');
+        sendWs(ws, encodeNotice({ kind: err.terminal ? 'too-large' : 'busy' }));
+        ws.close(err.terminal ? CLOSE.tooLarge : CLOSE.tryAgain, err.terminal ? 'document too large for this server' : 'server memory busy');
         setTimeout(() => ws.terminate(), 1000).unref?.();
+        return;
+      }
+      if (err instanceof WorkerFault) {
+        // fv9: the stored room could not be loaded within its worker's limits (1013: retried)
+        log.error({ err: String(err), room: artifactKey }, 'room load failed in its worker');
+        metrics.wsRejected.inc({ reason: `load_${err.kind}` });
+        sendWs(ws, encodeNotice({ kind: 'busy' }));
+        ws.close(CLOSE.tryAgain, 'server busy');
         return;
       }
       log.error({ err: String(err), room: artifactKey }, 'room load failed');
@@ -599,8 +719,6 @@ export class WsServer {
       if (anonNum !== anonVisitor.num) identity = { ...identity, name: `Anónimo ${anonNum}` };
     }
     const t0 = performance.now();
-    const ledgerFrames = room.ledgerFrames();
-    const ledgerBytes = ledgerFrames.reduce((a, f) => a + f.byteLength, 0);
     const conn: Conn = {
       ws,
       artifactKey,
@@ -617,7 +735,9 @@ export class WsServer {
         ? new TokenBucket(cfg.anonSyncBytesPerSec, cfg.anonSyncBurstBytes)
         : new TokenBucket(cfg.syncBytesPerSec, cfg.syncBurstBytes),
       cpu: this.principalOf(principal, identity.anonymous).cpu,
+      inflight: 0,
       principal,
+      ip,
       resync: new TokenBucket(0.5, 20),
       step1Answers: 0,
       joinSv: new Map(),
@@ -625,10 +745,10 @@ export class WsServer {
       joining: true,
       backlog: [],
       backlogBytes: 0,
-      // until the content frame is encoded, the room's last known size stands for it
-      joinBytes: ledgerBytes + room.approxBytes,
+      // until the frames are encoded, the room's last known size stands for them
+      joinBytes: room.ledgerApproxBytes + room.approxBytes,
       joinStarted: Date.now(),
-      joinFrames: ledgerFrames,
+      joinFrames: null,
       overSince: 0,
       lastSent: 0,
       lastBuffered: 0,
@@ -645,6 +765,8 @@ export class WsServer {
       log.warn({ room: artifactKey, user: identity.id, buffered: ws.bufferedAmount }, 'ws dropped: outgoing buffer over the cap');
     };
     limitBuffered(ws, cfg.wsMaxBufferedBytes + conn.joinBytes, onOver);
+    // attached before its frames are taken (fv9: they come from the worker, a job of the room):
+    // whatever the room broadcasts meanwhile waits in the backlog and follows the frames
     room.attach(conn);
     room.pendingJoins = Math.max(0, room.pendingJoins - 1);
     metrics.wsAccepted.inc({ anonymous: identity.anonymous ? 'true' : 'false' });
@@ -670,7 +792,10 @@ export class WsServer {
         log.warn({ err: String(err), room: artifactKey }, 'bad message');
         this.closeConn(conn, 1003, 'bad message');
       }
+      // the main thread's own share (decoding the frame, awareness); the worker's time is
+      // charged when its answer comes (onUpdate, answerStep1)
       this.chargeCpu(conn, room, performance.now() - t1);
+      if (buf.byteLength > 256 * 1024) metrics.sampleHeap();
     });
     ws.on('pong', () => {
       conn.awaitingPong = false;
@@ -688,8 +813,11 @@ export class WsServer {
       conn.closing = true;
       conn.backlog = [];
       conn.backlogBytes = 0;
+      this.paused.delete(conn);
       if (conn.recheckTimer) clearInterval(conn.recheckTimer);
       room.detach(conn);
+      // fv8 U2: a loader that left no longer pays for what the others keep open
+      if (!room.principals.has(conn.principal)) manager.handOver(room);
       awarenessProtocol.removeAwarenessStates(room.awareness, Array.from(conn.clientIds), null);
       metrics.connections.dec({ anonymous: identity.anonymous ? 'true' : 'false' });
       void manager.leave(artifactKey, room);
@@ -708,10 +836,33 @@ export class WsServer {
     // IDENTITY MUST be the first message (protocol §4.1). The ledger (read-only for clients)
     // before the content, so shapes arrive with authors.
     sendWs(ws, encodeIdentity(identity));
+    const mainMs = performance.now() - t0;
+    const gone = (err: unknown) => {
+      if (conn.closing) return;
+      // the room was dropped (a fault it could not recover from) or evicted: retry
+      if (!(err instanceof RoomGone)) log.warn({ err: String(err), room: artifactKey }, 'join frames failed');
+      sendWs(ws, encodeNotice({ kind: 'busy' }));
+      this.closeConn(conn, CLOSE.tryAgain, 'server busy');
+    };
+    let ledgerFrames: Uint8Array[];
+    try {
+      ledgerFrames = await room.ledgerFrames();
+    } catch (err) {
+      gone(err);
+      return;
+    }
+    if (conn.closing || ws.readyState !== ws.OPEN) return;
+    const t1 = performance.now();
+    const ledgerBytes = ledgerFrames.reduce((a, f) => a + f.byteLength, 0);
+    conn.joinFrames = ledgerFrames;
+    conn.joinBytes = ledgerBytes + room.approxBytes;
+    limitBuffered(ws, cfg.wsMaxBufferedBytes + conn.joinBytes, onOver);
     for (const f of ledgerFrames) sendWs(ws, f);
-    this.chargeCpu(conn, room, performance.now() - t0, false);
-    // the CPU the load took (decoding the stored documents) counts against the server-wide
-    // budgets (fv6 M-A): while they are used up, joins that would load or encode wait
+    // the main thread's own work (not the waits for the room's worker: their time is the worker's)
+    this.chargeCpu(conn, room, performance.now() - t1 + mainMs, false);
+    // the CPU the load and the join encodings took in the room's worker (decoding the stored
+    // documents, encoding the ledger) counts against the server-wide budgets (fv6 M-A): while they
+    // are used up, joins that would load or encode wait
     const loadMs = room.takeLoadMs();
     this.cpuAll.charge(loadMs);
     if (identity.anonymous) this.cpuAnon.charge(loadMs);
@@ -721,8 +872,15 @@ export class WsServer {
     // client answers with a step 2 holding what the room lacks — the edits it made while
     // disconnected. That answer is a plain client update and goes through the guard; the
     // content document holds no server-only root a client could echo back.
-    const t2 = performance.now();
-    const content = room.contentFrames();
+    let content: Awaited<ReturnType<Room['contentFrames']>>;
+    try {
+      content = await room.contentFrames();
+    } catch (err) {
+      gone(err);
+      return;
+    }
+    if (conn.closing || ws.readyState !== ws.OPEN) return;
+    const t3 = performance.now();
     conn.joinSv = content.sv;
     conn.joinFrames = [...ledgerFrames, ...content.frames];
     conn.joinBytes = ledgerBytes + content.frames.reduce((a, f) => a + f.byteLength, 0);
@@ -742,13 +900,11 @@ export class WsServer {
     conn.backlog = [];
     conn.backlogBytes = 0;
     for (const m of backlog) sendWs(ws, m);
-    this.chargeCpu(conn, room, performance.now() - t2, false);
+    this.chargeCpu(conn, room, performance.now() - t3 + room.takeLoadMs(), false);
     if (conn.deferredStep1 && !conn.closing) {
       const sv = conn.deferredStep1;
       conn.deferredStep1 = undefined;
-      const t3 = performance.now();
-      this.answerStep1(conn, room, sv);
-      this.chargeCpu(conn, room, performance.now() - t3, false);
+      void this.answerStep1(conn, room, sv, false);
     }
   }
 
@@ -773,6 +929,17 @@ export class WsServer {
   /** Close once (later messages of a closing connection are ignored). */
   private closeConn(conn: Conn, code: number, reason: string): void {
     conn.closing = true;
+    if (conn.paused) {
+      // read again so that the peer's close frame is seen (what it still sends is dropped unread
+      // above); a paused socket would be held until the close timeout
+      this.paused.delete(conn);
+      conn.paused = false;
+      try {
+        conn.ws.resume();
+      } catch {
+        /* gone */
+      }
+    }
     try {
       conn.ws.close(code, reason);
     } catch {
@@ -800,7 +967,9 @@ export class WsServer {
     if (type === MSG_SYNC) {
       const syncType = decoding.readVarUint(dec);
       if (syncType === syncProtocol.messageYjsSyncStep1) {
-        this.answerStep1(conn, room, decoding.readVarUint8Array(dec));
+        const sv = decoding.readVarUint8Array(dec);
+        const release = this.admitInflight(conn, buf.byteLength);
+        if (release) void this.answerStep1(conn, room, sv).then(release, release);
         return;
       }
       // step 2 and update carry the same payload: varUint8Array(update) (y-protocols/sync:
@@ -812,79 +981,16 @@ export class WsServer {
       const update = decoding.readVarUint8Array(dec);
       if (syncType === syncProtocol.messageYjsSyncStep2) conn.resyncAsked = false;
       if (conn.identity.readOnly) return;
-      // Protocol §5.3: a write the content guard refuses closes the connection and the
-      // update is NOT applied.
-      const check = checkClientUpdateSafe(room, conn, update);
-      if (check.bad === 'pending') {
-        // fv5 M-2: an honest tab that reconnects with offline edits can send a fresh edit
-        // before its step-2 answer (y-websocket sends local updates as soon as the socket is
-        // open); that edit depends on structs the room does not have yet. It is not applied
-        // (the room never holds pending state) and the connection stays open: the server
-        // asks with a step 1 for what it lacks, and the client's step-2 answer carries the
-        // edit too. A connection that keeps sending updates that never integrate is closed.
-        this.askResync(conn, room);
+      // fv9: a principal cooling down after strikes writes nothing (1013: it retries later)
+      const cool = this.deps.manager.strikes.coolingDown({ principal: conn.principal, anonymous: conn.identity.anonymous, ip: conn.ip });
+      if (cool) {
+        sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+        this.closeConn(conn, CLOSE.tryAgain, 'cooldown');
+        this.deps.metrics.wsRejected.inc({ reason: `write_${cool}` });
         return;
       }
-      const bad = check.bad;
-      if (bad) {
-        this.deps.log.warn({ room: room.name, user: conn.identity.id, root: bad }, 'forbidden content write');
-        this.closeConn(conn, CLOSE.forbidden, `write to ${bad} not allowed`);
-        this.deps.metrics.wsRejected.inc({ reason: 'forbidden_write' });
-        return;
-      }
-      // Document size cap (protocol §10), per connection: an update that would grow the room
-      // past THIS connection's cap is refused and only this connection is closed. The room
-      // stays open for everyone else (an anonymous visitor cannot lock the room).
-      // The ledger counts too (fv4 M4: create/delete cycles grew it ~7x the content). The
-      // sizes are the exact ones of the last save plus every accepted update since (an upper
-      // bound; every save — at most SAVE_DEBOUNCE_MS after a change — makes them exact again,
-      // deletes included). Nothing O(room) runs here: no scratch copy, no re-encoding per
-      // message (fv4 H2). An update that adds nothing (deletes only) always passes.
-      // fv5 L-2: deletes that split live items grow the encoded room too (every split becomes
-      // structs of its own), so they count against the cap with SPLIT_COST_BYTES per split.
-      const limit = conn.identity.anonymous ? cfg.anonMaxDocBytes : cfg.maxDocBytes;
-      const growth = update.byteLength + check.splits * SPLIT_COST_BYTES;
-      if (check.grows && room.approxBytes + room.ledgerApproxBytes + growth > limit) {
-        sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
-        this.closeConn(conn, CLOSE.tooLarge, 'document too large');
-        this.deps.metrics.wsRejected.inc({ reason: 'doc_too_large' });
-        return;
-      }
-      // fv6 H-1: the loaded rooms together may not grow past the memory budget, one principal
-      // past its share of it, the rooms only anonymous visitors hold past theirs. Refused with
-      // 1013 (busy, the client retries); nothing is applied.
-      if (check.grows) {
-        const why = this.deps.manager.growthRefusal(room, conn.principal, conn.identity.anonymous, growth);
-        if (why) {
-          this.deps.log.warn({ room: room.name, user: conn.identity.id, growth, why }, 'update refused: memory budget');
-          sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
-          this.closeConn(conn, CLOSE.tryAgain, 'server memory busy');
-          this.deps.metrics.wsRejected.inc({ reason: why });
-          return;
-        }
-      }
-      // Apply with the connection as origin (the stamper attributes it to this identity).
-      // applyGuarded ALWAYS drops whatever Yjs could not integrate, also when it throws
-      // mid-way. A clean apply marks the room dirty through the document's update event;
-      // anything else marks it here (what did integrate before a throw was broadcast).
-      let outcome: ReturnType<typeof applyGuarded> | null = null;
-      try {
-        outcome = applyGuarded(room.doc, update, conn);
-      } finally {
-        room.approxBytes += growth;
-        if (!outcome || outcome.threw || outcome.droppedPending) room.markDirty();
-      }
-      if (outcome.threw || outcome.droppedPending) {
-        this.deps.log.error(
-          { room: room.name, user: conn.identity.id, threw: outcome.threw, droppedPending: outcome.droppedPending },
-          'accepted update did not integrate cleanly: sender closed, pending dropped',
-        );
-        if (outcome.droppedPending) this.deps.metrics.pendingDropped.inc({ where: 'apply' });
-        this.closeConn(conn, CLOSE.forbidden, 'write not allowed');
-        this.deps.metrics.wsRejected.inc({ reason: outcome.threw ? 'apply_threw' : 'pending_after_apply' });
-        return;
-      }
-      room.claimWriters(check.writers, conn.identity.id);
+      const release = this.admitInflight(conn, buf.byteLength);
+      if (release) void this.onUpdate(conn, room, update).then(release, release);
       return;
     }
     if (type === MSG_LEDGER) {
@@ -924,6 +1030,166 @@ export class WsServer {
   }
 
   /**
+   * A client update (protocol §5.3), processed by the room's worker (fv9): the guard runs there,
+   * the checks below run here on its verdict, and the worker applies it or drops it. A write the
+   * guard refuses closes the connection and the update is NOT applied. A worker that takes too
+   * long or runs out of heap on it is terminated and the room rebuilt (Room.recover): the sender
+   * is closed 4413 and struck.
+   */
+  private async onUpdate(conn: Conn, room: Room, update: Uint8Array): Promise<void> {
+    const { cfg } = this.deps;
+    let precharged = 0;
+    let growth = 0;
+    try {
+      const r = await room.update(conn, update, {
+        decide: (check) => {
+          if (check.bad === 'pending') {
+            // fv5 M-2: an honest tab that reconnects with offline edits can send a fresh edit
+            // before its step-2 answer (y-websocket sends local updates as soon as the socket is
+            // open); that edit depends on structs the room does not have yet. It is not applied
+            // (the room never holds pending state) and the connection stays open: the server
+            // asks with a step 1 for what it lacks, and the client's step-2 answer carries the
+            // edit too. A connection that keeps sending updates that never integrate is closed.
+            this.askResync(conn, room);
+            return false;
+          }
+          if (check.bad === 'splits' || check.bad === 'blocks' || (!check.bad && applyEstimateMs(0, check.splitWork, check.scanWork) > cfg.maxApplyMs)) {
+            // fv8 P1/P2, fv9: more cuts of items, merges, or more work to make and place them, or
+            // more client blocks, than one update may carry: Yjs would copy, splice and scan for
+            // seconds. Refused like an update too large: only the sender closes.
+            // (the messages are the fv8 ones: log scrapers and the fv8 full-system spec look for them)
+            const deletes = check.deletesOnly;
+            this.deps.log.warn(
+              { room: room.name, user: conn.identity.id, bytes: update.byteLength, why: check.bad ?? 'work', merges: check.merges, deletesOnly: deletes },
+              check.bad === 'blocks' ? 'update refused: too many clients' : 'update refused: too many cuts',
+            );
+            // fv9: a strike, like a worker fault, so that retrying costly messages ends in a
+            // cooldown. Review F-1: not for a delete (no new struct): an honest bulk delete of
+            // thousands of shapes another session wrote can be one (a co-writer who filled the board
+            // made the deleter's three tries a 10-minute cooldown on every canvas), and the guard
+            // that refused it cost the server only its own time (charged to the sender's budget).
+            if (!deletes) this.deps.manager.strikes.strike({ principal: conn.principal, anonymous: conn.identity.anonymous, ip: conn.ip }, check.bad ?? 'work');
+            // the canvas is not full: a delete of fewer shapes at a time goes through (the editor
+            // deletes big selections in parts, CanvasDoc.delete)
+            sendWs(conn.ws, encodeNotice({ kind: deletes ? 'too-costly' : 'too-large' }));
+            this.closeConn(conn, CLOSE.tooLarge, check.bad === 'blocks' ? 'update carries too many clients' : deletes ? 'delete too costly: fewer shapes at a time' : 'update cuts too many items');
+            this.deps.metrics.wsRejected.inc({ reason: check.bad === 'blocks' ? 'too_many_clients' : deletes ? 'delete_too_costly' : 'too_many_splits' });
+            return false;
+          }
+          const bad = check.bad;
+          if (bad) {
+            this.deps.log.warn({ room: room.name, user: conn.identity.id, root: bad }, 'forbidden content write');
+            this.closeConn(conn, CLOSE.forbidden, `write to ${bad} not allowed`);
+            this.deps.metrics.wsRejected.inc({ reason: 'forbidden_write' });
+            return false;
+          }
+          // review F-6: the room's saves keep failing and its write-ahead log is full: nothing more
+          // is accepted until a save reaches storage (1013: the client keeps the edit and sends it
+          // again once it reconnected); what was accepted is in the log and saved with the next save
+          if (room.walFull) {
+            this.deps.log.error({ room: room.name, user: conn.identity.id, walBytes: room.walBytes }, 'update refused: write-ahead log full (saves are failing)');
+            this.deps.metrics.walFull.inc();
+            sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+            this.closeConn(conn, CLOSE.tryAgain, 'server busy');
+            this.deps.metrics.wsRejected.inc({ reason: 'wal_full' });
+            return false;
+          }
+          // Document size cap (protocol §10), per connection: an update that would grow the room
+          // past THIS connection's cap is refused and only this connection is closed. The room
+          // stays open for everyone else (an anonymous visitor cannot lock the room).
+          // The ledger counts too (fv4 M4: create/delete cycles grew it ~7x the content). The
+          // sizes are the exact ones of the last save plus every accepted update since (an upper
+          // bound; every save — at most SAVE_DEBOUNCE_MS after a change — makes them exact again,
+          // deletes included). Nothing O(room) runs here: no scratch copy, no re-encoding per
+          // message (fv4 H2). An update that adds nothing (deletes only) always passes.
+          // fv5 L-2: deletes that split live items grow the encoded room too (every split becomes
+          // structs of its own), so they count against the cap with SPLIT_COST_BYTES per split.
+          // fv7 F1: and the ledger the stamper writes with it, counted ahead (its shapes, their ids
+          // and the room's longest user id: each line names the writer and the shape's creator), so a
+          // room never passes its cap by the attribution of its last update (a room at the cap must
+          // fit one share of the memory budget, and load for anyone).
+          const limit = conn.identity.anonymous ? cfg.anonMaxDocBytes : cfg.maxDocBytes;
+          growth = update.byteLength + check.splits * SPLIT_COST_BYTES;
+          const ledger = check.grows ? ledgerBound(check.shapes, check.shapeKeyBytes, Math.max(utf8Length(conn.identity.id), room.maxUserIdBytes)) : 0;
+          if (check.grows && room.approxBytes + room.ledgerApproxBytes + growth + ledger > limit) {
+            sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
+            this.closeConn(conn, CLOSE.tooLarge, 'document too large');
+            this.deps.metrics.wsRejected.inc({ reason: 'doc_too_large' });
+            return false;
+          }
+          // fv6 H-1, fv7 F1: the loaded rooms together may not grow past GROWTH_FRACTION of the
+          // memory budget, the sender past its share of it (it is charged what it writes, in full),
+          // the anonymous visitors past theirs. Refused with 1013 (busy, the client retries); nothing
+          // is applied.
+          if (check.grows) {
+            const why = this.deps.manager.growthRefusal(room, conn.principal, conn.identity.anonymous, growth, ledger);
+            if (why) {
+              this.deps.log.warn({ room: room.name, user: conn.identity.id, growth, why }, 'update refused: memory budget');
+              sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+              this.closeConn(conn, CLOSE.tryAgain, 'server memory busy');
+              this.deps.metrics.wsRejected.inc({ reason: why });
+              return false;
+            }
+          }
+          // fv8 P2: the CPU the apply will take is charged BEFORE it runs: an update whose
+          // estimate the sender's budget or the server's cannot cover is refused 1013 (busy: the
+          // client reconnects and sends it again once the budget refilled). One that costs more
+          // than half a burst needs half a burst (a bucket never holds more than its burst); a
+          // cheap one (under PRECHARGE_MIN_MS, the small edits fv5 M-5 lets through while the
+          // server is busy) is charged after, as before.
+          const estimate = applyEstimateMs(update.byteLength, check.splitWork, check.scanWork);
+          const covers = (b: TokenBucket) => b.level() >= Math.min(estimate, b.burst / 2);
+          if (estimate >= PRECHARGE_MIN_MS && (!covers(conn.cpu) || !covers(this.cpuAll) || (conn.identity.anonymous && !covers(this.cpuAnon)))) {
+            this.deps.log.warn({ room: room.name, user: conn.identity.id, estimateMs: Math.round(estimate) }, 'update refused: cpu budget');
+            sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+            this.closeConn(conn, CLOSE.tryAgain, 'server busy');
+            this.deps.metrics.wsRejected.inc({ reason: 'cpu_precharge' });
+            return false;
+          }
+          conn.cpu.charge(estimate);
+          this.cpuAll.charge(estimate);
+          if (conn.identity.anonymous) this.cpuAnon.charge(estimate);
+          precharged = estimate;
+          return true;
+        },
+        applied: (check, outcome, before) => {
+          // An update that only removes whole items counts what it really deleted (Yjs' own
+          // encoding of the change), not its size: a delete set that repeats deletions the room
+          // has (a full-state step 2 does) changes nothing, and counted at its size it grew the
+          // estimate with nothing behind it until a save, which no change triggers (fv7 F1).
+          room.approxBytes += check.grows ? growth : room.contentChangedBytes - before.changed;
+          if (outcome.threw || outcome.droppedPending) room.markDirty();
+          // fv7 F1: what the update added (content, and the ledger the stamper wrote for it and
+          // for the client ids it bound) is charged to its sender, in full
+          this.deps.manager.chargeUpdate(room, conn.principal, conn.identity.anonymous, before.cost);
+          if (outcome.threw || outcome.droppedPending) {
+            this.deps.log.error(
+              { room: room.name, user: conn.identity.id, threw: outcome.threw, droppedPending: outcome.droppedPending },
+              'accepted update did not integrate cleanly: sender closed, pending dropped',
+            );
+            if (outcome.droppedPending) this.deps.metrics.pendingDropped.inc({ where: 'apply' });
+            this.closeConn(conn, CLOSE.forbidden, 'write not allowed');
+            this.deps.metrics.wsRejected.inc({ reason: outcome.threw ? 'apply_threw' : 'pending_after_apply' });
+          }
+        },
+      });
+      // what the worker took, minus what was charged ahead for its apply (fv8 P2)
+      if (r) this.chargeCpu(conn, room, r.ms - precharged);
+    } catch (err) {
+      if (err instanceof WorkerFault) {
+        // the room was rebuilt and the sender closed and struck (Room.recover): the worker time
+        // the message burned is charged to its principal and the server-wide budgets (not when the
+        // room just went away under it: evicted or expired)
+        if (!room.disposed) this.chargeCpu(conn, room, room.messageTimeout(update.byteLength) - precharged, false);
+        return;
+      }
+      if (err instanceof RoomGone) return;
+      this.deps.log.warn({ err: String(err), room: room.name }, 'bad message');
+      this.closeConn(conn, 1003, 'bad message');
+    }
+  }
+
+  /**
    * Sync step 1 from a client (fv4 H1: every 4-byte step 1 with an empty state vector was
    * answered with the whole room, buffered without bound for a peer that never read).
    *   - The answer is a diff against the client's state vector merged with the one the
@@ -934,19 +1200,10 @@ export class WsServer {
    *     for the whole room again) closes the connection with 4429.
    *   - Nothing is computed for a peer whose outgoing buffer is over the cap.
    */
-  private answerStep1(conn: Conn, room: Room, sv: Uint8Array): void {
+  private async answerStep1(conn: Conn, room: Room, sv: Uint8Array, closeInDebt = true): Promise<void> {
     if (conn.joining) {
       // its join state vector is not known yet: answered right after the content frame
-      Y.decodeStateVector(sv); // malformed = bad message, now
       conn.deferredStep1 = sv;
-      return;
-    }
-    const clientSv = Y.decodeStateVector(sv);
-    const emptySv = clientSv.size === 0;
-    if (conn.step1Answers > 0 && emptySv) {
-      this.deps.metrics.wsRejected.inc({ reason: 'sync_repeat' });
-      sendWs(conn.ws, encodeNotice({ kind: 'rate-limited' }));
-      this.closeConn(conn, CLOSE.rateLimited, 'full sync repeated');
       return;
     }
     if (!underBufferCap(conn.ws)) {
@@ -955,21 +1212,52 @@ export class WsServer {
       conn.ws.terminate();
       return;
     }
-    const merged = new Map(conn.joinSv);
-    for (const [client, clock] of clientSv) if (clock > (merged.get(client) ?? 0)) merged.set(client, clock);
-    const diff = Y.encodeStateAsUpdate(room.doc, Y.encodeStateVector(merged));
-    if (conn.step1Answers > 0 && !conn.syncBytes.take(diff.byteLength)) {
-      this.deps.metrics.wsRejected.inc({ reason: 'sync_bytes' });
-      sendWs(conn.ws, encodeNotice({ kind: 'rate-limited' }));
-      this.closeConn(conn, CLOSE.rateLimited, 'sync budget');
-      return;
+    try {
+      await room.diff(conn, sv, {
+        refuseEmpty: () => conn.step1Answers > 0,
+        answered: (r) => {
+          // what the answer took in the worker; a principal in debt is closed (fv5 M-5), except
+          // for the answer a join owes its client
+          this.chargeCpu(conn, room, r.ms, closeInDebt);
+          if (conn.closing) return;
+          if (r.malformed) {
+            this.closeConn(conn, 1003, 'bad message');
+            return;
+          }
+          if (!r.diff) {
+            this.deps.metrics.wsRejected.inc({ reason: 'sync_repeat' });
+            sendWs(conn.ws, encodeNotice({ kind: 'rate-limited' }));
+            this.closeConn(conn, CLOSE.rateLimited, 'full sync repeated');
+            return;
+          }
+          if (!underBufferCap(conn.ws)) {
+            this.deps.metrics.wsRejected.inc({ reason: 'slow_consumer' });
+            conn.closing = true;
+            conn.ws.terminate();
+            return;
+          }
+          if (conn.step1Answers > 0 && !conn.syncBytes.take(r.diff.byteLength)) {
+            this.deps.metrics.wsRejected.inc({ reason: 'sync_bytes' });
+            sendWs(conn.ws, encodeNotice({ kind: 'rate-limited' }));
+            this.closeConn(conn, CLOSE.rateLimited, 'sync budget');
+            return;
+          }
+          conn.step1Answers++;
+          const e = encoding.createEncoder();
+          encoding.writeVarUint(e, MSG_SYNC);
+          encoding.writeVarUint(e, syncProtocol.messageYjsSyncStep2);
+          encoding.writeVarUint8Array(e, r.diff);
+          sendWs(conn.ws, encoding.toUint8Array(e));
+        },
+      });
+    } catch (err) {
+      if (err instanceof WorkerFault) {
+        if (!room.disposed) this.chargeCpu(conn, room, room.messageTimeout(sv.byteLength), false);
+        return;
+      }
+      if (err instanceof RoomGone) return;
+      this.closeConn(conn, 1003, 'bad message');
     }
-    conn.step1Answers++;
-    const e = encoding.createEncoder();
-    encoding.writeVarUint(e, MSG_SYNC);
-    encoding.writeVarUint(e, syncProtocol.messageYjsSyncStep2);
-    encoding.writeVarUint8Array(e, diff);
-    sendWs(conn.ws, encoding.toUint8Array(e));
   }
 
   /** Ask the client for what the room lacks (sync step 1), at most one request outstanding. */
@@ -983,7 +1271,10 @@ export class WsServer {
       return;
     }
     conn.resyncAsked = true;
-    sendWs(conn.ws, room.step1Frame());
+    void room.step1Frame().then(
+      (f) => sendConn(conn, f),
+      () => undefined,
+    );
   }
 
   private async recheck(conn: Conn, room: Room): Promise<void> {
@@ -999,26 +1290,36 @@ export class WsServer {
       return;
     }
     if (!res.allowed) {
+      if (coreError(res.reason)) {
+        // fv7 F6: the core could not answer the re-check (timeout, 5xx): the connection is not
+        // kept unverified (fail closed), but nothing was revoked either: 1013, the client
+        // reconnects and is checked again (4403 made every tab give up during a core blip)
+        sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+        this.closeConn(conn, CLOSE.tryAgain, 'authorization unavailable');
+        this.deps.metrics.wsRejected.inc({ reason: `recheck_${res.reason}` });
+        return;
+      }
       sendWs(conn.ws, encodeNotice({ kind: 'revoked' }));
-      conn.ws.close(CLOSE.forbidden, 'authorization revoked');
+      // closing: updates of this connection still queued are dropped, not applied after the revoke
+      this.closeConn(conn, CLOSE.forbidden, 'authorization revoked');
       this.deps.metrics.wsRejected.inc({ reason: 'revoked' });
     }
   }
 }
 
-/**
- * The §5.3 guard with this connection's client-id ownership; it can throw on malformed
- * updates, and any throw counts as forbidden.
- */
-function checkClientUpdateSafe(room: Room, conn: Conn, update: Uint8Array): UpdateCheck {
-  try {
-    return checkClientUpdate(room.doc, update, {
-      serverClient: room.doc.clientID,
-      mayWriteClient: (client) => room.mayWrite(client, conn.identity.id, conn),
-    });
-  } catch {
-    return { bad: 'forbidden', writers: [], grows: false, splits: 0 };
-  }
+/** A principal (`u:<id>` / `a:<visitor>`): its live connections, their CPU bucket, their messages in flight (bytes). */
+interface Principal {
+  conns: number;
+  cpu: TokenBucket;
+  inflight: number;
+}
+
+/** An update whose apply is estimated under this (ms) is not checked against the CPU budgets first (fv8 P2). */
+const PRECHARGE_MIN_MS = 1;
+
+/** An authz answer that says the core failed (not a decision): `core_error`, `malformed` (authz.ts). */
+function coreError(reason: string): boolean {
+  return reason === 'core_error' || reason === 'malformed';
 }
 
 /** Join deadline: the payload at WS_JOIN_MIN_BYTES_PER_SEC, never less than 30 s. */

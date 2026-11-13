@@ -1,3 +1,4 @@
+import v8 from 'node:v8';
 import {
   Counter,
   Gauge,
@@ -73,6 +74,22 @@ export class Metrics {
     help: 'Bytes held for all WebSocket peers (outgoing buffers; join payloads in flight counted once per room version)',
     registers: [this.registry],
   });
+  readonly inflightBytes = new Gauge({
+    name: 'canvas_ws_inflight_bytes',
+    help: 'Bytes of client messages received and not processed yet (waiting for their room and the apply slots), over all connections; bounded by WORKER_INFLIGHT_BYTES',
+    registers: [this.registry],
+  });
+  readonly wsPaused = new Counter({
+    name: 'canvas_ws_paused_total',
+    help: 'Connections the server stopped reading while their messages in flight were over a cap: the connection\'s own (why="connection"), its principal\'s over all its connections (why="principal"), or the server\'s (why="server")',
+    labelNames: ['why'],
+    registers: [this.registry],
+  });
+  readonly walFull = new Counter({
+    name: 'canvas_wal_full_total',
+    help: 'Writes refused (1013) because their room\'s write-ahead log is full: its saves keep failing',
+    registers: [this.registry],
+  });
   readonly roomMemory = new Gauge({
     name: 'canvas_room_memory_bytes',
     help: 'Estimated resident memory of the loaded rooms (ROOM_COST_FACTOR x content + ledger, plus a base per room)',
@@ -83,6 +100,46 @@ export class Metrics {
     help: 'Loaded-room memory budget (ROOM_MEMORY_BUDGET_BYTES, or derived from the V8 heap limit)',
     registers: [this.registry],
   });
+  /** Set by the RoomManager: what the principals are charged for (read at every scrape). */
+  heldProbe: (() => { user: number; anonVisitor: number; anon: number }) | null = null;
+  readonly roomMemoryHeld = new Gauge({
+    name: 'canvas_room_memory_charged_bytes',
+    help: 'Loaded-room memory charged to principals (fv7 F1): the most one logged-in user is charged for (who="user_max"), the most one anonymous visitor (who="anon_visitor_max"), all anonymous visitors together (who="anon_total")',
+    labelNames: ['who'],
+    registers: [this.registry],
+    collect: () => {
+      const h = this.heldProbe?.();
+      if (!h) return;
+      this.roomMemoryHeld.set({ who: 'user_max' }, h.user);
+      this.roomMemoryHeld.set({ who: 'anon_visitor_max' }, h.anonVisitor);
+      this.roomMemoryHeld.set({ who: 'anon_total' }, h.anon);
+    },
+  });
+  readonly roomMemoryShare = new Gauge({
+    name: 'canvas_room_memory_share_bytes',
+    help: 'The most one logged-in user (who="user"), one anonymous visitor (who="anon_visitor") and all anonymous visitors together (who="anon_total") may be charged for',
+    labelNames: ['who'],
+    registers: [this.registry],
+  });
+  readonly heapUsedPeak = new Gauge({
+    name: 'canvas_heap_used_peak_bytes',
+    help: 'Highest V8 used heap seen since start (sampled every 500 ms and after every message over 256 KiB)',
+    registers: [this.registry],
+  });
+  readonly heapLimit = new Gauge({
+    name: 'canvas_heap_size_limit_bytes',
+    help: 'V8 heap size limit of the main thread (the room workers have their own)',
+    registers: [this.registry],
+  });
+  private heapPeak = 0;
+  /** Sample the used heap into canvas_heap_used_peak_bytes. */
+  sampleHeap(): void {
+    const used = v8.getHeapStatistics().used_heap_size;
+    if (used > this.heapPeak) {
+      this.heapPeak = used;
+      this.heapUsedPeak.set(used);
+    }
+  }
   readonly joinEncodes = new Counter({
     name: 'canvas_join_encodes_total',
     help: 'Full encodings of a room document for joins (each one is shared by every join until the updates since outgrow it)',
@@ -106,6 +163,35 @@ export class Metrics {
     labelNames: ['reason'],
     registers: [this.registry],
   });
+  readonly workerFaults = new Counter({
+    name: 'canvas_worker_faults_total',
+    help: 'Room workers terminated (fv9 isolation): over the watchdog (kind="timeout"), out of their heap (kind="oom"), crashed or exited (kind="crash"), or answered with an error (kind="error")',
+    labelNames: ['kind'],
+    registers: [this.registry],
+  });
+  readonly workerRecoveries = new Counter({
+    name: 'canvas_worker_recoveries_total',
+    help: 'Rooms rebuilt in a fresh worker from their saved state and write-ahead log after a fault (outcome="ok"), or dropped because that failed too (outcome="failed"); outcome="differs": a rebuilt room whose state vector is not the one it replaced (never expected)',
+    labelNames: ['outcome'],
+    registers: [this.registry],
+  });
+  readonly workers = new Gauge({
+    name: 'canvas_room_workers',
+    help: 'Room worker threads running (one per loaded room)',
+    registers: [this.registry],
+  });
+  readonly strikes = new Counter({
+    name: 'canvas_strikes_total',
+    help: 'Strikes given to the principal whose message made a room worker fault (fv9), and cooldowns started (outcome="cooldown")',
+    labelNames: ['outcome'],
+    registers: [this.registry],
+  });
+  readonly workerReply = new Histogram({
+    name: 'canvas_worker_reply_seconds',
+    help: 'Time a room worker took for a client update (guard and apply)',
+    buckets: [0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 1],
+    registers: [this.registry],
+  });
   readonly saveDuration = new Histogram({
     name: 'canvas_save_duration_seconds',
     help: 'Object storage save duration',
@@ -121,5 +207,19 @@ export class Metrics {
 
   constructor() {
     collectDefaultMetrics({ register: this.registry });
+    this.heapLimit.set(v8.getHeapStatistics().heap_size_limit);
+    // Review S7: the series the alerts read (chart/templates/prometheusrule.yaml) and the optional
+    // signals exist at 0 from the start. A labelled series is otherwise created at its first
+    // increment, already at 1, and increase() over it is 0: the first event after every start,
+    // the one these alerts are for, would not fire.
+    this.strikes.inc({ outcome: 'cooldown' }, 0);
+    this.workerFaults.inc({ kind: 'timeout' }, 0);
+    this.workerRecoveries.inc({ outcome: 'failed' }, 0);
+    this.workerRecoveries.inc({ outcome: 'differs' }, 0);
+    this.wsRejected.inc({ reason: 'inflight' }, 0);
+    this.wsRejected.inc({ reason: 'delete_too_costly' }, 0);
+    this.saves.inc({ outcome: 'error' }, 0);
+    this.wsPaused.inc({ why: 'connection' }, 0);
+    this.wsPaused.inc({ why: 'principal' }, 0);
   }
 }

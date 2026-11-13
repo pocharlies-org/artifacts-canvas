@@ -12,7 +12,9 @@ import { allowAnonKey, allowUser, openAs, rawConnect, startStack, waitFor, type 
 
 let stack: Stack;
 test.beforeAll(async () => {
-  stack = await startStack();
+  // the anonymous caps of fv5 (since fv7 F1 the defaults are 1.25 MiB / 1 MiB): M-7 sends one
+  // 2 MiB anonymous awareness message
+  stack = await startStack({ ANON_MAX_DOC_BYTES: String(5 * 1024 * 1024), ANON_MAX_MESSAGE_BYTES: String(2 * 1024 * 1024) });
 });
 test.afterAll(async () => {
   await stack?.stop();

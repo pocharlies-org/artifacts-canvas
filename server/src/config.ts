@@ -135,6 +135,77 @@ export interface Config {
   anonCpuTotalBurstMs: number;
   /** While a total CPU budget is used up, messages bigger than this are refused (1013, retry). */
   cpuShedMinBytes: number;
+  /**
+   * Cuts of items one update may make (fv8 P1/P2: every cut is a struct of its own in the stored
+   * room, and Yjs copies the item to make it; an insert between every two points of two strokes,
+   * 200 000 cuts in 3.97 MB, held the server for a minute and stored a room past every share).
+   * Over it, or over MAX_APPLY_MS, the sender is closed 4413 `too-large` and nothing is applied.
+   */
+  maxSplitsPerMessage: number;
+  /**
+   * Estimated Yjs time (ms) the cuts, placement, merges and deletes of one update may take
+   * (applyEstimateMs() without the bytes term, with the costs measured on x86); over it the update
+   * is refused 4413. fv9: the update runs in its room's worker, so this no longer bounds a stall of
+   * the server but the worker time one message may take (and the apply slot it holds): honest
+   * deletes of thousands of shapes cost Yjs 0.4-0.8 s (it splices the writer's struct array once
+   * per shape), so the default went from 50 to 1000. The worker's watchdog for the apply is
+   * WORKER_MESSAGE_TIMEOUT_MS plus twice the estimate.
+   */
+  maxApplyMs: number;
+  /**
+   * Client blocks (Yjs client ids) one update may carry (fv9 E). An honest update carries its
+   * sender's id, a resync after a reconnect the few ids the room lacks. Over it: closed 4413.
+   */
+  maxClientsPerUpdate: number;
+  /**
+   * Room isolation (fv9): every loaded room runs in a worker thread of its own, and the main
+   * thread waits for each answer with a watchdog. A client message (its guard and apply) may take
+   * WORKER_MESSAGE_TIMEOUT_MS plus WORKER_TIMEOUT_NS_PER_BYTE per byte of the message; an
+   * operation on the whole room (load, join encodings, saves, the replay of a recovery)
+   * WORKER_OP_TIMEOUT_MS plus WORKER_OP_NS_PER_BYTE per byte of the room. Past it the worker is
+   * terminated, the room rebuilt in a fresh one from its saved state and write-ahead log, and the
+   * sender of the message closed (4413) with a strike. 1000 ms by default: the main thread does
+   * not wait on it either way, and an honest message must never miss it — under CPU contention
+   * (two honest fuzzers on one host) one honest update missed 250 ms, and the first message of a
+   * fresh worker runs unoptimised code.
+   */
+  workerMessageTimeoutMs: number;
+  workerTimeoutNsPerByte: number;
+  workerOpTimeoutMs: number;
+  workerOpNsPerByte: number;
+  /**
+   * Client messages processed at once over all rooms (their guard and apply): each may use its
+   * worker's heap up to the worker's limit, so this bounds the memory of the messages being
+   * processed (the budget reserves one, see roomMemoryBudget()); the ones waiting for a slot are
+   * bounded by WORKER_INFLIGHT_BYTES.
+   */
+  workerApplyConcurrency: number;
+  /**
+   * Bytes of client messages (updates, sync steps) received and not processed yet, over all
+   * connections (review M-1: messages wait for their room's queue and the apply slots, and on
+   * main the TCP backpressure of the one thread bounded them; nothing did once they queued).
+   * Over it a message bigger than CPU_SHED_MIN_BYTES is refused (1013 `busy`: the client resends
+   * it after it reconnected); a small one is taken and its connection is no longer read until
+   * its own messages are processed. A connection, and a principal over all its connections, is
+   * no longer read while it has inflightConnBytes() in flight (TCP backpressure again).
+   * Default 64 MiB: Node buffers, outside every V8 heap (chart values.yaml, "Memory").
+   */
+  workerInflightBytes: number;
+  /**
+   * Strikes (fv9): a principal whose messages made WORKER_STRIKES worker faults within
+   * WORKER_STRIKE_WINDOW_MS is refused joins and writes for WORKER_STRIKE_COOLDOWN_MS; anonymous
+   * visitors also per client IP (when known) and, all together, after WORKER_ANON_POOL_STRIKES.
+   */
+  workerStrikes: number;
+  workerStrikeWindowMs: number;
+  workerStrikeCooldownMs: number;
+  workerAnonPoolStrikes: number;
+  /**
+   * Test only: a client update carrying `canvas-test-hook:<busy|alloc|throw>` makes the worker
+   * misbehave. Never in production: with NODE_ENV=production (the image's) the server refuses to
+   * start with it, unless WORKER_TEST_HOOKS_IN_PRODUCTION is set too (the compose test stack).
+   */
+  workerTestHooks: boolean;
   /** Attribution entries of shapes deleted longer ago than this are pruned from the ledger. */
   attributionRetentionDays: number;
   /**
@@ -148,23 +219,33 @@ export interface Config {
   anonIpMintRatePerMin: number;
   anonIpMintBurst: number;
   /**
-   * Loaded-room memory (fv6 H-1). A loaded room costs about `roomCostFactor` x its encoded size
-   * (content + ledger) plus ROOM_BASE_COST_BYTES. Loading a room past `roomMemoryBudgetBytes`
-   * (after evicting idle rooms) is refused with 1013, and so is an update that grows the loaded
-   * rooms past it. Default budget: derived from the V8 heap limit (see roomMemoryBudget()).
+   * Loaded-room memory (fv6 H-1, fv7 F1). A loaded room costs about `roomCostFactor` x its encoded
+   * size (content + ledger) plus ROOM_BASE_COST_BYTES. Loads stop at LOAD_FRACTION of
+   * `roomMemoryBudgetBytes` (after evicting idle rooms), growth at GROWTH_FRACTION, both with
+   * 1013. Default budget: derived from the V8 heap limit (see deriveRoomLimits()).
    */
   roomMemoryBudgetBytes: number;
   /** where the budget came from: `env` (ROOM_MEMORY_BUDGET_BYTES) or `heap` (derived) */
   roomMemoryBudgetSource: 'env' | 'heap';
+  /** where the heap limit of the budget came from: `env` (HEAP_LIMIT_MB) or `v8` (the main thread's) */
+  heapLimitSource: 'env' | 'v8';
   roomCostFactor: number;
+  /** Resident cost of an empty loaded room, its worker thread included (ROOM_BASE_COST_BYTES). */
+  roomBaseCostBytes: number;
   /**
-   * Share of the budget one principal may keep loaded (each room's cost is split between the
-   * principals connected to it); never less than one room at the principal's size cap. An
-   * anonymous visitor gets a quarter of it, and the rooms only anonymous visitors hold share
-   * `roomMemoryAnonShare` of the budget together.
+   * Fraction of the budget one logged-in principal may be charged for (fv7 F1: the loads it made
+   * and every byte it wrote, in full, while those rooms stay loaded). An anonymous visitor gets a
+   * quarter of it (ANON_VISITOR_SHARE_RATIO), and all anonymous visitors together
+   * `roomMemoryAnonShare`. Their sum is at most GROWTH_FRACTION.
    */
   roomMemoryPrincipalShare: number;
   roomMemoryAnonShare: number;
+  /**
+   * The size caps as configured, before deriveRoomLimits() lowered them to what the memory
+   * budget holds (fv7 F1: a full room must fit one principal's share), and why (startup warnings).
+   */
+  configuredLimits: { maxDocBytes: number; anonMaxDocBytes: number; maxMessageBytes: number; anonMaxMessageBytes: number; maxImageBytes: number; anonMaxImageBytes: number };
+  memoryWarnings: string[];
   /** Advertised to the client in the wrapper config (client-side cap for pasted images). */
   maxImageBytes: number;
   anonMaxImageBytes: number;
@@ -225,6 +306,12 @@ function int(env: NodeJS.ProcessEnv, name: string, def: number): number {
   if (!Number.isInteger(n) || n < 0 || n > 65535) throw new Error(`${name} must be an integer 0..65535, got "${v}"`);
   return n;
 }
+/** Is V8's --max-old-space-size given to this process (it then overrides every worker's heap limit)? */
+export function oldSpaceFlag(env: NodeJS.ProcessEnv = process.env): boolean {
+  const re = /--max[-_]old[-_]space[-_]size/;
+  return re.test(env.NODE_OPTIONS ?? '') || process.execArgv.some((a) => re.test(a));
+}
+
 /** `scheme://host[:port]` only (what browsers send in Origin); throws otherwise. */
 export function normalizeOrigin(raw: string): string {
   let u: URL;
@@ -305,10 +392,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     msgBurst: num(env, 'MSG_BURST', 240),
     anonMsgRatePerSec: num(env, 'ANON_MSG_RATE_PER_SEC', 30),
     anonMsgBurst: num(env, 'ANON_MSG_BURST', 60),
-    maxDocBytes: num(env, 'MAX_DOC_BYTES', 20 * 1024 * 1024),
-    anonMaxDocBytes: num(env, 'ANON_MAX_DOC_BYTES', 5 * 1024 * 1024),
-    maxMessageBytes: num(env, 'MAX_MESSAGE_BYTES', 8 * 1024 * 1024),
-    anonMaxMessageBytes: num(env, 'ANON_MAX_MESSAGE_BYTES', 2 * 1024 * 1024),
+    maxDocBytes: num(env, 'MAX_DOC_BYTES', 5 * 1024 * 1024),
+    anonMaxDocBytes: num(env, 'ANON_MAX_DOC_BYTES', 1280 * 1024),
+    maxMessageBytes: num(env, 'MAX_MESSAGE_BYTES', 4 * 1024 * 1024),
+    anonMaxMessageBytes: num(env, 'ANON_MAX_MESSAGE_BYTES', 1024 * 1024),
     wsMaxBufferedBytes: num(env, 'WS_MAX_BUFFERED_BYTES', 8 * 1024 * 1024),
     wsSlowConsumerMs: num(env, 'WS_SLOW_CONSUMER_MS', 10_000),
     wsOutgoingBudgetBytes: num(env, 'WS_OUTGOING_BUDGET_BYTES', 256 * 1024 * 1024),
@@ -337,6 +424,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     anonCpuTotalMsPerSec: num(env, 'ANON_CPU_TOTAL_MS_PER_SEC', 150),
     anonCpuTotalBurstMs: num(env, 'ANON_CPU_TOTAL_BURST_MS', 1500),
     cpuShedMinBytes: num(env, 'CPU_SHED_MIN_BYTES', 16 * 1024),
+    maxSplitsPerMessage: num(env, 'MAX_SPLITS_PER_MESSAGE', 5000),
+    maxApplyMs: num(env, 'MAX_APPLY_MS', 1000),
+    maxClientsPerUpdate: num(env, 'MAX_CLIENTS_PER_UPDATE', 256),
+    workerMessageTimeoutMs: num(env, 'WORKER_MESSAGE_TIMEOUT_MS', 1000),
+    workerTimeoutNsPerByte: num(env, 'WORKER_TIMEOUT_NS_PER_BYTE', 1000),
+    workerOpTimeoutMs: num(env, 'WORKER_OP_TIMEOUT_MS', 10_000),
+    workerOpNsPerByte: num(env, 'WORKER_OP_NS_PER_BYTE', 2000),
+    workerApplyConcurrency: num(env, 'WORKER_APPLY_CONCURRENCY', 1),
+    workerInflightBytes: num(env, 'WORKER_INFLIGHT_BYTES', 64 * 1024 * 1024),
+    workerStrikes: num(env, 'WORKER_STRIKES', 3),
+    workerStrikeWindowMs: num(env, 'WORKER_STRIKE_WINDOW_MS', 600_000),
+    workerStrikeCooldownMs: num(env, 'WORKER_STRIKE_COOLDOWN_MS', 600_000),
+    workerAnonPoolStrikes: num(env, 'WORKER_ANON_POOL_STRIKES', 10),
+    workerTestHooks: bool(env, 'WORKER_TEST_HOOKS', false),
     attributionRetentionDays: num(env, 'ATTRIBUTION_RETENTION_DAYS', 30),
     anonMintRatePerMin: num(env, 'ANON_MINT_RATE_PER_MIN', 120),
     anonMintBurst: num(env, 'ANON_MINT_BURST', 60),
@@ -344,11 +445,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     anonIpMintBurst: num(env, 'ANON_IP_MINT_BURST', 10),
     roomMemoryBudgetBytes: 0, // set below (depends on other limits)
     roomMemoryBudgetSource: 'heap',
+    heapLimitSource: 'v8',
     roomCostFactor: num(env, 'ROOM_COST_FACTOR', ROOM_COST_FACTOR),
-    roomMemoryPrincipalShare: frac(env, 'ROOM_MEMORY_PRINCIPAL_SHARE', 0.5),
-    roomMemoryAnonShare: frac(env, 'ROOM_MEMORY_ANON_SHARE', 0.5),
+    roomBaseCostBytes: num(env, 'ROOM_BASE_COST_BYTES', ROOM_BASE_COST_BYTES),
+    roomMemoryPrincipalShare: frac(env, 'ROOM_MEMORY_PRINCIPAL_SHARE', 1 / 3),
+    roomMemoryAnonShare: frac(env, 'ROOM_MEMORY_ANON_SHARE', 1 / 3),
+    configuredLimits: { maxDocBytes: 0, anonMaxDocBytes: 0, maxMessageBytes: 0, anonMaxMessageBytes: 0, maxImageBytes: 0, anonMaxImageBytes: 0 }, // set below
+    memoryWarnings: [],
     maxImageBytes: num(env, 'MAX_IMAGE_BYTES', 2 * 1024 * 1024),
-    anonMaxImageBytes: num(env, 'ANON_MAX_IMAGE_BYTES', 1 * 1024 * 1024),
+    anonMaxImageBytes: num(env, 'ANON_MAX_IMAGE_BYTES', 512 * 1024),
     artifactPrefixes: list(env, 'ARTIFACT_PREFIXES', []),
     anonAllowedPrefixes: list(env, 'ANON_ALLOWED_PREFIXES', ['pub/']),
     // Reason vocabulary of the core gate (gate/gate.py, docs/plugins.md §1): `expired` when the
@@ -379,44 +484,228 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (cfg.anonMaxDocBytes > cfg.maxDocBytes) {
     throw new Error('ANON_MAX_DOC_BYTES must be <= MAX_DOC_BYTES');
   }
-  if (env.ROOM_MEMORY_BUDGET_BYTES !== undefined && env.ROOM_MEMORY_BUDGET_BYTES !== '') {
-    cfg.roomMemoryBudgetBytes = num(env, 'ROOM_MEMORY_BUDGET_BYTES', 0);
-    cfg.roomMemoryBudgetSource = 'env';
-  } else {
-    cfg.roomMemoryBudgetBytes = roomMemoryBudget(v8.getHeapStatistics().heap_size_limit, cfg);
+  if (cfg.roomMemoryPrincipalShare + cfg.roomMemoryAnonShare > GROWTH_FRACTION + 1e-9) {
+    // fv7 F1: one logged-in user and every anonymous visitor together must leave room to load
+    throw new Error(`ROOM_MEMORY_PRINCIPAL_SHARE + ROOM_MEMORY_ANON_SHARE must be <= ${GROWTH_FRACTION}`);
+  }
+  const envBudget = env.ROOM_MEMORY_BUDGET_BYTES !== undefined && env.ROOM_MEMORY_BUDGET_BYTES !== '' ? num(env, 'ROOM_MEMORY_BUDGET_BYTES', 0) : null;
+  // fv9: the heap the whole process may use (main thread and room workers) is HEAP_LIMIT_MB, not
+  // --max-old-space-size: that V8 flag applies to every thread and overrides the room workers' own
+  // heap limits (resourceLimits), so a worker could grow to the whole heap (measured: a worker
+  // limited to 47 MiB ran out of memory at 1 728 MiB under --max-old-space-size=1728)
+  const heapLimit = env.HEAP_LIMIT_MB !== undefined && env.HEAP_LIMIT_MB !== '' ? num(env, 'HEAP_LIMIT_MB', 0) * 1024 * 1024 : v8.getHeapStatistics().heap_size_limit;
+  cfg.heapLimitSource = env.HEAP_LIMIT_MB ? 'env' : 'v8';
+  deriveRoomLimits(cfg, heapLimit, envBudget);
+  // review F-5: refused, not only warned about (a room worker could grow to the whole heap, and
+  // one message that exhausts it would take every room with it)
+  if (oldSpaceFlag(env)) {
+    throw new Error(
+      '--max-old-space-size is set (NODE_OPTIONS or the command line): it applies to every thread and overrides the heap limit of each room worker, so one message could make a worker grow to the whole heap and take the process down; remove it and size the process with HEAP_LIMIT_MB',
+    );
+  }
+  if (cfg.workerTestHooks && env.NODE_ENV === 'production' && !bool(env, 'WORKER_TEST_HOOKS_IN_PRODUCTION', false)) {
+    throw new Error('WORKER_TEST_HOOKS is set with NODE_ENV=production: the hooks let any writer make its room\'s worker misbehave; they are for the test stacks only (WORKER_TEST_HOOKS_IN_PRODUCTION=true overrides, deploy/compose)');
+  }
+  // at least one message of the largest size must fit, else the biggest honest message never would
+  if (cfg.workerInflightBytes < cfg.maxMessageBytes) {
+    throw new Error(`WORKER_INFLIGHT_BYTES (${cfg.workerInflightBytes}) must be >= MAX_MESSAGE_BYTES (${cfg.maxMessageBytes}, after the memory sizing)`);
   }
   return cfg;
 }
 
 /**
- * Measured resident cost of a loaded room per encoded byte (content + ledger), V8 heap and
- * buffers together, with its join frames encoded (fv6 H-1; Node 22 on x86-64, `--expose-gc`,
- * rooms loaded through Room.load): geo shapes with a text label (the verifier's q4 room) 21.7x,
- * geo shapes one per transaction 22.1x, texts with every other character deleted 17.5x, tiny maps
- * 15.6x, text typed by two people one character at a time 12.7x, strokes grown two numbers at a
- * time 4.2x. The worst, rounded up.
+ * Bytes of messages one connection, and one principal over all its connections, may have in
+ * flight before the server stops reading it (review M-1): two messages of the largest size, 1 MiB
+ * at least. An honest tab has one small update in flight, a reconnecting one its step 2 (at most a
+ * room) and an edit or two.
  */
-export const ROOM_COST_FACTOR = 24;
-/** Resident cost of an empty loaded room (two documents, awareness, caches): measured 11-12 KiB. */
-export const ROOM_BASE_COST_BYTES = 32 * 1024;
-/** What the process needs besides rooms: runtime, libraries, the HTTP side (heap). */
-export const RUNTIME_RESERVE_BYTES = 192 * 1024 * 1024;
-/** Decoding, checking and applying one message costs about this many times its size (fv5 H-1). */
-export const MESSAGE_COST_FACTOR = 24;
-/** The budget never goes below this (a heap too small for the limits gets a warning at start). */
-export const MIN_ROOM_MEMORY_BUDGET_BYTES = 64 * 1024 * 1024;
+export function inflightConnBytes(maxMessageBytes: number): number {
+  return Math.max(2 * maxMessageBytes, 1024 * 1024);
+}
 
 /**
- * Default loaded-room budget: what the V8 heap can hold besides the runtime, the outgoing budget
- * and one message of the maximum size being processed:
+ * What a client message counts in flight at least (review S6): a tiny update is a few payload
+ * bytes but several hundred bytes to ~1 KiB of live objects while it waits (the frame, its views,
+ * the job and its promises), so counted by its bytes alone many of them from many principals never
+ * reached a cap and queued without a bound. With the floor, WORKER_INFLIGHT_BYTES (64 MiB) bounds
+ * the queue to ~65 000 messages, plus what each connection had already read when it was paused
+ * (protocol §12), and a connection's cap (8 MiB) to ~8 000; an honest tab has a handful in flight.
+ */
+export const INFLIGHT_MIN_COST = 1024;
+
+/**
+ * Measured resident cost of a loaded room per encoded byte (content + ledger), V8 heap and
+ * buffers together, with its join frames encoded (Node 22 on x86-64, `--expose-gc`, rooms built
+ * through the real guard and stamper and loaded through Room.load: server/test/fv7/ratio.ts).
+ * fv7 F2: a key overwritten alternately by two client ids 37.7x (`meta-overwrite`,
+ * `alt-overwrite`), the same with a new pair of ids every 250 writes 39.5x, geo shapes whose
+ * fields alternate ids 25.1x, one client id per shape 24.8x, create/delete 10.1x (fv6: geo shapes
+ * with a text label 21.7x, strokes 4.2x). The worst, plus 10%.
+ */
+export const ROOM_COST_FACTOR = 44;
+/**
+ * Yjs apply time of an update, per unit (fv8 P2, server/test/fv8/split-cpu-cal.ts, split-growth.ts
+ * and scan-probe.ts on x86-64, Node 22): UpdateCheck.splitWork (cuts: worst 4.5 ns per unit, a
+ * long points list cut in many places), UpdateCheck.scanWork (placement scans: 189-193 ns per
+ * item scanned) and the update's bytes (integrating its structs: 65 ns per byte for 20 000 new
+ * shapes). The worst measured plus 30-50%. The server refuses an update whose cuts and placement
+ * are estimated over MAX_APPLY_MS, and pre-charges the whole estimate to the CPU budgets before
+ * it applies one.
+ */
+export const SPLIT_WORK_NS = 6;
+export const SCAN_WORK_NS = 250;
+export const APPLY_NS_PER_BYTE = 100;
+
+/**
+ * The versions of Yjs and its libraries every cost constant here and in the guard
+ * (shared/src/stamper.ts: SPLIT_COST_BYTES, SPLIT_BASE_WORK, SPLIT_MOVE_DIVISOR, the merge and scan
+ * counts) was measured against: they mirror Yjs internals. A bump of any of them invalidates the
+ * calibration: re-run the fv8/fv9 adversarial suites (server/test/fv8.test.ts, fv9.test.ts,
+ * e2e-system/adversarial-fv8/fv9.spec.ts, the guard fuzzer) and only then update this list. A unit
+ * test (server/test/fv9-review.test.ts) fails while the lockfile and this list differ.
+ */
+export const CALIBRATED_WITH: Readonly<Record<'yjs' | 'lib0' | 'y-protocols', string>> = { yjs: '13.6.33', lib0: '0.2.120', 'y-protocols': '1.0.7' };
+
+/** Estimated Yjs apply time (ms) of an update of `bytes` with these cut and placement counts. */
+export function applyEstimateMs(bytes: number, splitWork: number, scanWork: number): number {
+  return (bytes * APPLY_NS_PER_BYTE + splitWork * SPLIT_WORK_NS + scanWork * SCAN_WORK_NS) / 1e6;
+}
+
+/**
+ * Resident cost of an empty loaded room (fv9: ROOM_BASE_COST_BYTES): its worker thread with the
+ * empty room loaded and its join frames encoded — the V8 isolate, the Node environment and the
+ * modules it loads (Yjs, lib0, the stamper) — plus the room's state on the main thread (awareness,
+ * caches: 11-12 KiB). Measured with server/test/fv9/worker-cost.mjs (40 workers, RSS per worker):
+ * 15.7 MiB in the image (node:22-alpine, x86-64), 17.3 MiB on Ubuntu (glibc) Node 22. Before the
+ * rooms had workers it was 32 KiB.
+ */
+export const ROOM_BASE_COST_BYTES = 16 * 1024 * 1024;
+
+/** Estimated resident cost of a loaded room of `bytes` encoded bytes (content + ledger). */
+export function roomCost(cfg: Pick<Config, 'roomCostFactor'> & { roomBaseCostBytes?: number }, bytes: number): number {
+  return (cfg.roomBaseCostBytes ?? ROOM_BASE_COST_BYTES) + cfg.roomCostFactor * bytes;
+}
+
+/** What the process needs besides rooms: runtime, libraries, the HTTP side (heap). */
+export const RUNTIME_RESERVE_BYTES = 192 * 1024 * 1024;
+/**
+ * Heap needed to guard and apply one message, per byte (fv7 F2, server/test/fv7/guardcost.ts):
+ * the guard of a 7.98 MiB update of alternating overwrites needs a heap limit of 423-438 MiB (13
+ * MiB of it the runtime), 51-53x; geo shapes need less. Rounded up to 60.
+ */
+export const MESSAGE_COST_FACTOR = 60;
+/** The budget never goes below this (a heap too small for the limits gets a warning at start). */
+export const MIN_ROOM_MEMORY_BUDGET_BYTES = 64 * 1024 * 1024;
+/** Loads (rooms brought into memory) stop at this fraction of the budget (fv7 F1). */
+export const LOAD_FRACTION = 0.85;
+/**
+ * Growth (updates that make loaded rooms bigger) stops at this fraction: the gap to LOAD_FRACTION
+ * (5% of the budget, 43 MiB with the chart's defaults) is always left for loads, so a room of
+ * typical size still opens when the loaded rooms have grown as far as they may (fv7 F1).
+ */
+export const GROWTH_FRACTION = 0.8;
+/** An anonymous visitor's share is this fraction of a logged-in principal's (1/12 of the budget by default). */
+export const ANON_VISITOR_SHARE_RATIO = 0.25;
+/**
+ * A room at the size cap must fit its principal's share with this margin (the last update that
+ * reaches the cap is estimated with the ledger it will add): cost(1.25 x cap) <= share.
+ */
+export const FULL_ROOM_MARGIN = 1.25;
+/** A data-URL image (4/3 of its bytes) plus its shape must fit one message: image cap <= 0.7 x message cap. */
+const IMAGE_PER_MESSAGE = 0.7;
+
+/**
+ * Loaded-room budget derived from the heap: what the V8 heap can hold besides the runtime, the
+ * outgoing budget and one message of `maxMessageBytes` being processed:
  *
- *   heap_size_limit - RUNTIME_RESERVE_BYTES - WS_OUTGOING_BUDGET_BYTES - 24 x MAX_MESSAGE_BYTES
+ *   heap_size_limit - RUNTIME_RESERVE_BYTES - WS_OUTGOING_BUDGET_BYTES - 60 x MAX_MESSAGE_BYTES
  *
- * heap_size_limit follows --max-old-space-size (the chart's nodeMaxOldSpaceMb), so the budget is
- * right for any memory setting. The outgoing buffers live outside the heap: counting them here
+ * The heap limit is HEAP_LIMIT_MB (the chart's heapLimitMb) or, without it, the main thread's
+ * heap_size_limit (V8 sizes it from the container's memory), so the budget is right for any memory
+ * setting. fv9: not --max-old-space-size, which would override every room worker's own limit. The outgoing buffers live outside the heap: counting them here
  * leaves the container limit the room it needs for them (chart values.yaml, "Memory").
  */
-export function roomMemoryBudget(heapLimit: number, cfg: Pick<Config, 'wsOutgoingBudgetBytes' | 'maxMessageBytes'>): number {
-  const b = heapLimit - RUNTIME_RESERVE_BYTES - cfg.wsOutgoingBudgetBytes - MESSAGE_COST_FACTOR * cfg.maxMessageBytes;
+export function roomMemoryBudget(heapLimit: number, cfg: Pick<Config, 'wsOutgoingBudgetBytes' | 'maxMessageBytes'> & { workerApplyConcurrency?: number }): number {
+  const b = heapLimit - RUNTIME_RESERVE_BYTES - cfg.wsOutgoingBudgetBytes - (cfg.workerApplyConcurrency ?? 1) * MESSAGE_COST_FACTOR * cfg.maxMessageBytes;
   return Math.max(MIN_ROOM_MEMORY_BUDGET_BYTES, Math.floor(b));
+}
+
+/** The biggest room (encoded bytes) whose cost, with FULL_ROOM_MARGIN, fits `share` bytes of memory. */
+export function roomCapFor(share: number, costFactor: number, base = ROOM_BASE_COST_BYTES): number {
+  return Math.max(0, Math.floor((share - base) / (FULL_ROOM_MARGIN * costFactor)));
+}
+
+/**
+ * fv7 F1: the budget and the size caps that go with it. A principal is never charged more than
+ * its share, so a room at MAX_DOC_BYTES must fit that share (with FULL_ROOM_MARGIN); when it does
+ * not, the cap of this deployment is lowered to what fits and a warning is logged at start (the
+ * 1 GiB case: a full 20 MiB room cost more than the whole budget). A message can never add more
+ * than a room holds, so the message caps follow the room caps, and the heap budget is derived
+ * with the message cap that results (the largest m <= MAX_MESSAGE_BYTES with m <= the room cap
+ * of the budget left after reserving 60 x m). Image caps follow the message caps.
+ */
+export function deriveRoomLimits(cfg: Config, heapLimit: number, envBudget: number | null): void {
+  const MiB = (b: number) => `${(b / 1048576).toFixed(2)} MiB`;
+  const conf = {
+    maxDocBytes: cfg.maxDocBytes,
+    anonMaxDocBytes: cfg.anonMaxDocBytes,
+    maxMessageBytes: cfg.maxMessageBytes,
+    anonMaxMessageBytes: cfg.anonMaxMessageBytes,
+    maxImageBytes: cfg.maxImageBytes,
+    anonMaxImageBytes: cfg.anonMaxImageBytes,
+  };
+  cfg.configuredLimits = conf;
+  const warnings: string[] = [];
+  const f = cfg.roomCostFactor;
+  const base = cfg.roomBaseCostBytes;
+  const userCap = (budget: number) => roomCapFor(budget * cfg.roomMemoryPrincipalShare, f, base);
+  let budget: number;
+  // the message size the budget leaves room for (the message caps never go above it)
+  let reserved = conf.maxMessageBytes;
+  if (envBudget !== null) {
+    budget = envBudget;
+    cfg.roomMemoryBudgetSource = 'env';
+  } else {
+    cfg.roomMemoryBudgetSource = 'heap';
+    const budgetFor = (m: number) => roomMemoryBudget(heapLimit, { wsOutgoingBudgetBytes: cfg.wsOutgoingBudgetBytes, maxMessageBytes: m, workerApplyConcurrency: cfg.workerApplyConcurrency });
+    const top = Math.min(conf.maxMessageBytes, conf.maxDocBytes);
+    let m = top;
+    if (userCap(budgetFor(top)) < top) {
+      // userCap(budgetFor(m)) - m decreases with m: the largest m that fits, by bisection
+      let lo = 0;
+      let hi = top;
+      while (hi - lo > 1) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (userCap(budgetFor(mid)) >= mid) lo = mid;
+        else hi = mid;
+      }
+      m = lo;
+    }
+    budget = budgetFor(m);
+    reserved = m;
+    if (heapLimit - RUNTIME_RESERVE_BYTES - cfg.wsOutgoingBudgetBytes - cfg.workerApplyConcurrency * MESSAGE_COST_FACTOR * m < MIN_ROOM_MEMORY_BUDGET_BYTES) {
+      warnings.push(
+        `the V8 heap (${MiB(heapLimit)}) is too small for the runtime (${MiB(RUNTIME_RESERVE_BYTES)}), WS_OUTGOING_BUDGET_BYTES (${MiB(cfg.wsOutgoingBudgetBytes)}) and one message: the room budget is at its floor (${MiB(MIN_ROOM_MEMORY_BUDGET_BYTES)}); raise HEAP_LIMIT_MB or lower WS_OUTGOING_BUDGET_BYTES`,
+      );
+    }
+  }
+  cfg.roomMemoryBudgetBytes = budget;
+  const fullRoom = base + f * conf.maxDocBytes;
+  if (budget < fullRoom) {
+    warnings.push(`the room memory budget (${MiB(budget)}) is smaller than one full room at MAX_DOC_BYTES (${MiB(conf.maxDocBytes)} x ${f} = ${MiB(fullRoom)})`);
+  }
+  const lower = (name: string, key: keyof typeof conf, to: number, why: string) => {
+    const v = Math.max(0, Math.min(conf[key], to));
+    (cfg as unknown as Record<string, number>)[key] = v;
+    if (v < conf[key]) warnings.push(`${name} lowered from ${MiB(conf[key])} to ${MiB(v)}: ${why}`);
+  };
+  const share = budget * cfg.roomMemoryPrincipalShare;
+  const anonShare = share * ANON_VISITOR_SHARE_RATIO;
+  lower('MAX_DOC_BYTES', 'maxDocBytes', roomCapFor(share, f, base), `a full room (x ${f}, +25%) must fit one user's share of the room memory budget (${MiB(share)} of ${MiB(budget)})`);
+  lower('ANON_MAX_DOC_BYTES', 'anonMaxDocBytes', Math.min(cfg.maxDocBytes, roomCapFor(anonShare, f, base)), `a full anonymous room must fit one anonymous visitor's share (${MiB(anonShare)})`);
+  lower('MAX_MESSAGE_BYTES', 'maxMessageBytes', Math.min(cfg.maxDocBytes, reserved), 'a message cannot add more than a room holds (MAX_DOC_BYTES)');
+  lower('ANON_MAX_MESSAGE_BYTES', 'anonMaxMessageBytes', Math.min(cfg.maxMessageBytes, cfg.anonMaxDocBytes), 'a message cannot add more than a room holds (ANON_MAX_DOC_BYTES)');
+  lower('MAX_IMAGE_BYTES', 'maxImageBytes', Math.floor(IMAGE_PER_MESSAGE * cfg.maxMessageBytes), 'an image (as a data URL) must fit one message');
+  lower('ANON_MAX_IMAGE_BYTES', 'anonMaxImageBytes', Math.floor(IMAGE_PER_MESSAGE * cfg.anonMaxMessageBytes), 'an image (as a data URL) must fit one message');
+  cfg.memoryWarnings = warnings;
 }

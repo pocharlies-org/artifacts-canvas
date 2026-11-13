@@ -1,17 +1,19 @@
 /**
  * FULL-SYSTEM regressions of the sixth independent verification (fv6), against the live compose
- * stack, whose canvas container runs under the chart's memory limit (compose.yml: mem_limit 2g,
- * NODE_OPTIONS --max-old-space-size=1536, so the server derives a 920 MiB loaded-room budget):
- *   Q4  one ACL member opens R rooms and fills each to ~17 MB through raw sockets (the verifier's
- *       q4-multi-room-oom.spec.ts; before: the pod OOM-killed in a loop) -> the fills past the
- *       memory budget are refused 1013 busy, the container never restarts, an honest user in a
- *       loaded room joins and edits
- *   Q4b three ACL members fill a room each: the server-wide budget refuses the third, joins to
- *       the loaded rooms go on
- *   Q4c anonymous visitors fill ~14 pub/ rooms to the 5 MiB anonymous cap -> the rooms only
- *       anonymous visitors hold stop at half the budget, no restart; a logged-in user still loads
- *       a room and edits
- * Rooms per test: FV6_ROOMS (default 5; the proof runs 10), FV6_ANON_ROOMS (default 14).
+ * stack, whose canvas container runs under the chart's memory limit (compose.yml: mem_limit 2304m,
+ * HEAP_LIMIT_MB=1776 since fv9, so the server derives a 1088 MiB loaded-room budget (872 MiB before);
+ * fv7 F1: a third of it per user, rooms of 5 MiB at most):
+ *   Q4  one ACL member opens R rooms and fills each to the size cap through raw sockets (the
+ *       verifier's q4-multi-room-oom.spec.ts filled ~17 MB rooms; before: the pod OOM-killed in a
+ *       loop) -> the fills past the user's share of the memory budget are refused 1013 busy, the
+ *       container never restarts, an honest user in a loaded room joins and edits
+ *   Q4b three ACL members fill two rooms each: each is stopped at its share, the third by the
+ *       server-wide growth threshold; joins to the loaded rooms go on
+ *   Q4c anonymous visitors fill ~14 pub/ rooms to the anonymous cap -> the anonymous visitors
+ *       together stop at a third of the budget, no restart; a logged-in user still loads a room
+ *       and edits
+ * Rooms per test: FV6_ROOMS (default 5; the proof runs 10), FV6_ANON_ROOMS (default 14). The
+ * sizes come from the server's startup log (sizing()).
  */
 import { execFileSync } from 'node:child_process';
 import { expect, test, type BrowserContext } from '@playwright/test';
@@ -21,6 +23,8 @@ import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
 import { BASE, USERS, container, editorReady, newContext, openWithLogin, publish, waitFor, type UserName } from './lib';
 
+/** the chart's default memory limit (fv9: 2304 MiB, a worker per loaded room; it was 2 GiB) */
+const LIMIT_MIB = 2304;
 test.describe.configure({ mode: 'serial' });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const log = (k: string, v: unknown) => console.log(`[fv6] ${k}: ${JSON.stringify(v)}`);
@@ -54,6 +58,15 @@ function metric(name: string, label = ''): number {
   return n;
 }
 const memoryRefusals = () => metric('canvas_ws_rejected_total', 'reason="room_memory');
+/** The memory sizing the server logged at its last start (budget, shares, caps). */
+function sizing(): Record<string, number> {
+  const out = execFileSync('docker', ['logs', container('canvas')], { encoding: 'utf8', maxBuffer: 256 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
+  const lines = out.split('\n').filter((l) => l.includes('"msg":"loaded-room memory budget"'));
+  if (!lines.length) throw new Error('the canvas did not log its memory sizing');
+  return JSON.parse(lines[lines.length - 1]);
+}
+/** Labelled shapes (~520 encoded bytes each, content + ledger) that fill most of a room of `capMiB`. */
+const shapesFor = (capMiB: number) => Math.floor((0.85 * capMiB * MiB) / 520);
 
 /** A raw y-websocket peer (no browser): what the verifier's q4 used. */
 class Raw {
@@ -139,6 +152,14 @@ async function cookieOf(browser: Parameters<typeof newContext>[0], url: string, 
   await page.close();
   return cookie;
 }
+/** ms from `who` deleting shape `id` until `reader` no longer has it (a delete never grows the room) */
+async function deleteRtt(who: Raw, reader: Raw, id: string): Promise<number> {
+  const t = Date.now();
+  expect(who.doc.getMap('shapes').has(id)).toBe(true);
+  who.doc.getMap('shapes').delete(id);
+  await waitFor(() => !reader.doc.getMap('shapes').has(id), 20_000, `delete ${id} relayed`);
+  return Date.now() - t;
+}
 /** ms from an edit of `who` until `reader` has it (both raw peers in the same room) */
 async function editRtt(who: Raw, reader: Raw, id: string): Promise<number> {
   const t = Date.now();
@@ -151,9 +172,9 @@ async function editRtt(who: Raw, reader: Raw, id: string): Promise<number> {
   return Date.now() - t;
 }
 
-test('Q4: one ACL member keeps R rooms of ~17 MB loaded: past the memory budget the fills get 1013 busy, no OOM, no restart; an honest user in a loaded room is unaffected', async ({ browser }) => {
+test('Q4: one ACL member keeps R full rooms loaded: past its share of the memory budget the fills get 1013 busy, no OOM, no restart; an honest user in a loaded room is unaffected', async ({ browser }) => {
   test.setTimeout(900_000);
-  expect(Number(inspect('{{.HostConfig.Memory}}'))).toBe(2 * 1024 ** 3);
+  expect(Number(inspect('{{.HostConfig.Memory}}'))).toBe(LIMIT_MIB * 1024 ** 2);
   const s0 = state();
   const refused0 = memoryRefusals();
   const run = Date.now().toString(36);
@@ -162,17 +183,18 @@ test('Q4: one ACL member keeps R rooms of ~17 MB loaded: past the memory budget 
   const c2 = await cookieOf(browser, pubs[0].canvas, 'user2');
   const held: Raw[] = [];
   const filled: number[] = [];
+  const full = shapesFor(sizing().maxDocMiB);
   let peak = mem();
   for (let r = 0; r < ROOMS; r++) {
     const c = new Raw(wsUrl(pubs[r].canvas), c1);
     held.push(c);
     await c.ready();
-    filled.push(await c.fill(`r${r}`, 34_000, 2000, 900));
+    filled.push(await c.fill(`r${r}`, full, 1000, 900));
     peak = Math.max(peak, mem());
     log(`Q4 room ${r + 1}/${ROOMS}`, { filled: filled[r], close: c.closeCode, notices: c.notices, memMiB: mem(), state: state() });
   }
-  // the first room is full; at least one fill past the budget was refused with 1013 busy
-  expect(filled[0]).toBe(34_000);
+  // the first room is full; at least one fill past the share was refused with 1013 busy
+  expect(filled[0]).toBe(full);
   const refused = held.filter((h) => h.closeCode === 1013);
   expect(refused.length).toBeGreaterThanOrEqual(1);
   expect(refused.every((h) => h.notices.includes('busy'))).toBe(true);
@@ -180,7 +202,7 @@ test('Q4: one ACL member keeps R rooms of ~17 MB loaded: past the memory budget 
   // an honest user joins the loaded big room and edits: relayed to the holder
   const honest = new Raw(wsUrl(pubs[0].canvas), c2);
   expect(await honest.ready(60_000)).toBe(true);
-  await waitFor(() => honest.doc.getMap('shapes').size >= 34_000, 60_000, 'honest synced');
+  await waitFor(() => honest.doc.getMap('shapes').size >= full, 60_000, 'honest synced');
   const rtts: number[] = [];
   for (let i = 0; i < 5; i++) rtts.push(await editRtt(honest, held[0], `h${run}-${i}`));
   for (let i = 0; i < 6; i++) {
@@ -203,48 +225,69 @@ test('Q4: one ACL member keeps R rooms of ~17 MB loaded: past the memory budget 
   }
   const rejoin = again.map((a) => (a.synced && a.closeCode === null ? 'joined' : String(a.closeCode)));
   const s1 = state();
-  log('Q4', { rooms: ROOMS, filled, closes: held.map((h) => h.closeCode), honestRttMs: rtts, rejoin, peakMiB: peak, before: s0, after: s1 });
+  log('Q4', { rooms: ROOMS, full, filled, closes: held.map((h) => h.closeCode), honestRttMs: rtts, rejoin, peakMiB: peak, before: s0, after: s1 });
   expect(rejoin[0]).toBe('joined');
   expect(s1).toEqual(s0);
   expect(s1.oom).toBe('false');
-  expect(peak).toBeLessThan(2048);
+  expect(peak).toBeLessThan(LIMIT_MIB);
   expect(Math.max(...rtts)).toBeLessThan(2000);
 });
 
-test('Q4b: three ACL members fill a room each: the server-wide budget refuses the third, joins to the loaded rooms go on, no restart', async ({ browser }) => {
-  test.setTimeout(600_000);
+test('Q4b: three ACL members fill two rooms each: each is stopped at its share, the third by the server-wide growth threshold; joins to the loaded rooms go on, no restart', async ({ browser }) => {
+  test.setTimeout(900_000);
   const s0 = state();
   const run = Date.now().toString(36);
   const who: UserName[] = ['user1', 'user2', 'user3'];
   const all = [USERS.user1.email, USERS.user2.email, USERS.user3.email];
-  const pubs = who.map((_, r) => publish({ users: all }, `fv6-q4b-${run}-${r}`));
+  const pubs = Array.from({ length: 6 }, (_, r) => publish({ users: all }, `fv6-q4b-${run}-${r}`));
   const cookies = await Promise.all(who.map((u, r) => cookieOf(browser, pubs[r].canvas, u)));
+  const full = shapesFor(sizing().maxDocMiB);
+  const principal0 = metric('canvas_ws_rejected_total', 'reason="room_memory_principal"');
+  const total0 = metric('canvas_ws_rejected_total', 'reason="room_memory"');
   const held: Raw[] = [];
+  const keepers: Raw[] = [];
   const filled: number[] = [];
   let peak = mem();
-  for (let r = 0; r < 3; r++) {
-    const c = new Raw(wsUrl(pubs[r].canvas), cookies[r]);
+  for (let r = 0; r < 6; r++) {
+    // a reader socket of the same user keeps the room loaded once the writer is refused (a room
+    // nobody is connected to is evicted, and its charge with it)
+    const keep = new Raw(wsUrl(pubs[r].canvas), cookies[Math.floor(r / 2)]);
+    keepers.push(keep);
+    await keep.ready();
+    const c = new Raw(wsUrl(pubs[r].canvas), cookies[Math.floor(r / 2)]);
     held.push(c);
     await c.ready();
-    filled.push(await c.fill(`b${r}`, 34_000, 2000, 900));
+    filled.push(await c.fill(`b${r}`, full, 1000, 900));
     peak = Math.max(peak, mem());
   }
-  // two full rooms (~2 x 408 MiB of the 920 MiB budget): the third one is stopped, with 1013
-  expect(filled.slice(0, 2)).toEqual([34_000, 34_000]);
-  expect(held[2].closeCode).toBe(1013);
-  expect(filled[2]).toBeLessThan(34_000);
-  // joins to the loaded rooms are never refused for memory: user3 joins user1's room and edits
+  const principal = metric('canvas_ws_rejected_total', 'reason="room_memory_principal"') - principal0;
+  const total = metric('canvas_ws_rejected_total', 'reason="room_memory"') - total0;
+  // the first room of user1 and of user2 is full, their second one stopped at their share; user3
+  // is stopped by the total before it reaches its share
+  expect(filled[0]).toBe(full);
+  expect(filled[2]).toBe(full);
+  expect(held[1].closeCode).toBe(1013);
+  expect(held[3].closeCode).toBe(1013);
+  expect(principal).toBeGreaterThanOrEqual(2);
+  expect(total).toBeGreaterThanOrEqual(1);
+  expect([held[4].closeCode, held[5].closeCode]).toContain(1013);
+  expect(metric('canvas_room_memory_bytes')).toBeLessThanOrEqual(0.8 * metric('canvas_room_memory_budget_bytes') * 1.01);
+  // joins to the loaded rooms are never refused for memory: user3 joins user1's room and edits.
+  // fv9: the loaded rooms may pass the 80% growth threshold through loads alone (each one is a
+  // worker, 16 MiB, and loads go on to 85%), and an edit that adds anything is then refused 1013 by
+  // design: the visitor's edit is a delete, which never grows the room and always passes
   const visitor = new Raw(wsUrl(pubs[0].canvas), cookies[2]);
   expect(await visitor.ready(60_000)).toBe(true);
-  const rtt = await editRtt(visitor, held[0], `v${run}`);
+  const rtt = await deleteRtt(visitor, held[0], 'b0s0');
   peak = Math.max(peak, mem());
   const s1 = state();
-  log('Q4b', { filled, closes: held.map((h) => h.closeCode), visitorRttMs: rtt, peakMiB: peak, before: s0, after: s1 });
+  log('Q4b', { full, filled, closes: held.map((h) => h.closeCode), keepersOpen: keepers.filter((k) => k.closeCode === null).length, refusedPrincipal: principal, refusedTotal: total, visitorRttMs: rtt, peakMiB: peak, before: s0, after: s1 });
+  expect(keepers.every((k) => k.closeCode === null)).toBe(true);
   expect(s1).toEqual(s0);
-  expect(peak).toBeLessThan(2048);
+  expect(peak).toBeLessThan(LIMIT_MIB);
 });
 
-test('Q4c: anonymous visitors fill pub/ rooms at the 5 MiB cap: the anonymous rooms stop at half the budget, no restart; a logged-in user still loads and edits', async ({ browser }) => {
+test('Q4c: anonymous visitors fill pub/ rooms at the anonymous cap: they stop at a third of the budget together, no restart; a logged-in user still loads and edits', async ({ browser }) => {
   test.setTimeout(900_000);
   const s0 = state();
   const run = Date.now().toString(36);
@@ -252,6 +295,7 @@ test('Q4c: anonymous visitors fill pub/ rooms at the 5 MiB cap: the anonymous ro
   const anon0 = metric('canvas_ws_rejected_total', 'reason="room_memory_anon"');
   const anons: Raw[] = [];
   const filled: number[] = [];
+  const full = shapesFor(sizing().anonMaxDocMiB);
   let peak = mem();
   const keepers: Raw[] = [];
   for (let r = 0; r < ANON_ROOMS; r++) {
@@ -266,8 +310,8 @@ test('Q4c: anonymous visitors fill pub/ rooms at the 5 MiB cap: the anonymous ro
       log(`Q4c room ${r + 1}/${ANON_ROOMS}`, { refusedAtJoin: [keeper.closeCode, c.closeCode], memMiB: mem() });
       continue;
     }
-    // 9 000 labelled shapes = ~4.5 MB, just under the 5 MiB anonymous cap (content + ledger)
-    filled.push(await c.fill(`a${r}`, 9000, 1000, 1500));
+    // just under the anonymous cap (content + ledger)
+    filled.push(await c.fill(`a${r}`, full, 500, 1500));
     peak = Math.max(peak, mem());
     log(`Q4c room ${r + 1}/${ANON_ROOMS}`, { filled: filled[r], close: c.closeCode, notices: c.notices, memMiB: mem() });
   }
@@ -278,25 +322,26 @@ test('Q4c: anonymous visitors fill pub/ rooms at the 5 MiB cap: the anonymous ro
   const c2 = await cookieOf(browser, P.canvas, 'user2');
   const owner = new Raw(wsUrl(P.canvas), c1);
   expect(await owner.ready()).toBe(true);
-  expect(await owner.fill('t', 6000, 2000, 900)).toBe(6000);
+  const team = Math.floor(shapesFor(sizing().maxDocMiB) / 2);
+  expect(await owner.fill('t', team, 1000, 900)).toBe(team);
   const other = new Raw(wsUrl(P.canvas), c2);
   expect(await other.ready()).toBe(true);
-  await waitFor(() => other.doc.getMap('shapes').size >= 6000, 30_000, 'team synced');
+  await waitFor(() => other.doc.getMap('shapes').size >= team, 30_000, 'team synced');
   const rtt = await editRtt(owner, other, `t${run}`);
   for (let i = 0; i < 4; i++) {
     await sleep(2500);
     peak = Math.max(peak, mem());
   }
   const s1 = state();
-  log('Q4c', { rooms: ANON_ROOMS, filled, closes: anons.map((a) => a.closeCode), keepers: keepers.map((k) => (k.synced ? k.closeCode : `refused ${k.closeCode}`)), anonRefused, teamRttMs: rtt, peakMiB: peak, before: s0, after: s1 });
-  // the first rooms fill up; then the anonymous half of the budget is used: later rooms are
+  log('Q4c', { rooms: ANON_ROOMS, full, filled, closes: anons.map((a) => a.closeCode), keepers: keepers.map((k) => (k.synced ? k.closeCode : `refused ${k.closeCode}`)), anonRefused, teamRttMs: rtt, peakMiB: peak, before: s0, after: s1 });
+  // the first rooms fill up; then the anonymous third of the budget is used: later rooms are
   // refused (at the join that would load them, or at the fill)
-  expect(filled.filter((f) => f === 9000).length).toBeGreaterThanOrEqual(2);
+  expect(filled.filter((f) => f === full).length).toBeGreaterThanOrEqual(2);
   expect(anonRefused).toBeGreaterThanOrEqual(1);
-  expect(filled.filter((f) => f === 9000).length).toBeLessThan(ANON_ROOMS);
+  expect(filled.filter((f) => f === full).length).toBeLessThan(ANON_ROOMS);
   // the rooms already loaded keep their readers
   expect(keepers.filter((k) => k.synced).every((k) => k.closeCode === null)).toBe(true);
   expect(s1).toEqual(s0);
-  expect(peak).toBeLessThan(2048);
+  expect(peak).toBeLessThan(LIMIT_MIB);
   expect(owner.closeCode).toBeNull();
 });

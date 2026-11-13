@@ -37,7 +37,7 @@ y-websocket, y-protocols, lib0, [perfect-freehand](https://github.com/steveruizo
 |---|---|
 | `shared/` | The single source of the wire protocol, the Yjs document model and the attribution stamper. Both sides import it (`@pocharlies/artifacts-canvas-shared`), so client and server cannot drift. |
 | `client/` | The wrapper page: TypeScript + SVG, no framework, built with Vite. |
-| `server/` | The canvas service: rooms, core authz, stamper enforcement, S3 persistence. |
+| `server/` | The canvas service: rooms (each in a worker thread of its own, with a watchdog), core authz, stamper enforcement, S3 persistence. |
 | `dev/` | Local full-stack dev: the real server against a fake core authz and an in-memory S3 (`npm run dev`). |
 | `deploy/compose/` | The full system: the core's compose stack plus the canvas as its plugin (real gate, real MinIO, Dex). |
 | `e2e-system/` | Playwright suite against that full system (`npm run e2e:system`). |
@@ -137,12 +137,27 @@ the adversarial cases (a forged `history` append, `attribution`/`users` overwrit
 a client LEDGER message, a pending-state DoS, bad style enums and `__proto__` fields, offline edits across a
 canvas restart, a client-id claim after a restart, the oauth2-proxy catch-all, a foreign or missing
 `Origin`, the expired-artifact leak to a stranger, `/metrics` on the public route, an anonymous visitor
-filling the document, a client-chosen anonymous id, dozens of paused sockets on a ~20 MB room, a keystroke
-while reconnecting after a restart, users and anonymous visitors opening and filling more big rooms than the
-memory holds); and finally the core's own `deploy/compose/e2e.sh`, which must still
-pass with the plugin enabled. The canvas container runs under the chart's default memory limit (2 GiB,
-`--max-old-space-size=1536`; the server derives its loaded-room budget from that heap limit, see "Memory" in
-[`chart/values.yaml`](chart/values.yaml)).
+filling the document, a client-chosen anonymous id, dozens of paused sockets on a room near the size cap, a
+keystroke while reconnecting after a restart, users and anonymous visitors opening and filling more big rooms
+than the memory holds, one user filling rooms while anonymous visitors or signed-in co-viewers sit in them and
+then leave, with a second user opening a new artifact afterwards, one update of 200 000 cuts and
+one of 2 000 far-placed items refused while honest edits elsewhere keep p95 < 100 ms, a room stored
+past every share opening for its owner, screenshots pasted through the editor until it says the
+canvas is full, a user opening a second big room after leaving the first to a colleague, the fv9 messages that
+crashed or froze the canvas (runs and pairs of items Yjs merges, deletes that make it merge, formatting items,
+20 000 client blocks) refused while a signed-in user in another room sees pings answered within 200 ms and the
+container never restarts, anonymous visitors unable to fill the memory with stored `pub/` rooms, a signed-in
+writer flooding 4 MiB updates from one and from eight connections while the canvas stops reading it and stays
+within its in-flight cap and memory, and — with
+`CANVAS_WORKER_TEST_HOOKS=true` for `docker compose up` and `SYSTEM_WORKER_TEST_HOOKS=1` for the suite — a room
+worker that loops forever or allocates without bound replaced while the canvas lives on); and finally the core's own
+`deploy/compose/e2e.sh`, which must still pass with the plugin enabled. The canvas container runs under the
+chart's default memory limit (2304 MiB, `HEAP_LIMIT_MB=1776`; the server derives its loaded-room budget
+from that heap limit and logs it at start, see "Memory" in [`chart/values.yaml`](chart/values.yaml)). To run
+the stack at another size, set both `CANVAS_MEM_LIMIT` and `CANVAS_HEAP_LIMIT_MB` for `docker compose up`
+(e.g. `1g` and `816`); the fv7 spec reads the sizes from the server and runs at any of them
+(`npx playwright test -c e2e-system/playwright.config.ts adversarial-fv7`), the fv5 and fv6 specs expect
+the default 2304 MiB.
 
 Stop everything with `docker compose down -v` (from `deploy/compose/`).
 
@@ -202,7 +217,11 @@ The canvas is a core plugin (design §8): the core answers *who may see this art
 
    The chart ships the Deployment, Service (`http` 8080, `metrics` 9091), ConfigMap, ServiceAccount and a
    NetworkPolicy: `http` only from the ingress controller's namespace and the core's namespace, `metrics`
-   only from `networkPolicy.metricsNamespaces`.
+   only from `networkPolicy.metricsNamespaces`; with `alerts.enabled` also a PrometheusRule (strike
+   cooldowns, worker timeouts, failed rebuilds, in-flight refusals, writes refused while saves fail;
+   their series are exposed at 0 from the start, so the first event after a restart fires).
+   It refuses to render a `resources.limits.memory` that cannot hold its `heapLimitMb` (see "Memory"
+   in `values.yaml`: change both together).
 
 ## Configuration reference (server)
 
@@ -220,7 +239,7 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `S3_FORCE_PATH_STYLE` | `true` | Path-style addressing (needed by MinIO). |
 | `CANVAS_PREFIX` | `_plugins/canvas` | Prefix of the stored canvas objects (`<prefix>/<key>.ydoc` content, `<prefix>/<key>.ydoc.ledger` ledger). |
 | `AUTHZ_TIMEOUT_MS` | `3000` | Gate call timeout; anything late or wrong fails closed. |
-| `AUTHZ_RECHECK_SECONDS` | `300` | Re-check interval per connection; on a deny the client is dropped (4403). |
+| `AUTHZ_RECHECK_SECONDS` | `300` | Re-check interval per connection; on a deny the client is dropped (4403); when the core cannot answer (timeout, 5xx) it is closed `1013` and reconnects. |
 | `FRAME_FETCH_TIMEOUT_MS` | `10000` | Artifact fetch for the frame route. |
 | `STATIC_DIR` | `client/dist` | Built client bundle served under `/_canvas/_/`. |
 | `CANVAS_INJECT_CONFIG` | `true` | Inject the wrapper config element (§2 of the protocol). |
@@ -234,20 +253,31 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `MAX_CONNS_PER_ROOM` / `MAX_CONNS_PER_ROOM_ANON` / `MAX_CONNS_PER_ANON_VISITOR` | `50` / `10` / `2` | Room capacity (anon gets the stricter set); over capacity closes `1013`. |
 | `MSG_RATE_PER_SEC` / `MSG_BURST` | `120` / `240` | Per-connection message rate → `4429`. |
 | `ANON_MSG_RATE_PER_SEC` / `ANON_MSG_BURST` | `30` / `60` | Same for anonymous. |
-| `MAX_DOC_BYTES` / `ANON_MAX_DOC_BYTES` | `20 MiB` / `5 MiB` | Content **plus ledger**: an update that would grow the room past the sender's cap is refused and only that connection closes `4413`; the room stays open, and an update that only deletes always passes. |
+| `MAX_DOC_BYTES` / `ANON_MAX_DOC_BYTES` | `5 MiB` / `1.25 MiB` | Content **plus ledger**: an update that would grow the room past the sender's cap is refused and only that connection closes `4413`; the room stays open, and an update that only deletes always passes. Lowered at start (with a warning) when a full room does not fit one share of the room memory budget. |
 | `WS_MAX_BUFFERED_BYTES` | `8 MiB` | A peer that stops reading is dropped once the server holds this much unsent data for it (beyond the join burst). |
 | `SYNC_BYTES_PER_SEC` / `SYNC_BURST_BYTES` | `1 MiB` / `4 MiB` | Bytes of sync step-2 answers after the first one of a connection → `4429`; a later step 1 with an empty state vector closes `4429` at once. Anonymous: `ANON_SYNC_BYTES_PER_SEC` / `ANON_SYNC_BURST_BYTES` (`256 KiB` / `1 MiB`). |
 | `JOIN_RATE_PER_MIN` / `JOIN_BURST` | `30` / `20` | Joins per signed-in user → `4429`. Anonymous: `ANON_JOIN_RATE_PER_MIN` / `ANON_JOIN_BURST` (`10` / `6`) per visitor, and `ANON_ROOM_JOIN_RATE_PER_MIN` / `ANON_ROOM_JOIN_BURST` (`60` / `30`) per room. |
 | `CPU_MS_PER_SEC` / `CPU_BURST_MS` | `250` / `5000` | Server CPU time a connection's messages may use → `4429`. Anonymous: `ANON_CPU_MS_PER_SEC` / `ANON_CPU_BURST_MS` (`60` / `1000`). |
-| `ROOM_MEMORY_BUDGET_BYTES` | derived | Loaded-room memory budget (fv6 H-1). Default: V8 `heap_size_limit` − 192 MiB − `WS_OUTGOING_BUDGET_BYTES` − 24 × `MAX_MESSAGE_BYTES` (920 MiB under the chart's 1536 MiB heap); a room costs `ROOM_COST_FACTOR` (24) × content + ledger. A join that would load a room past 90% of it, or an update that would grow the loaded rooms past it → `1013`; joins to loaded rooms are never refused for memory. |
-| `ROOM_MEMORY_PRINCIPAL_SHARE` / `ROOM_MEMORY_ANON_SHARE` | `0.5` / `0.5` | Share of the budget one principal may keep loaded (a quarter of it for an anonymous visitor, never less than 1.25 rooms at its size cap), and the share of the rooms only anonymous visitors hold. |
+| `ROOM_MEMORY_BUDGET_BYTES` | derived | Loaded-room memory budget (fv6 H-1, fv7 F1). Default: `HEAP_LIMIT_MB` (else V8's `heap_size_limit`) − 192 MiB − `WS_OUTGOING_BUDGET_BYTES` − 60 × `MAX_MESSAGE_BYTES` × `WORKER_APPLY_CONCURRENCY` (1 088 MiB with the chart's 1776); a room costs `ROOM_COST_FACTOR` (44) × content + ledger + `ROOM_BASE_COST_BYTES` (16 MiB: its worker thread, fv9). A join that would load a room past 85% of it, or an update that would grow the loaded rooms past 80% → `1013`; joins to loaded rooms are never refused for memory. |
+| `ROOM_MEMORY_PRINCIPAL_SHARE` / `ROOM_MEMORY_ANON_SHARE` | `1/3` / `1/3` | What one principal may be charged for — the rooms its joins loaded (until it leaves them to others, who take the load cost within their shares) and everything it wrote, in full, while those rooms stay loaded (an anonymous visitor: a quarter of it) — and what all anonymous visitors together may. Their sum must stay ≤ 0.8. A stored room that costs more than a share loads, charged one share. |
 | `ANON_MINT_RATE_PER_MIN` / `ANON_MINT_BURST` | `120` / `60` | New anonymous visitors (cookies) minted by the wrapper page, and as many by cookieless WebSocket joins; per client IP `ANON_IP_MINT_RATE_PER_MIN` / `ANON_IP_MINT_BURST` (`10` / `10`) when `CLIENT_IP_HOPS` is set. |
 | `CLIENT_IP_HOPS` | `-1` (chart: `1`) | Where the client IP comes from: `-1` unknown, `0` the TCP peer, `n` the n-th `X-Forwarded-For` entry from the right (one per trusted proxy that appends; never more). |
 | `SAVE_CPU_MS_PER_SEC` / `SAVE_CPU_BURST_MS` | `50` / `1000` | Server CPU the debounced saves of all rooms may use; a due save waits while it is used up (flushes never wait). |
 | `WS_STALL_MS` | `3000` | A peer holding > 256 KiB that drains < `WS_JOIN_MIN_BYTES_PER_SEC` this long is stalled: dropped first when the outgoing budget is short. |
 | `ATTRIBUTION_RETENTION_DAYS` | `30` | Attribution entries of shapes deleted longer ago than this are pruned from the ledger. |
-| `MAX_MESSAGE_BYTES` / `ANON_MAX_MESSAGE_BYTES` | `8 MiB` / `2 MiB` | Message size limit → `4413`. |
-| `MAX_IMAGE_BYTES` / `ANON_MAX_IMAGE_BYTES` | `2 MiB` / `1 MiB` | Announced to the client as its paste cap. |
+| `MAX_MESSAGE_BYTES` / `ANON_MAX_MESSAGE_BYTES` | `4 MiB` / `1 MiB` | Message size limit → `4413`. Never above the room caps (lowered with them). |
+| `MAX_IMAGE_BYTES` / `ANON_MAX_IMAGE_BYTES` | `2 MiB` / `512 KiB` | Announced to the client as its paste cap; at most 70% of the message cap (a data URL is 4/3 of the image). The editor stores pasted images at most 1600 px, as WebP (PNG or the original only when smaller), and says the canvas is full before an image would pass the room cap. |
+| `MAX_SPLITS_PER_MESSAGE` | `5000` | Cuts of items one update may make (every insert or delete inside an item: a struct of its own in the stored room, and a copy of the item for Yjs) → `4413` for the sender (fv8 P1/P2). |
+| `MAX_APPLY_MS` | `1000` | Yjs time the cuts, placement scans, merges and deletes of one update may take by the server's estimate (costs measured on x86) → `4413`; the whole apply is charged to the CPU budgets before it runs, and one they cannot cover → `1013` (fv8 P2, fv9 A-C). The update runs in its room's worker (fv9), so this bounds one message's worker time; it was 50. |
+| `MAX_CLIENTS_PER_UPDATE` | `256` | Client blocks one update may carry → `4413` (fv9 E). |
+| `WORKER_MESSAGE_TIMEOUT_MS`, `WORKER_TIMEOUT_NS_PER_BYTE` | `1000`, `1000` | Watchdog of a client message in its room's worker (guard and apply; the apply up to twice its estimate on top). Missed, out of heap or crashed: the worker is terminated, the room rebuilt from storage and its write-ahead log, the sender closed `4413` and struck (fv9, protocol §12). |
+| `WORKER_OP_TIMEOUT_MS`, `WORKER_OP_NS_PER_BYTE` | `10000`, `2000` | Watchdog of an operation on a whole room (load, join encodings, save, a rebuild's replay). |
+| `WORKER_APPLY_CONCURRENCY` | `1` | Client messages processed at once over all rooms (the memory budget reserves one message per slot). |
+| `WORKER_INFLIGHT_BYTES` | `67108864` | Client messages received and not processed yet, over all connections (64 MiB; Node buffers outside the heap, counted in the chart's memory formula). Past it a message over `CPU_SHED_MIN_BYTES` → `1013`; a connection, and a principal, with `max(2 × MAX_MESSAGE_BYTES, 1 MiB)` in flight is not read until it is processed (protocol §12). |
+| `WORKER_STRIKES`, `WORKER_STRIKE_WINDOW_MS`, `WORKER_STRIKE_COOLDOWN_MS`, `WORKER_ANON_POOL_STRIKES` | `3`, `600000`, `600000`, `10` | Strikes within the window put a principal (anonymous: also its IP, and all anonymous visitors after the pool's count) in a cooldown: joins and writes `1013`. |
+| `HEAP_LIMIT_MB` | V8's heap limit | The heap the process may use, all threads together: the loaded-room budget is derived from it. Use it, not `--max-old-space-size`: that V8 flag applies to every thread and overrides each room worker's own heap limit, and the server refuses to start with it (`NODE_OPTIONS` or the command line). The chart refuses a `resources.limits.memory` too small for its `heapLimitMb` (values.yaml, "Memory"). |
+| `WORKER_TEST_HOOKS` | `false` | Test stacks only: a client update carrying `canvas-test-hook:<busy\|alloc\|throw>` makes its room's worker misbehave. Refused at start under `NODE_ENV=production` (the image's) unless `WORKER_TEST_HOOKS_IN_PRODUCTION=true` (the compose stack sets both); the chart renders neither. |
+| `ROOM_BASE_COST_BYTES` | `16777216` | Resident cost of an empty loaded room, its worker thread included (measured 15.7 MiB in the image). |
 | `ALLOWED_ORIGINS` | origin of `ARTIFACT_BASE_URL` | Comma-separated browser origins (`scheme://host[:port]`) allowed to open the WebSocket. A missing, `null` or foreign `Origin` is closed `4403` (cross-site WebSocket hijacking guard). |
 | `METRICS_PORT` / `METRICS_HOST` | `9091` / `0.0.0.0` | Internal Prometheus listener (`/metrics` only; `0` disables it). The public listener answers `404` for `/metrics`. |
 | `ANON_COOKIE_SECRET` | (random per process) | Signs the anonymous-visitor cookie: the server assigns the *Anónimo NNNN* pseudonym (`?anon=` is only a hint for the number shown) and the anonymous attribution id `anon:<visitor id>` is derived from the cookie's nonce. Chart: `anon.cookieSecretRef` (a Secret reference, never a value); required with more than one replica, since every pod must verify the same cookie. |

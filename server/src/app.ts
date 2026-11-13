@@ -1,6 +1,6 @@
 import http from 'node:http';
 import v8 from 'node:v8';
-import type { Config } from './config.js';
+import { GROWTH_FRACTION, LOAD_FRACTION, type Config } from './config.js';
 import { createLogger, type Logger } from './logging.js';
 import { Metrics } from './metrics.js';
 import { AuthzClient } from './authz.js';
@@ -45,6 +45,9 @@ export function createApp(deps: AppDeps): App {
   const wsApp = new WsServer({ cfg, authz, manager, log, metrics, anon });
   const metricsServer = cfg.metricsPort ? http.createServer(metricsHandler(metrics)) : null;
 
+  const heapTimer = setInterval(() => metrics.sampleHeap(), 500);
+  heapTimer.unref();
+
   const server = http.createServer(httpApp.handler);
   server.on('upgrade', (req, socket, head) => wsApp.handleUpgrade(req, socket, head));
 
@@ -60,10 +63,28 @@ export function createApp(deps: AppDeps): App {
         server.listen(cfg.port, cfg.host, () => {
           server.removeListener('error', reject);
           log.info({ port: cfg.port }, 'artifacts-canvas server listening');
+          const mib = (b: number) => Math.round((b / 1048576) * 100) / 100;
           log.info(
-            { budgetMiB: Math.round(cfg.roomMemoryBudgetBytes / 1048576), source: cfg.roomMemoryBudgetSource, heapLimitMiB: Math.round(v8.getHeapStatistics().heap_size_limit / 1048576), costFactor: cfg.roomCostFactor },
+            {
+              budgetMiB: mib(cfg.roomMemoryBudgetBytes),
+              source: cfg.roomMemoryBudgetSource,
+              heapLimitMiB: mib(v8.getHeapStatistics().heap_size_limit),
+              heapLimitSource: cfg.heapLimitSource,
+              costFactor: cfg.roomCostFactor,
+              loadsUpToMiB: mib(cfg.roomMemoryBudgetBytes * LOAD_FRACTION),
+              growthUpToMiB: mib(cfg.roomMemoryBudgetBytes * GROWTH_FRACTION),
+              userShareMiB: mib(manager.share(false)),
+              anonVisitorShareMiB: mib(manager.share(true)),
+              anonTotalShareMiB: mib(manager.anonShare()),
+              maxDocMiB: mib(cfg.maxDocBytes),
+              anonMaxDocMiB: mib(cfg.anonMaxDocBytes),
+              maxMessageMiB: mib(cfg.maxMessageBytes),
+              anonMaxMessageMiB: mib(cfg.anonMaxMessageBytes),
+            },
             'loaded-room memory budget',
           );
+          // fv7 F1: the limits this deployment's memory cannot hold were lowered; say so loudly
+          for (const w of cfg.memoryWarnings) log.warn({ budgetMiB: mib(cfg.roomMemoryBudgetBytes) }, `memory sizing: ${w}`);
           resolve();
         });
       }).then(
@@ -80,6 +101,7 @@ export function createApp(deps: AppDeps): App {
       );
     },
     async close(): Promise<void> {
+      clearInterval(heapTimer);
       wsApp.close();
       await manager.shutdown('shutdown');
       await new Promise<void>((resolve) => server.close(() => resolve()));

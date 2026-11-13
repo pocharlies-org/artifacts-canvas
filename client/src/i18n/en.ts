@@ -30,6 +30,7 @@ export const en: Record<MessageKey, string> = {
   'app.notice.readonly': 'You can only view the annotations.',
   'app.notice.rate-limited': 'Too many changes at once; wait a moment.',
   'app.notice.too-large': 'The canvas reached its maximum size.',
+  'app.notice.too-costly': 'That change was too large to apply at once; delete fewer shapes at a time.',
   'app.notice.shutdown': 'The server is restarting; reconnecting…',
   'app.notice.busy': 'The server is busy; reconnecting…',
   'app.notice.closed': 'Connection closed by the server ({code}).',
@@ -167,6 +168,7 @@ export const en: Record<MessageKey, string> = {
   'frame.defaultName': 'Frame {n}',
   'text.truncated': 'Text is limited to {max} characters; the rest was not pasted.',
   'image.tooLarge': 'The image is too large (max {max}).',
+  'image.canvasFull': 'The canvas is full: this image would take it past its maximum size ({max}). Delete something first.',
   'artifact.loading': 'Loading artifact…',
   'artifact.failed': 'The artifact could not be loaded.',
 };
