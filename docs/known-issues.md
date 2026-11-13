@@ -31,14 +31,17 @@ one GitHub issue.
   Suggested fix: none planned; charging nobody would let loaders fill the budget through sitters
   (fv7 F1).
 
-- [ ] **The fv6 server suite needs ~4 GB in its vitest fork (Low, tests only).**
-  `server/test/fv6.test.ts` loads rooms up to its 64-256 MiB test budgets inside one vitest fork
-  (`pool: 'forks'`, files sequential): the fork peaks at ~3.9 GB RSS (measured on an M-series
-  Mac, Node 26; the whole server suite passes on the x86 proof host and on GitHub's runners). On
-  a host with 4 GB of RAM or less the fork can be killed or die with `JavaScript heap out of
-  memory`, and `npm test` fails there for that reason only.
-  Suggested fix: split the file per finding and lower its budgets, or run it with
-  `NODE_OPTIONS=--max-old-space-size=…` sized to the host; on small hosts run it alone.
+- [ ] **The fv6 server suite outgrows the default Node heap in its vitest fork (Low, tests only).**
+  `server/test/fv6.test.ts` loads rooms up to its 64-256 MiB test budgets and, in its last test
+  (q5), holds paused sockets' outgoing buffers, all inside one vitest fork (`pool: 'forks'`,
+  files sequential). On x86 with Node 22, whose default heap limit is 4 GiB whatever the RAM,
+  the fork reaches it during q5 (~4.5 GB RSS, `FATAL ERROR: Reached heap limit ... JavaScript heap
+  out of memory`, vitest reports `Worker exited unexpectedly` and `npm test` fails although 222
+  of 223 tests passed); the same happens at the fv7 head (5a1ab8c), so fv8 did not cause it. An
+  M-series Mac (Node 26, ~3.9 GB RSS) and GitHub's runners pass. Workaround:
+  `NODE_OPTIONS=--max-old-space-size=8192 npm test` (the forks inherit it).
+  Suggested fix: split the file per finding (each file gets a fresh fork), release the rooms and
+  test clients of each test, and lower q5's outgoing budget.
 
 The fv8 findings P1, P2, U1 and U2 are fixed:
 
