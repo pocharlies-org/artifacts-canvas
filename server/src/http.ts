@@ -232,11 +232,15 @@ export class HttpApp {
       return;
     }
     if (cfg.injectConfig) {
-      const anon = gate.res.identity?.anonymous ?? false;
+      // an anonymous visitor has no identity from the gate (authz.ts): it gets the anonymous caps
+      // (fv8 U1: it was told the signed-in image cap, and would have been told the room cap)
+      const anon = !gate.res.identity || gate.res.identity.anonymous;
       html = injectConfig(html, {
         artifactPath: key,
         dev: false,
         maxImageBytes: anon ? cfg.anonMaxImageBytes : cfg.maxImageBytes,
+        // fv8 U1: the editor says the canvas is full before the server would refuse it
+        maxDocBytes: anon ? cfg.anonMaxDocBytes : cfg.maxDocBytes,
       });
     }
     res.statusCode = 200;

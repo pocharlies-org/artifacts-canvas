@@ -29,6 +29,8 @@ export interface CanvasConfig {
   /** Development: name to ask the dev server for (?as=). */
   devUser: string;
   maxImageBytes: number;
+  /** The room's size cap for this visitor (MAX_DOC_BYTES / ANON_MAX_DOC_BYTES): the editor says the canvas is full before it (fv8 U1). */
+  maxDocBytes: number;
 }
 
 export const DEFAULT_PREFIX = '/_canvas/';
@@ -69,6 +71,7 @@ export function resolveConfig(loc: Location, doc: Document, isDev: boolean): Can
     dev,
     devUser: dev ? (q.get('as') ?? '') : '',
     maxImageBytes: 2 * 1024 * 1024,
+    maxDocBytes: 5 * 1024 * 1024,
     ...inline,
   };
   if (!inline.room) cfg.room = cfg.artifactPath;

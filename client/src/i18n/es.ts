@@ -165,6 +165,7 @@ export const es = {
   'frame.defaultName': 'Marco {n}',
   'text.truncated': 'El texto admite como máximo {max} caracteres; el resto no se ha pegado.',
   'image.tooLarge': 'La imagen es demasiado grande (máx. {max}).',
+  'image.canvasFull': 'El lienzo está lleno: esta imagen superaría su tamaño máximo ({max}). Borra algo antes.',
   'artifact.loading': 'Cargando artifact…',
   'artifact.failed': 'No se pudo cargar el artifact.',
 } as const;

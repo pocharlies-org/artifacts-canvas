@@ -167,6 +167,7 @@ export const en: Record<MessageKey, string> = {
   'frame.defaultName': 'Frame {n}',
   'text.truncated': 'Text is limited to {max} characters; the rest was not pasted.',
   'image.tooLarge': 'The image is too large (max {max}).',
+  'image.canvasFull': 'The canvas is full: this image would take it past its maximum size ({max}). Delete something first.',
   'artifact.loading': 'Loading artifact…',
   'artifact.failed': 'The artifact could not be loaded.',
 };

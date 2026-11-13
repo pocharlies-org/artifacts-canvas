@@ -1,6 +1,7 @@
 import * as Y from 'yjs';
 import { CanvasDoc, newId } from '../model/doc';
-import { MAX_TEXT_LENGTH, assetValueOk } from '@pocharlies/artifacts-canvas-shared/model';
+import { MAX_TEXT_LENGTH } from '@pocharlies/artifacts-canvas-shared/model';
+import { encodeImage, roomBytes, wouldOverfill } from './images';
 import { attachStamper } from '../model/stamper';
 import { DEFAULT_STYLE, STYLE_KEYS, type Identity, type Shape, type Style, type GeoKind } from '../model/types';
 import { Connection, type Status } from '../collab/connection';
@@ -717,22 +718,29 @@ export class Editor {
 
   // ------------------------------------------------------------------ images
 
+  /** images refused client-side because the canvas is full (fv8 U1; tests read it) */
+  canvasFullRefusals = 0;
+
   async insertImageFile(file: File, at?: Pt): Promise<void> {
     if (this.readOnly || !file.type.startsWith('image/')) return;
     const url = await readAsDataUrl(file);
     const img = await loadImage(url);
-    let dataUrl = url;
     const max = this.cfg.maxImageBytes;
-    // only png/jpeg/gif/webp data URLs are stored (server rule): anything else (svg, bmp,
-    // avif, ...) is re-encoded as PNG through a canvas
-    if (!assetValueOk(dataUrl)) dataUrl = downscale(img, 1600, 'image/png');
-    if (dataUrl.length * 0.75 > max || img.naturalWidth > 2000 || img.naturalHeight > 2000) {
-      dataUrl = downscale(img, 1600, file.type === 'image/png' ? 'image/png' : 'image/jpeg');
-      if (dataUrl.length * 0.75 > max) dataUrl = downscale(img, 1600, 'image/jpeg', 0.8);
-      if (dataUrl.length * 0.75 > max) {
-        this.toast(t('image.tooLarge', { max: `${Math.round(max / 1024 / 1024)} MB` }));
-        return;
-      }
+    // fv8 U1: stored at most 1600 px, as WebP (JPEG without WebP), PNG or the original file,
+    // whichever is smallest; only png/jpeg/gif/webp data URLs are stored (server rule): anything
+    // else (svg, bmp, avif, ...) is re-encoded through a canvas
+    const dataUrl = encodeImage(img, url, file.type, max);
+    if (!dataUrl || dataUrl.length * 0.75 > max) {
+      this.toast(t('image.tooLarge', { max: `${Math.round(max / 1024 / 1024)} MB` }));
+      return;
+    }
+    // fv8 U1: a canvas that cannot take the image says so, before the server would refuse the
+    // update by closing the connection (4413)
+    const cap = this.cfg.maxDocBytes;
+    if (wouldOverfill(roomBytes(this.doc.doc, this.doc.ledger), dataUrl.length, cap)) {
+      this.toast(t('image.canvasFull', { max: `${(cap / 1024 / 1024).toFixed(cap < 2 * 1024 * 1024 ? 2 : 1)} MB` }));
+      this.canvasFullRefusals++;
+      return;
     }
     const assetId = newId('a');
     if (!this.doc.setAsset(assetId, dataUrl)) return;
@@ -1074,20 +1082,6 @@ function loadImage(url: string): Promise<HTMLImageElement> {
     i.onerror = rej;
     i.src = url;
   });
-}
-
-function downscale(img: HTMLImageElement, maxSide: number, type: string, q = 0.9): string {
-  const s = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
-  const c = document.createElement('canvas');
-  c.width = Math.round(img.naturalWidth * s);
-  c.height = Math.round(img.naturalHeight * s);
-  const ctx = c.getContext('2d')!;
-  if (type === 'image/jpeg') {
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(0, 0, c.width, c.height);
-  }
-  ctx.drawImage(img, 0, 0, c.width, c.height);
-  return c.toDataURL(type, q);
 }
 
 function getComputedFontFamily(f: Style['font']): string {
