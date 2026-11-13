@@ -646,9 +646,10 @@ describe('S8: read-ahead, churn and unfinished messages are bounded', () => {
   }, 120_000);
 
   it('churn: a new connection starts with a full message bucket and nothing in flight; while the server is over the cap each one adds at most two messages, and the join limit ends the churn', async () => {
-    // a 1 MiB cap (and messages, which the cap must hold): the churn passes it fast
+    // a 1 MiB cap (and messages, which the cap must hold): the churn passes it fast; the join burst
+    // (20) refills at 1 a minute, so the run's length on a slow host does not decide whether it ends
     const cap = MiB;
-    const app = await startApp({ HEAP_LIMIT_MB: '1776', MAX_MESSAGE_BYTES: String(MiB), WORKER_INFLIGHT_BYTES: String(cap) });
+    const app = await startApp({ HEAP_LIMIT_MB: '1776', MAX_MESSAGE_BYTES: String(MiB), WORKER_INFLIGHT_BYTES: String(cap), JOIN_RATE_PER_MIN: '1' });
     const msg = tiny();
     const burst = 200;
     const filler = 'u/s8-churn-fill/index.html';
