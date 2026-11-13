@@ -4,17 +4,19 @@ import * as awarenessProtocol from 'y-protocols/awareness';
 import * as syncProtocol from 'y-protocols/sync';
 import { writeUpdate } from 'y-protocols/sync';
 import type { WebSocket } from 'ws';
-import { roomCost, type Config } from './config.js';
+import { MESSAGE_COST_FACTOR, SCAN_WORK_NS, SPLIT_WORK_NS, applyEstimateMs, roomCost, type Config } from './config.js';
 import type { Logger } from './logging.js';
 import type { Metrics } from './metrics.js';
 import { canvasLedgerKey, canvasObjectKey } from './paths.js';
 import type { CanvasObjectStore } from './store.js';
 import type { Identity } from './types.js';
-import { attachStamper, dropPending, encodeIntegratedState, hasPending, utf8Length } from '@pocharlies/artifacts-canvas-shared/stamper';
-import { ROOT } from '@pocharlies/artifacts-canvas-shared/model';
-import { bindWriters, materializeContent, materializeLedger, migrateLegacyRoots, pruneAttribution, writerOf } from '@pocharlies/artifacts-canvas-shared/ledger';
-import { MSG_SYNC, encodeLedger } from '@pocharlies/artifacts-canvas-shared/protocol';
+import type { UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { materializeContent, materializeLedger } from '@pocharlies/artifacts-canvas-shared/ledger';
+import { CLOSE, MSG_SYNC, encodeLedger, encodeNotice } from '@pocharlies/artifacts-canvas-shared/protocol';
 import type { TokenBucket } from './limits.js';
+import type { Emitted } from './room-core.js';
+import type { ApplyResult, CheckResult, DiffResult, FramesResult, InspectResult, LoadResult, SaveResult, StampIdentity, WorkerRequest } from './room-protocol.js';
+import { WorkerFault, WorkerHost, type Answer, type FaultKind, type Semaphore } from './worker-host.js';
 
 /** A live WebSocket connection in a room. Used as the Yjs transaction origin. */
 export interface Conn {
@@ -39,6 +41,8 @@ export interface Conn {
   precharged?: number;
   /** `u:<user id>` or `a:<visitor nonce>`: the key of the per-principal limits */
   principal: string;
+  /** the client IP when the deployment says where it comes from (CLIENT_IP_HOPS), else null (strikes) */
+  ip?: string | null;
   /** server step-1 requests answering a `pending` update (fv5 M-2), per connection */
   resync: TokenBucket;
   /** a step-1 request is outstanding (cleared by the client's next step 2) */
@@ -104,22 +108,58 @@ export interface RoomDeps {
    * charged one share at most).
    */
   shareOf?: (anonymous: boolean) => number;
+  /** client messages processed at once over all rooms (Config.workerApplyConcurrency) */
+  applySlots?: Semaphore;
+  /** a client message made the room's worker fault: its principal gets a strike (fv9) */
+  onStrike?: (conn: Conn, kind: FaultKind) => void;
+  /** the room could not be rebuilt after a fault: every connection was closed, the manager drops it */
+  onBroken?: (room: Room) => void;
 }
+
+/** The room is gone (evicted, expired, or dropped after a fault): nothing more runs on it. */
+export class RoomGone extends Error {
+  constructor() {
+    super('room gone');
+  }
+}
+
+/** What the main thread decides about a client update once the guard answered (see Room.update). */
+export interface UpdateHooks {
+  /** main-thread checks (size cap, memory budget, CPU): true = apply it; false = the caller refused it */
+  decide: (check: UpdateCheck) => boolean;
+  /** the update was applied (or threw / left pending state, both dropped): bookkeeping */
+  applied: (check: UpdateCheck, outcome: ApplyResult, before: { cost: number; changed: number }) => void;
+}
+
+const MiB = 1024 * 1024;
+/** Young generation of a room's worker (MiB). */
+export const WORKER_YOUNG_MB = 16;
 
 /**
  * One room per artifact key (design §6.2), made of TWO documents (protocol §5-§6):
- *   doc     the CONTENT document (shapes, assets, meta): the only one clients write, through
- *           the guard, each update applied with its connection as transaction origin;
- *   ledger  the LEDGER document (attribution, users, history, writers): written only by the
- *           shared stamper, which observes `doc`; clients receive it on MSG_LEDGER and the
- *           server never applies a client byte to it.
- * Both live in memory while anyone is connected and are persisted to object storage (two
- * objects) with a debounce plus on last-leave (protocol §8).
+ *   content  the CONTENT document (shapes, assets, meta): the only one clients write, through
+ *            the guard, each update applied with its connection as transaction origin;
+ *   ledger   the LEDGER document (attribution, users, history, writers): written only by the
+ *            shared stamper, which observes the content; clients receive it on MSG_LEDGER and
+ *            the server never applies a client byte to it.
+ *
+ * Isolation (fv9): both documents live in a worker thread of the room's own (room-worker.ts,
+ * RoomCore), with a heap limit derived from the room's cost; this object, on the main thread,
+ * holds the connections, the memory charges, the join frames and the write-ahead log, and never
+ * decodes or applies a client byte. Everything that touches the documents is a job on the room's
+ * queue (one at a time, in arrival order), and every request to the worker has a watchdog. A
+ * worker that misses it, runs out of heap or crashes is terminated, the sender of the message
+ * that caused it is closed (4413) and struck, and the room is rebuilt in a fresh worker from its
+ * saved objects plus the log of every change since (never the offending message), byte for byte
+ * the room it was; the connected clients are asked (sync step 1) for anything they hold that the
+ * room does not.
+ *
+ * Both documents are persisted to object storage (two objects) with a debounce plus on
+ * last-leave (protocol §8); a successful save truncates the log.
  */
 export class Room {
-  readonly doc = materializeContent(new Y.Doc());
-  readonly ledger = materializeLedger(new Y.Doc());
-  readonly awareness = new awarenessProtocol.Awareness(this.doc);
+  /** presence: relayed by the main thread, never part of the documents (its doc is a placeholder) */
+  readonly awareness = new awarenessProtocol.Awareness(new Y.Doc());
   readonly conns = new Map<WebSocket, Conn>();
   /** content size: exact at load and at every save, plus the accepted updates since */
   approxBytes = 0;
@@ -139,7 +179,7 @@ export class Room {
   private contentSnap: Snapshot | null = null;
   private ledgerSnap: Snapshot | null = null;
   /** the room's sync step 1 (state vector), per content version (fv6 L-C: not the full step 2) */
-  private step1Cache: { version: number; frame: Uint8Array; sv: Map<number, number> } | null = null;
+  private step1Cache: { version: number; frame: Uint8Array; sv: Map<number, number>; raw: Uint8Array } | null = null;
   /** full encodings of a document for joins (tests, metric canvas_join_encodes_total) */
   encodes = 0;
   /** CPU time the load took, not charged to anyone yet (see takeLoadMs) */
@@ -168,60 +208,39 @@ export class Room {
    * ledger an update adds is counted ahead with it)
    */
   maxUserIdBytes = 0;
-  private lastPrune = 0;
   ttlTag: string | null = null;
   private saveTimer?: ReturnType<typeof setTimeout>;
   private dirty = false;
   private saving: Promise<void> = Promise.resolve();
+  /** the writer bound to each client id in the ledger (mirrored for awareness claims, §5.4) */
+  private readonly writers = new Map<number, string>();
+  /** the room's worker (null before the load, and while a recovery replaces it) */
+  private host: WorkerHost | null = null;
+  /** the documents are loaded: a fault from now on is recovered */
+  private live = false;
+  /** a recovery failed: the room is being dropped */
+  broken = false;
+  /** jobs on the documents, one at a time in arrival order (see job()) */
+  private queue: Promise<void> = Promise.resolve();
+  /**
+   * Write-ahead log (fv9): every change the documents emitted since the last save that reached
+   * storage, in order. A fresh worker that loads the saved objects and replays it is the room.
+   */
+  private wal: { seq: number; entries: Emitted[] }[] = [];
+  private walSeq = 0;
+  walBytes = 0;
+  /** the object puts of a save in flight (a recovery reads storage once they are done) */
+  private putting: Promise<void> = Promise.resolve();
+  /** workers that faulted and were replaced (tests, logs) */
+  restarts = 0;
+  /** the old-generation limit (MiB) of the current worker */
+  heapLimitMb = 0;
 
   constructor(
     readonly name: string,
     private readonly deps: RoomDeps,
   ) {
     this.awareness.setLocalState(null);
-
-    // Protocol §5.2: stamp attribution/users/history into the LEDGER for every client
-    // transaction on the CONTENT document.
-    attachStamper(this.doc, this.ledger, {
-      userOf: (origin: unknown) => {
-        const c = origin as Conn | undefined;
-        if (!c || !c.identity) return null;
-        return {
-          id: c.identity.id,
-          info: {
-            name: c.identity.name,
-            anonymous: c.identity.anonymous,
-            color: c.identity.color,
-          },
-        };
-      },
-    });
-
-    this.doc.on('update', (update: Uint8Array, origin: unknown) => {
-      if (origin !== 'load') this.contentChangedBytes += update.byteLength;
-      const e = encoding.createEncoder();
-      encoding.writeVarUint(e, MSG_SYNC);
-      writeUpdate(e, update);
-      const msg = encoding.toUint8Array(e);
-      // Everyone but the sender (it has the update already).
-      this.contentVersion++;
-      this.contentSnap = extendTail(this.contentSnap, msg);
-      for (const c of this.conns.values()) if (c !== origin) sendConn(c, msg);
-      if (origin !== 'load') this.markDirty();
-    });
-    this.ledger.getMap(ROOT.users).observe((e) => {
-      for (const k of e.keysChanged) this.maxUserIdBytes = Math.max(this.maxUserIdBytes, utf8Length(k));
-    });
-    // The ledger goes to everyone, the sender included (it learns its own attribution here).
-    this.ledger.on('update', (update: Uint8Array, origin: unknown) => {
-      const msg = encodeLedger(update);
-      this.ledgerVersion++;
-      this.ledgerSnap = extendTail(this.ledgerSnap, msg);
-      this.ledgerApproxBytes += update.byteLength;
-      for (const c of this.conns.values()) sendConn(c, msg);
-      if (origin !== 'load') this.markDirty();
-    });
-
     this.awareness.on(
       'update',
       ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }, origin: unknown) => {
@@ -240,17 +259,297 @@ export class Room {
     );
   }
 
+  // ---------- the worker ----------
+
+  /**
+   * The worker's old-generation limit (MiB): the room at its largest (one share: a room at the
+   * size cap fits it, or the stored room when it is bigger) plus one message of MAX_MESSAGE_BYTES
+   * being guarded and applied (MESSAGE_COST_FACTOR). Whatever an update makes Yjs allocate past
+   * that ends the worker (ERR_WORKER_OUT_OF_MEMORY), never the process.
+   */
+  heapLimitFor(storedBytes: number): number {
+    const { cfg } = this.deps;
+    const room = Math.max(this.deps.shareOf?.(false) ?? roomCost(cfg, cfg.maxDocBytes), roomCost(cfg, storedBytes));
+    return Math.ceil((room + MESSAGE_COST_FACTOR * cfg.maxMessageBytes) / MiB);
+  }
+
+  private spawn(storedBytes: number): WorkerHost {
+    const { cfg } = this.deps;
+    this.heapLimitMb = this.heapLimitFor(storedBytes);
+    const host = new WorkerHost(
+      {
+        name: this.name,
+        core: {
+          attributionRetentionDays: cfg.attributionRetentionDays,
+          maxSplits: cfg.maxSplitsPerMessage,
+          maxSplitWork: (cfg.maxApplyMs * 1e6) / SPLIT_WORK_NS,
+          maxScanWork: (cfg.maxApplyMs * 1e6) / SCAN_WORK_NS,
+          maxClients: cfg.maxClientsPerUpdate,
+        },
+        testHooks: cfg.workerTestHooks,
+      },
+      { oldMb: this.heapLimitMb, youngMb: WORKER_YOUNG_MB },
+    );
+    this.deps.metrics.workers.inc();
+    void host.exited.then(() => this.deps.metrics.workers.dec());
+    return host;
+  }
+
+  /** The worker started (its modules loaded), within the operation timeout. */
+  private async started(host: WorkerHost): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        host.ready,
+        new Promise<never>((_, reject) => (timer = setTimeout(() => reject(new WorkerFault('timeout', 'worker start')), this.deps.cfg.workerOpTimeoutMs))),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (host.fault) throw host.fault;
+  }
+
+  /** Timeout of an operation on the whole room (load, encodings, replay). */
+  private opTimeout(bytes: number): number {
+    return this.deps.cfg.workerOpTimeoutMs + (bytes * this.deps.cfg.workerOpNsPerByte) / 1e6;
+  }
+
+  /** Timeout of a client message (its guard and apply together). */
+  messageTimeout(bytes: number): number {
+    return this.deps.cfg.workerMessageTimeoutMs + (bytes * this.deps.cfg.workerTimeoutNsPerByte) / 1e6;
+  }
+
+  /** One request to the worker; what the documents emitted is taken in (broadcast, logged). */
+  private async call<T>(req: WorkerRequest, timeoutMs: number, sender: Conn | null = null, transfer: ArrayBuffer[] = []): Promise<Answer<T>> {
+    const host = this.host;
+    if (!host) throw new RoomGone();
+    const a = await host.call<T>(req, timeoutMs, transfer);
+    if (this.host === host) this.absorb(a, sender);
+    return a;
+  }
+
+  /** Changes a worker answer carries: the mirrors, the log, the broadcasts. */
+  private absorb(a: Answer<unknown>, sender: Conn | null): void {
+    if (a.maxUserIdBytes > this.maxUserIdBytes) this.maxUserIdBytes = a.maxUserIdBytes;
+    for (const [client, writer] of a.writers) if (!this.writers.has(client)) this.writers.set(client, writer);
+    if (!a.emitted.length) return;
+    let bytes = 0;
+    for (const e of a.emitted) bytes += e.u.byteLength;
+    this.wal.push({ seq: ++this.walSeq, entries: a.emitted });
+    this.walBytes += bytes;
+    for (const e of a.emitted) {
+      if (e.doc === 'content') {
+        this.contentChangedBytes += e.u.byteLength;
+        const enc = encoding.createEncoder();
+        encoding.writeVarUint(enc, MSG_SYNC);
+        writeUpdate(enc, e.u);
+        const msg = encoding.toUint8Array(enc);
+        this.contentVersion++;
+        this.contentSnap = extendTail(this.contentSnap, msg);
+        // everyone but the sender (it has the update already)
+        for (const c of this.conns.values()) if (c !== sender) sendConn(c, msg);
+      } else {
+        // the ledger goes to everyone, the sender included (it learns its own attribution here)
+        const msg = encodeLedger(e.u);
+        this.ledgerVersion++;
+        this.ledgerSnap = extendTail(this.ledgerSnap, msg);
+        this.ledgerApproxBytes += e.u.byteLength;
+        for (const c of this.conns.values()) sendConn(c, msg);
+      }
+    }
+    this.markDirty();
+    // a log much bigger than the room's cap (saves failing, or held back by the save budget):
+    // save now, a recovery replays all of it
+    if (this.walBytes > 2 * this.deps.cfg.maxDocBytes && !this.saveForced) {
+      this.saveForced = true;
+      void this.flush().finally(() => (this.saveForced = false));
+    }
+  }
+  private saveForced = false;
+
+  /**
+   * Run `fn` on the documents once every earlier job is done. A worker fault inside it is
+   * recovered before the next job starts (the sender of a client message is closed and struck),
+   * then rethrown to the caller.
+   */
+  private job<T>(sender: Conn | null, fn: () => Promise<T>): Promise<T> {
+    const run = async (): Promise<T> => {
+      if (this.disposed || this.broken) throw new RoomGone();
+      try {
+        return await fn();
+      } catch (err) {
+        if (err instanceof WorkerFault && this.live && !this.disposed) await this.recover(err, sender);
+        throw err;
+      }
+    };
+    const p = this.queue.then(run, run);
+    this.queue = p.then(
+      () => undefined,
+      () => undefined,
+    );
+    return p;
+  }
+
+  /**
+   * The worker faulted: close and strike the sender of the message that caused it, rebuild the
+   * room in a fresh worker from the saved objects and the log, and ask every client for what it
+   * holds that the room may lack. If that fails too, every connection is closed (1013: they
+   * reconnect and resync) and the room is dropped.
+   */
+  private async recover(fault: WorkerFault, sender: Conn | null): Promise<void> {
+    const { metrics, log, store } = this.deps;
+    this.restarts++;
+    metrics.workerFaults.inc({ kind: fault.kind });
+    log.warn({ room: this.name, kind: fault.kind, err: fault.message, user: sender?.identity.id, walEntries: this.wal.length, walBytes: this.walBytes }, 'room worker fault: rebuilding the room');
+    if (sender && !sender.closing) {
+      this.deps.onStrike?.(sender, fault.kind);
+      sendWs(sender.ws, encodeNotice({ kind: 'too-large' }));
+      sender.closing = true;
+      try {
+        sender.ws.close(CLOSE.tooLarge, 'update too costly');
+      } catch {
+        /* gone */
+      }
+      metrics.wsRejected.inc({ reason: `worker_${fault.kind}` });
+    }
+    const old = this.host;
+    this.host = null;
+    await old?.terminate();
+    try {
+      // a save's puts finish first: the log starts where storage is
+      await this.putting;
+      const [ledgerBytes, data] = await Promise.all([store.get(this.ledgerKey), store.get(this.objectKey)]);
+      const stored = (ledgerBytes?.byteLength ?? 0) + (data?.byteLength ?? 0);
+      const host = this.spawn(Math.max(stored, this.bytes));
+      try {
+        await this.started(host);
+        const l = ledgerBytes ? ledgerBytes.slice() : null;
+        const c = data ? data.slice() : null;
+        await host.call({ op: 'load', ledger: l, content: c, recovery: true }, this.opTimeout(stored), [l?.buffer, c?.buffer].filter((b): b is ArrayBuffer => !!b));
+        const entries = this.wal.flatMap((w) => w.entries);
+        if (entries.length) await host.call({ op: 'replay', entries }, this.opTimeout(stored + this.walBytes));
+        const f = await host.call<FramesResult>({ op: 'frames', content: false, ledger: false, sv: true }, this.opTimeout(stored));
+        const sv = f.result.sv!;
+        if (this.step1Cache && this.step1Cache.version === this.contentVersion && !bytesEqual(this.step1Cache.raw, sv)) {
+          // never seen; the join caches are dropped so that no join gets frames of another state
+          log.error({ room: this.name }, 'rebuilt room differs from the one it replaces');
+          this.contentSnap = null;
+          this.ledgerSnap = null;
+        }
+        this.setStep1(sv);
+      } catch (err) {
+        await host.terminate();
+        throw err;
+      }
+      this.host = host;
+      metrics.workerRecoveries.inc({ outcome: 'ok' });
+      log.info({ room: this.name, replayed: this.wal.length }, 'room rebuilt in a fresh worker');
+      const step1 = this.step1Cache!.frame;
+      for (const c of this.conns.values()) {
+        if (c.closing || c === sender || c.joining) continue;
+        sendConn(c, step1);
+        c.resyncAsked = true;
+      }
+    } catch (err) {
+      metrics.workerRecoveries.inc({ outcome: 'failed' });
+      log.error({ room: this.name, err: String(err) }, 'room could not be rebuilt: closed for everyone');
+      this.broken = true;
+      for (const c of this.conns.values()) {
+        sendWs(c.ws, encodeNotice({ kind: 'busy' }));
+        c.closing = true;
+        try {
+          c.ws.close(CLOSE.tryAgain, 'server busy');
+        } catch {
+          /* gone */
+        }
+      }
+      this.deps.onBroken?.(this);
+    }
+  }
+
+  /** Writers' client ids announced in awareness by live connections of OTHER writers than `conn`'s. */
+  private claimedBy(conn: Conn): number[] {
+    const out: number[] = [];
+    for (const c of this.conns.values()) if (c !== conn && c.identity.id !== conn.identity.id) for (const id of c.clientIds) out.push(id);
+    return out;
+  }
+
+  /**
+   * A client update (protocol §5.3), as a job: the guard runs in the worker; `hooks.decide` makes
+   * the main thread's checks on its verdict; the worker applies it (stamped, its client ids bound to
+   * the writer) or drops it. The whole of it holds one apply slot and has one deadline
+   * (messageTimeout). Resolves with the worker's time; rejects with WorkerFault after the room was
+   * rebuilt (the sender is closed and struck), or RoomGone.
+   */
+  update(conn: Conn, update: Uint8Array, hooks: UpdateHooks): Promise<{ ms: number } | null> {
+    return this.job(conn, async () => {
+      if (conn.closing) return null;
+      const release = (await this.deps.applySlots?.acquire()) ?? (() => undefined);
+      try {
+        if (conn.closing || this.disposed) return null;
+        const t0 = performance.now();
+        const deadline = t0 + this.messageTimeout(update.byteLength);
+        const left = () => Math.max(1, deadline - performance.now());
+        const buf = update.slice();
+        const c = await this.call<CheckResult>({ op: 'check', update: buf, writer: conn.identity.id, claimed: this.claimedBy(conn) }, left(), conn, [buf.buffer as ArrayBuffer]);
+        let ms = c.ms;
+        const check = c.result.check;
+        if (!hooks.decide(check)) {
+          if (!check.bad) await this.call({ op: 'drop' }, left(), conn);
+          this.deps.metrics.workerReply.observe((performance.now() - t0) / 1000);
+          return { ms };
+        }
+        const before = { cost: this.cost, changed: this.contentChangedBytes };
+        // the apply may take what the guard estimated (an upper bound of every path Yjs is known
+        // to take, MAX_APPLY_MS at most), twice over; past that it is a path nobody counted
+        const estimate = applyEstimateMs(update.byteLength, check.splitWork, check.scanWork);
+        const applyTimeout = Math.max(left(), this.deps.cfg.workerMessageTimeoutMs + 2 * estimate);
+        const a = await this.call<ApplyResult>({ op: 'apply', identity: stampIdentity(conn.identity) }, applyTimeout, conn);
+        ms += a.ms;
+        hooks.applied(check, a.result, before);
+        this.deps.metrics.workerReply.observe((performance.now() - t0) / 1000);
+        return { ms };
+      } finally {
+        release();
+      }
+    });
+  }
+
+  /**
+   * A client's sync step 1, as a job: what the room has beyond its state vector merged with the
+   * one the connection was sent in full at join (fv4 H1). `refuseEmpty` is asked when the job
+   * runs (a later step 1 asking for everything again gets nothing), and `answered` gets the
+   * answer inside the job, so that the step 1s of one connection are answered strictly in order.
+   */
+  diff(conn: Conn, sv: Uint8Array, hooks: { refuseEmpty: () => boolean; answered: (r: DiffResult & { ms: number }) => void }): Promise<void> {
+    return this.job(conn, async () => {
+      if (conn.closing) return;
+      const buf = sv.slice();
+      const joinSv = Y.encodeStateVector(conn.joinSv);
+      const timeout = this.messageTimeout(sv.byteLength) + (this.bytes * this.deps.cfg.workerOpNsPerByte) / 1e6;
+      const a = await this.call<DiffResult>({ op: 'diff', sv: buf, joinSv, refuseEmpty: hooks.refuseEmpty() }, timeout, conn, [buf.buffer as ArrayBuffer]);
+      hooks.answered({ ...a.result, ms: a.ms });
+    });
+  }
+
+  // ---------- join frames ----------
+
   /**
    * The ledger part of a join: its snapshot frame (MSG_LEDGER + the full ledger) and the ledger
    * messages broadcast since. The frames are shared by every join (fv5 H-1: N slow readers must
    * not hold N copies of the room).
    */
-  ledgerFrames(): Uint8Array[] {
-    if (!this.ledgerSnap) {
-      this.ledgerSnap = newSnapshot(encodeLedger(encodeIntegratedState(this.ledger)));
-      this.countEncode('ledger');
-    }
-    return [this.ledgerSnap.frame, ...this.ledgerSnap.tail];
+  async ledgerFrames(): Promise<Uint8Array[]> {
+    if (this.ledgerSnap) return [this.ledgerSnap.frame, ...this.ledgerSnap.tail];
+    return this.job(null, async () => {
+      if (!this.ledgerSnap) {
+        const a = await this.call<FramesResult>({ op: 'frames', content: false, ledger: true, sv: false }, this.opTimeout(this.bytes));
+        this.ledgerSnap = newSnapshot(encodeLedger(a.result.ledger!));
+        this.loadMs += a.ms;
+        this.countEncode('ledger');
+      }
+      return [this.ledgerSnap.frame, ...this.ledgerSnap.tail];
+    });
   }
 
   /**
@@ -258,17 +557,40 @@ export class Room {
    * updates broadcast since, the room's sync step 1, and the state vector all of them add up to
    * (what the joiner has once they arrived).
    */
-  contentFrames(): { frames: Uint8Array[]; step1: Uint8Array; sv: Map<number, number> } {
-    if (!this.contentSnap) {
-      const e = encoding.createEncoder();
-      encoding.writeVarUint(e, MSG_SYNC);
-      encoding.writeVarUint(e, syncProtocol.messageYjsSyncStep2);
-      encoding.writeVarUint8Array(e, encodeIntegratedState(this.doc));
-      this.contentSnap = newSnapshot(encoding.toUint8Array(e));
-      this.countEncode('content');
-    }
-    const s1 = this.step1();
-    return { frames: [this.contentSnap.frame, ...this.contentSnap.tail], step1: s1.frame, sv: s1.sv };
+  async contentFrames(): Promise<{ frames: Uint8Array[]; step1: Uint8Array; sv: Map<number, number> }> {
+    const cached = () => {
+      if (!this.contentSnap || !this.step1Cache || this.step1Cache.version !== this.contentVersion) return null;
+      return { frames: [this.contentSnap.frame, ...this.contentSnap.tail], step1: this.step1Cache.frame, sv: this.step1Cache.sv };
+    };
+    return (
+      cached() ??
+      this.job(null, async () => {
+        const hit = cached();
+        if (hit) return hit;
+        const content = !this.contentSnap;
+        const a = await this.call<FramesResult>({ op: 'frames', content, ledger: false, sv: true }, this.opTimeout(this.bytes));
+        if (content) {
+          const e = encoding.createEncoder();
+          encoding.writeVarUint(e, MSG_SYNC);
+          encoding.writeVarUint(e, syncProtocol.messageYjsSyncStep2);
+          encoding.writeVarUint8Array(e, a.result.content!);
+          this.contentSnap = newSnapshot(encoding.toUint8Array(e));
+          this.loadMs += a.ms;
+          this.countEncode('content');
+        }
+        this.setStep1(a.result.sv!);
+        return cached()!;
+      })
+    );
+  }
+
+  /** The step 1 frame and state vector of the current content version, from the worker's encoding. */
+  private setStep1(raw: Uint8Array): void {
+    const e = encoding.createEncoder();
+    encoding.writeVarUint(e, MSG_SYNC);
+    encoding.writeVarUint(e, syncProtocol.messageYjsSyncStep1);
+    encoding.writeVarUint8Array(e, raw);
+    this.step1Cache = { version: this.contentVersion, frame: encoding.toUint8Array(e), sv: Y.decodeStateVector(raw), raw };
   }
 
   /** True when a join now needs no full encoding (both snapshots are cached). */
@@ -287,22 +609,18 @@ export class Room {
   }
 
   /** A sync step 1 with the room's current state vector (asks a client for what the room lacks). */
-  step1Frame(): Uint8Array {
-    return this.step1().frame;
+  async step1Frame(): Promise<Uint8Array> {
+    if (this.step1Cache && this.step1Cache.version === this.contentVersion) return this.step1Cache.frame;
+    return this.job(null, async () => {
+      if (!this.step1Cache || this.step1Cache.version !== this.contentVersion) {
+        const a = await this.call<FramesResult>({ op: 'frames', content: false, ledger: false, sv: true }, this.opTimeout(this.bytes));
+        this.setStep1(a.result.sv!);
+      }
+      return this.step1Cache!.frame;
+    });
   }
 
-  /** Sync step 1 and state vector, once per content version: O(clients), never the full state. */
-  private step1(): { frame: Uint8Array; sv: Map<number, number> } {
-    if (!this.step1Cache || this.step1Cache.version !== this.contentVersion) {
-      const e1 = encoding.createEncoder();
-      encoding.writeVarUint(e1, MSG_SYNC);
-      syncProtocol.writeSyncStep1(e1, this.doc);
-      this.step1Cache = { version: this.contentVersion, frame: encoding.toUint8Array(e1), sv: Y.decodeStateVector(Y.encodeStateVector(this.doc)) };
-    }
-    return this.step1Cache;
-  }
-
-  /** The load's CPU time, once (the first join charges it to its principal). */
+  /** The load's and the join encodings' worker time, once (the next join charges it to its principal). */
   takeLoadMs(): number {
     const ms = this.loadMs;
     this.loadMs = 0;
@@ -375,11 +693,28 @@ export class Room {
     return b;
   }
 
-  /** What the anonymous visitors together are charged for this room. */
+  /**
+   * What the anonymous pool pays for this room (fv9 F): what anonymous visitors are charged, plus
+   * the part of the room's cost nobody is charged for (fv8 P1: a load is charged one share at most)
+   * in the proportion anonymous visitors hold the room's load. Three visitors who each loaded a
+   * 5 MiB pub/ room were charged 72.67 MiB each while the rooms cost 651 MiB: the pool now pays
+   * the full cost of the rooms its visitors brought in.
+   */
   anonCharged(): number {
-    let n = 0;
-    for (const c of this.charges.values()) if (c.anonymous) n += c.bytes;
-    return n;
+    let anon = 0;
+    let all = 0;
+    let anonLoad = 0;
+    let load = 0;
+    for (const c of this.charges.values()) {
+      all += c.bytes;
+      load += c.load;
+      if (c.anonymous) {
+        anon += c.bytes;
+        anonLoad += c.load;
+      }
+    }
+    const uncharged = Math.max(0, this.cost - all);
+    return anon + (load > 0 ? (uncharged * anonLoad) / load : 0);
   }
 
   /** Every charge of the room, by principal (the largest first is not guaranteed). */
@@ -423,7 +758,8 @@ export class Room {
       if (to) this.charge(to.principal, to.anonymous, changed, false);
     }
     // fv8 P1: nobody is charged more than a share for one room (a stored room bigger than that
-    // loads, the rest of its cost charged to nobody; the size cap refuses it any growth)
+    // loads, the rest of its cost charged to nobody — the anonymous pool pays its part of that
+    // rest, see anonCharged; the size cap refuses it any growth)
     const shareOf = this.deps.shareOf;
     for (const c of this.charges.values()) {
       c.written = 0;
@@ -454,21 +790,56 @@ export class Room {
   }
 
   /**
-   * Load both documents from storage. `admit` sees the encoded size before anything is decoded
-   * (fv6 H-1: the memory budget); it throws to refuse the load, else returns a release that
-   * runs once the documents are in.
+   * Load both documents from storage into the room's new worker. `admit` sees the encoded size
+   * before anything is decoded (fv6 H-1: the memory budget); it throws to refuse the load, else
+   * returns a release that runs once the documents are in.
    */
   async load(admit?: (encodedBytes: number) => Promise<() => void>): Promise<void> {
-    const { store, metrics } = this.deps;
+    const { store, metrics, log } = this.deps;
     try {
       const [ledgerBytes, data] = await Promise.all([store.get(this.ledgerKey), store.get(this.objectKey)]);
-      const release = admit ? await admit((ledgerBytes?.byteLength ?? 0) + (data?.byteLength ?? 0)) : () => undefined;
-      const t0 = performance.now();
+      const stored = (ledgerBytes?.byteLength ?? 0) + (data?.byteLength ?? 0);
+      const release = admit ? await admit(stored) : () => undefined;
       try {
-        this.apply(ledgerBytes, data);
+        await this.job(null, async () => {
+          const host = this.spawn(stored);
+          try {
+            await this.started(host);
+          } catch (err) {
+            await host.terminate();
+            throw err;
+          }
+          this.host = host;
+          this.approxBytes = data?.byteLength ?? 0;
+          this.ledgerApproxBytes = ledgerBytes?.byteLength ?? 0;
+          // copies: the store keeps its own (the copies are handed over to the worker, not copied again)
+          const l = ledgerBytes ? ledgerBytes.slice() : null;
+          const c = data ? data.slice() : null;
+          const a = await this.call<LoadResult>({ op: 'load', ledger: l, content: c, recovery: false }, this.opTimeout(stored), null, [l?.buffer, c?.buffer].filter((b): b is ArrayBuffer => !!b));
+          const r = a.result;
+          for (const [client, writer] of r.writers) this.writers.set(client, writer);
+          if (r.droppedPending) {
+            log.warn({ room: this.name }, 'stored canvas had pending structs: dropped');
+            metrics.pendingDropped.inc({ where: 'load' });
+          }
+          if (r.migrated) {
+            log.info({ room: this.name }, 'legacy canvas split into content + ledger');
+            metrics.migrations.inc();
+          }
+          if (r.pruned) log.info({ room: this.name, pruned: r.pruned }, 'attribution of long-deleted shapes pruned');
+          if (r.dirty) this.markDirty();
+          this.loadMs = a.ms;
+          this.live = true;
+        });
+      } catch (err) {
+        if (this.host) {
+          const h = this.host;
+          this.host = null;
+          await h.terminate();
+        }
+        throw err;
       } finally {
         release();
-        this.loadMs = performance.now() - t0;
       }
       metrics.loads.inc({ outcome: 'ok' });
     } catch (err) {
@@ -477,43 +848,10 @@ export class Room {
     }
   }
 
-  private apply(ledgerBytes: Uint8Array | null, data: Uint8Array | null): void {
-    const { metrics, log } = this.deps;
-    // ledger first, so a migration below sees what the ledger already holds
-    if (ledgerBytes && ledgerBytes.byteLength > 0) {
-      Y.applyUpdate(this.ledger, ledgerBytes, 'load');
-      this.ledgerApproxBytes = ledgerBytes.byteLength;
-      if (dropPending(this.ledger)) {
-        log.warn({ room: this.name }, 'stored ledger had pending structs: dropped');
-        metrics.pendingDropped.inc({ where: 'load' });
-        this.markDirty();
-      }
-    }
-    if (data && data.byteLength > 0) {
-      Y.applyUpdate(this.doc, data, 'load');
-      this.approxBytes = data.byteLength;
-      // A stored document must integrate completely. Parked structs/deletes (an object
-      // written before the guard refused them) are dropped and the clean state is saved.
-      if (dropPending(this.doc)) {
-        log.warn({ room: this.name }, 'stored canvas had pending structs: dropped');
-        metrics.pendingDropped.inc({ where: 'load' });
-        this.markDirty();
-      }
-      // A document from before the content/ledger split: its attribution/users/history
-      // move to the ledger and leave the content document (both saved back).
-      if (migrateLegacyRoots(this.doc, this.ledger, 'migrate')) {
-        log.info({ room: this.name }, 'legacy canvas split into content + ledger');
-        metrics.migrations.inc();
-        this.markDirty();
-      }
-    }
-    this.prune();
-  }
-
   /** Something changed (or may have, after an apply that threw): save soon. */
   markDirty(): void {
     this.dirty = true;
-    if (!this.saveTimer) this.scheduleSave(this.deps.cfg.saveDebounceMs);
+    if (!this.saveTimer && !this.disposed) this.scheduleSave(this.deps.cfg.saveDebounceMs);
   }
 
   private scheduleSave(ms: number): void {
@@ -528,36 +866,52 @@ export class Room {
 
   /**
    * Serialize saves; persist the two documents as two objects with the copied ttl tag.
-   * The ledger goes first: a content object is never newer than its ledger.
+   * The ledger goes first: a content object is never newer than its ledger. The worker encodes
+   * them (a job); the puts run outside the queue, and once both are in storage the log is
+   * truncated up to the encoding.
    */
   save(): Promise<void> {
     this.saving = this.saving.then(async () => {
       // a disposed room is gone (evicted after its last save, or expired and deleted): never
       // written back
-      if (!this.dirty || this.disposed) return;
+      if (!this.dirty || this.disposed || !this.live || this.broken) return;
       const { store, metrics, log } = this.deps;
       const t0 = performance.now();
-      this.dirty = false;
+      let enc: { content: Uint8Array; ledger: Uint8Array; seq: number } | null = null;
       try {
-        // never persist parked structs/deletes (encodeStateAsUpdate would merge them in)
-        const droppedContent = dropPending(this.doc);
-        const droppedLedger = dropPending(this.ledger);
-        if (droppedContent || droppedLedger) {
-          log.error({ room: this.name }, 'room had pending structs at save: dropped');
-          metrics.pendingDropped.inc({ where: 'save' });
+        enc = await this.job(null, async () => {
+          this.dirty = false;
+          const a = await this.call<SaveResult>({ op: 'save' }, this.opTimeout(this.bytes));
+          const r = a.result;
+          if (r.droppedPending) {
+            log.error({ room: this.name }, 'room had pending structs at save: dropped');
+            metrics.pendingDropped.inc({ where: 'save' });
+          }
+          if (r.pruned) log.info({ room: this.name, pruned: r.pruned }, 'attribution of long-deleted shapes pruned');
+          this.approxBytes = r.content.byteLength;
+          this.ledgerApproxBytes = r.ledger.byteLength;
+          // the room is measured: its charges follow (fv7 F1)
+          this.settleCharges();
+          this.deps.saveBudget?.charge(a.ms);
+          return { content: r.content, ledger: r.ledger, seq: this.walSeq };
+        });
+        const put = (async () => {
+          await store.put(this.ledgerKey, enc!.ledger, this.ttlTag ?? undefined);
+          await store.put(this.objectKey, enc!.content, this.ttlTag ?? undefined);
+        })();
+        this.putting = put.catch(() => undefined);
+        await put;
+        // storage holds everything up to the encoding: the log starts after it
+        const seq = enc.seq;
+        let i = 0;
+        while (i < this.wal.length && this.wal[i].seq <= seq) {
+          for (const e of this.wal[i].entries) this.walBytes -= e.u.byteLength;
+          i++;
         }
-        if (Date.now() - this.lastPrune > 3600_000) this.prune();
-        const ledgerBytes = encodeIntegratedState(this.ledger);
-        const bytes = encodeIntegratedState(this.doc);
-        this.approxBytes = bytes.byteLength;
-        this.ledgerApproxBytes = ledgerBytes.byteLength;
-        // the room is measured: its charges follow (fv7 F1)
-        this.settleCharges();
-        this.deps.saveBudget?.charge(performance.now() - t0);
-        await store.put(this.ledgerKey, ledgerBytes, this.ttlTag ?? undefined);
-        await store.put(this.objectKey, bytes, this.ttlTag ?? undefined);
+        if (i) this.wal.splice(0, i);
         metrics.saves.inc({ outcome: 'ok' });
       } catch (err) {
+        if (this.disposed) return;
         this.dirty = true;
         metrics.saves.inc({ outcome: 'error' });
         log.error({ err: String(err), room: this.name }, 'canvas save failed');
@@ -566,14 +920,6 @@ export class Room {
       }
     });
     return this.saving;
-  }
-
-  /** Drop attribution entries of shapes deleted longer ago than the retention (fv4 M4). */
-  prune(): void {
-    this.lastPrune = Date.now();
-    const days = this.deps.cfg.attributionRetentionDays;
-    const n = pruneAttribution(this.doc, this.ledger, this.lastPrune, days * 86400_000);
-    if (n) this.deps.log.info({ room: this.name, pruned: n }, 'attribution of long-deleted shapes pruned');
   }
 
   /** Cancel the debounce and persist now (last leave / shutdown). */
@@ -585,38 +931,66 @@ export class Room {
     await this.save();
   }
 
-  /** True when the room holds structs/deletes Yjs could not integrate. */
-  hasPending(): boolean {
-    return hasPending(this.doc);
+  /**
+   * Replace the room's worker as a fault would (tests and the honest fuzzer: a forced restart
+   * between messages): the room is rebuilt from storage and its log, and every client is asked
+   * for what the room may lack. Nobody is struck.
+   */
+  restart(): Promise<void> {
+    return this.job(null, async () => {
+      if (!this.live) return;
+      await this.recover(new WorkerFault('crash', 'forced restart'), null);
+    });
+  }
+
+  /** Every queued job is done (tests). */
+  async settled(): Promise<void> {
+    for (let q = this.queue; ; q = this.queue) {
+      await q;
+      if (q === this.queue) return;
+    }
   }
 
   /**
-   * May `principal` add clocks to Yjs client id `client` of the content document? A client
-   * id is bound (in the ledger, so the binding survives a reload and a restart) to the first
-   * principal that adds clocks to it, and nobody else may extend it: a forged struct at
-   * someone else's next clock would make Yjs drop that person's real edit as "already
-   * known". An id nobody wrote yet is refused when another principal's live connection
-   * announced it in awareness; an id that already has clocks is never decided by awareness.
+   * Copies of the room's two documents as the worker holds them now, and whether it holds pending
+   * state (tests and probes: decoded on the caller's thread from the worker's own encoding).
    */
-  mayWrite(client: number, principal: string, conn: Conn): boolean {
-    if (client === this.doc.clientID || client === this.ledger.clientID) return false;
-    const owner = writerOf(this.ledger, client);
-    if (owner !== undefined) return owner === principal;
-    // clocks from before the bindings were persisted (legacy object): first writer binds it
-    if (Y.getState(this.doc.store, client) > 0) return true;
-    for (const c of this.conns.values()) if (c !== conn && c.identity.id !== principal && c.clientIds.has(client)) return false;
-    return true;
+  async inspect(): Promise<{ doc: Y.Doc; ledger: Y.Doc; pending: boolean; contentBytes: Uint8Array; ledgerBytes: Uint8Array }> {
+    const docs = (content: Uint8Array | null, ledgerBytes: Uint8Array | null, pending: boolean) => {
+      const doc = materializeContent(new Y.Doc());
+      const ledger = materializeLedger(new Y.Doc());
+      if (content?.byteLength) Y.applyUpdate(doc, content);
+      if (ledgerBytes?.byteLength) Y.applyUpdate(ledger, ledgerBytes);
+      return { doc, ledger, pending, contentBytes: content ?? new Uint8Array(), ledgerBytes: ledgerBytes ?? new Uint8Array() };
+    };
+    try {
+      return await this.job(null, async () => {
+        const a = await this.call<InspectResult>({ op: 'inspect' }, this.opTimeout(this.bytes));
+        return docs(a.result.content, a.result.ledger, a.result.pending);
+      });
+    } catch (err) {
+      // evicted (its last leave saved it) or expired (deleted): what storage holds
+      if (!this.disposed) throw err;
+      await this.saving;
+      const [ledgerBytes, data] = await Promise.all([this.deps.store.get(this.ledgerKey), this.deps.store.get(this.objectKey)]);
+      return docs(data, ledgerBytes, false);
+    }
+  }
+
+  /** True when the room holds structs/deletes Yjs could not integrate (tests). */
+  async hasPending(): Promise<boolean> {
+    return (await this.inspect()).pending;
   }
 
   /** May `principal` announce awareness state for `clientId`? Not for someone else's writer id. */
   mayClaimAwareness(clientId: number, principal: string): boolean {
-    const owner = writerOf(this.ledger, clientId);
+    const owner = this.writers.get(clientId);
     return owner === undefined || owner === principal;
   }
 
-  /** Bind the client ids of an accepted update to its principal (persisted in the ledger). */
-  claimWriters(clients: number[], principal: string): void {
-    bindWriters(this.ledger, clients, principal);
+  /** The writer bound to a client id (tests). */
+  writerOf(clientId: number): string | undefined {
+    return this.writers.get(clientId);
   }
 
   /** Live connections of one anonymous visitor (server-issued nonce). */
@@ -642,9 +1016,9 @@ export class Room {
   }
 
   /**
-   * Release the room once it is evicted: the awareness instance runs a 3 s interval that
-   * referenced the room's documents forever (every evicted room stayed in memory: found while
-   * sizing the memory limit for fv5 H-1). Idempotent.
+   * Release the room once it is evicted: its worker is terminated, and the awareness instance
+   * runs a 3 s interval that referenced the room forever (every evicted room stayed in memory:
+   * found while sizing the memory limit for fv5 H-1). Idempotent.
    */
   dispose(): void {
     if (this.disposed) return;
@@ -656,9 +1030,16 @@ export class Room {
     this.ledgerSnap = null;
     this.step1Cache = null;
     this.charges.clear();
+    this.wal = [];
+    this.walBytes = 0;
+    const host = this.host;
+    this.host = null;
+    this.stopped = host?.terminate() ?? Promise.resolve();
   }
 
   disposed = false;
+  /** resolves once the room's worker is down (after dispose) */
+  stopped: Promise<void> = Promise.resolve();
 
   closeAll(code: number, reason: string): void {
     for (const c of this.conns.values()) {
@@ -669,6 +1050,16 @@ export class Room {
       }
     }
   }
+}
+
+function stampIdentity(id: Identity): StampIdentity {
+  return { id: id.id, name: id.name, anonymous: id.anonymous, color: id.color };
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 /**

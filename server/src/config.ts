@@ -143,10 +143,50 @@ export interface Config {
    */
   maxSplitsPerMessage: number;
   /**
-   * Estimated Yjs time (ms) the cuts and placement of one update may take (applyEstimateMs()
-   * without the bytes term, with the costs measured on x86); over it the update is refused 4413.
+   * Estimated Yjs time (ms) the cuts, placement, merges and deletes of one update may take
+   * (applyEstimateMs() without the bytes term, with the costs measured on x86); over it the update
+   * is refused 4413. fv9: the update runs in its room's worker, so this no longer bounds a stall of
+   * the server but the worker time one message may take (and the apply slot it holds): honest
+   * deletes of thousands of shapes cost Yjs 0.4-0.8 s (it splices the writer's struct array once
+   * per shape), so the default went from 50 to 1000. The worker's watchdog for the apply is
+   * WORKER_MESSAGE_TIMEOUT_MS plus twice the estimate.
    */
   maxApplyMs: number;
+  /**
+   * Client blocks (Yjs client ids) one update may carry (fv9 E). An honest update carries its
+   * sender's id, a resync after a reconnect the few ids the room lacks. Over it: closed 4413.
+   */
+  maxClientsPerUpdate: number;
+  /**
+   * Room isolation (fv9): every loaded room runs in a worker thread of its own, and the main
+   * thread waits for each answer with a watchdog. A client message (its guard and apply) may take
+   * WORKER_MESSAGE_TIMEOUT_MS plus WORKER_TIMEOUT_NS_PER_BYTE per byte of the message; an
+   * operation on the whole room (load, join encodings, saves, the replay of a recovery)
+   * WORKER_OP_TIMEOUT_MS plus WORKER_OP_NS_PER_BYTE per byte of the room. Past it the worker is
+   * terminated, the room rebuilt in a fresh one from its saved state and write-ahead log, and the
+   * sender of the message closed (4413) with a strike.
+   */
+  workerMessageTimeoutMs: number;
+  workerTimeoutNsPerByte: number;
+  workerOpTimeoutMs: number;
+  workerOpNsPerByte: number;
+  /**
+   * Client messages processed at once over all rooms (their guard and apply): each may use its
+   * worker's heap up to the worker's limit, so this bounds the memory of the messages in flight
+   * (the budget reserves one, see roomMemoryBudget()).
+   */
+  workerApplyConcurrency: number;
+  /**
+   * Strikes (fv9): a principal whose messages made WORKER_STRIKES worker faults within
+   * WORKER_STRIKE_WINDOW_MS is refused joins and writes for WORKER_STRIKE_COOLDOWN_MS; anonymous
+   * visitors also per client IP (when known) and, all together, after WORKER_ANON_POOL_STRIKES.
+   */
+  workerStrikes: number;
+  workerStrikeWindowMs: number;
+  workerStrikeCooldownMs: number;
+  workerAnonPoolStrikes: number;
+  /** Test only: a client update carrying `canvas-test-hook:<busy|alloc|throw>` makes the worker misbehave. Never in production. */
+  workerTestHooks: boolean;
   /** Attribution entries of shapes deleted longer ago than this are pruned from the ledger. */
   attributionRetentionDays: number;
   /**
@@ -169,6 +209,8 @@ export interface Config {
   /** where the budget came from: `env` (ROOM_MEMORY_BUDGET_BYTES) or `heap` (derived) */
   roomMemoryBudgetSource: 'env' | 'heap';
   roomCostFactor: number;
+  /** Resident cost of an empty loaded room, its worker thread included (ROOM_BASE_COST_BYTES). */
+  roomBaseCostBytes: number;
   /**
    * Fraction of the budget one logged-in principal may be charged for (fv7 F1: the loads it made
    * and every byte it wrote, in full, while those rooms stay loaded). An anonymous visitor gets a
@@ -356,7 +398,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     anonCpuTotalBurstMs: num(env, 'ANON_CPU_TOTAL_BURST_MS', 1500),
     cpuShedMinBytes: num(env, 'CPU_SHED_MIN_BYTES', 16 * 1024),
     maxSplitsPerMessage: num(env, 'MAX_SPLITS_PER_MESSAGE', 5000),
-    maxApplyMs: num(env, 'MAX_APPLY_MS', 50),
+    maxApplyMs: num(env, 'MAX_APPLY_MS', 1000),
+    maxClientsPerUpdate: num(env, 'MAX_CLIENTS_PER_UPDATE', 256),
+    workerMessageTimeoutMs: num(env, 'WORKER_MESSAGE_TIMEOUT_MS', 250),
+    workerTimeoutNsPerByte: num(env, 'WORKER_TIMEOUT_NS_PER_BYTE', 1000),
+    workerOpTimeoutMs: num(env, 'WORKER_OP_TIMEOUT_MS', 10_000),
+    workerOpNsPerByte: num(env, 'WORKER_OP_NS_PER_BYTE', 2000),
+    workerApplyConcurrency: num(env, 'WORKER_APPLY_CONCURRENCY', 1),
+    workerStrikes: num(env, 'WORKER_STRIKES', 3),
+    workerStrikeWindowMs: num(env, 'WORKER_STRIKE_WINDOW_MS', 600_000),
+    workerStrikeCooldownMs: num(env, 'WORKER_STRIKE_COOLDOWN_MS', 600_000),
+    workerAnonPoolStrikes: num(env, 'WORKER_ANON_POOL_STRIKES', 10),
+    workerTestHooks: bool(env, 'WORKER_TEST_HOOKS', false),
     attributionRetentionDays: num(env, 'ATTRIBUTION_RETENTION_DAYS', 30),
     anonMintRatePerMin: num(env, 'ANON_MINT_RATE_PER_MIN', 120),
     anonMintBurst: num(env, 'ANON_MINT_BURST', 60),
@@ -365,6 +418,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     roomMemoryBudgetBytes: 0, // set below (depends on other limits)
     roomMemoryBudgetSource: 'heap',
     roomCostFactor: num(env, 'ROOM_COST_FACTOR', ROOM_COST_FACTOR),
+    roomBaseCostBytes: num(env, 'ROOM_BASE_COST_BYTES', ROOM_BASE_COST_BYTES),
     roomMemoryPrincipalShare: frac(env, 'ROOM_MEMORY_PRINCIPAL_SHARE', 1 / 3),
     roomMemoryAnonShare: frac(env, 'ROOM_MEMORY_ANON_SHARE', 1 / 3),
     configuredLimits: { maxDocBytes: 0, anonMaxDocBytes: 0, maxMessageBytes: 0, anonMaxMessageBytes: 0, maxImageBytes: 0, anonMaxImageBytes: 0 }, // set below
@@ -438,12 +492,19 @@ export function applyEstimateMs(bytes: number, splitWork: number, scanWork: numb
   return (bytes * APPLY_NS_PER_BYTE + splitWork * SPLIT_WORK_NS + scanWork * SCAN_WORK_NS) / 1e6;
 }
 
-/** Resident cost of an empty loaded room (two documents, awareness, caches): measured 11-12 KiB. */
-export const ROOM_BASE_COST_BYTES = 32 * 1024;
+/**
+ * Resident cost of an empty loaded room (fv9: ROOM_BASE_COST_BYTES): its worker thread with the
+ * empty room loaded and its join frames encoded — the V8 isolate, the Node environment and the
+ * modules it loads (Yjs, lib0, the stamper) — plus the room's state on the main thread (awareness,
+ * caches: 11-12 KiB). Measured with server/test/fv9/worker-cost.mjs (40 workers, RSS per worker):
+ * 15.7 MiB in the image (node:22-alpine, x86-64), 17.3 MiB on Ubuntu (glibc) Node 22. Before the
+ * rooms had workers it was 32 KiB.
+ */
+export const ROOM_BASE_COST_BYTES = 16 * 1024 * 1024;
 
 /** Estimated resident cost of a loaded room of `bytes` encoded bytes (content + ledger). */
-export function roomCost(cfg: Pick<Config, 'roomCostFactor'>, bytes: number): number {
-  return ROOM_BASE_COST_BYTES + cfg.roomCostFactor * bytes;
+export function roomCost(cfg: Pick<Config, 'roomCostFactor'> & { roomBaseCostBytes?: number }, bytes: number): number {
+  return (cfg.roomBaseCostBytes ?? ROOM_BASE_COST_BYTES) + cfg.roomCostFactor * bytes;
 }
 
 /** What the process needs besides rooms: runtime, libraries, the HTTP side (heap). */
@@ -484,14 +545,14 @@ const IMAGE_PER_MESSAGE = 0.7;
  * right for any memory setting. The outgoing buffers live outside the heap: counting them here
  * leaves the container limit the room it needs for them (chart values.yaml, "Memory").
  */
-export function roomMemoryBudget(heapLimit: number, cfg: Pick<Config, 'wsOutgoingBudgetBytes' | 'maxMessageBytes'>): number {
-  const b = heapLimit - RUNTIME_RESERVE_BYTES - cfg.wsOutgoingBudgetBytes - MESSAGE_COST_FACTOR * cfg.maxMessageBytes;
+export function roomMemoryBudget(heapLimit: number, cfg: Pick<Config, 'wsOutgoingBudgetBytes' | 'maxMessageBytes'> & { workerApplyConcurrency?: number }): number {
+  const b = heapLimit - RUNTIME_RESERVE_BYTES - cfg.wsOutgoingBudgetBytes - (cfg.workerApplyConcurrency ?? 1) * MESSAGE_COST_FACTOR * cfg.maxMessageBytes;
   return Math.max(MIN_ROOM_MEMORY_BUDGET_BYTES, Math.floor(b));
 }
 
 /** The biggest room (encoded bytes) whose cost, with FULL_ROOM_MARGIN, fits `share` bytes of memory. */
-export function roomCapFor(share: number, costFactor: number): number {
-  return Math.max(0, Math.floor((share - ROOM_BASE_COST_BYTES) / (FULL_ROOM_MARGIN * costFactor)));
+export function roomCapFor(share: number, costFactor: number, base = ROOM_BASE_COST_BYTES): number {
+  return Math.max(0, Math.floor((share - base) / (FULL_ROOM_MARGIN * costFactor)));
 }
 
 /**
@@ -516,7 +577,8 @@ export function deriveRoomLimits(cfg: Config, heapLimit: number, envBudget: numb
   cfg.configuredLimits = conf;
   const warnings: string[] = [];
   const f = cfg.roomCostFactor;
-  const userCap = (budget: number) => roomCapFor(budget * cfg.roomMemoryPrincipalShare, f);
+  const base = cfg.roomBaseCostBytes;
+  const userCap = (budget: number) => roomCapFor(budget * cfg.roomMemoryPrincipalShare, f, base);
   let budget: number;
   // the message size the budget leaves room for (the message caps never go above it)
   let reserved = conf.maxMessageBytes;
@@ -525,7 +587,7 @@ export function deriveRoomLimits(cfg: Config, heapLimit: number, envBudget: numb
     cfg.roomMemoryBudgetSource = 'env';
   } else {
     cfg.roomMemoryBudgetSource = 'heap';
-    const budgetFor = (m: number) => roomMemoryBudget(heapLimit, { wsOutgoingBudgetBytes: cfg.wsOutgoingBudgetBytes, maxMessageBytes: m });
+    const budgetFor = (m: number) => roomMemoryBudget(heapLimit, { wsOutgoingBudgetBytes: cfg.wsOutgoingBudgetBytes, maxMessageBytes: m, workerApplyConcurrency: cfg.workerApplyConcurrency });
     const top = Math.min(conf.maxMessageBytes, conf.maxDocBytes);
     let m = top;
     if (userCap(budgetFor(top)) < top) {
@@ -541,14 +603,14 @@ export function deriveRoomLimits(cfg: Config, heapLimit: number, envBudget: numb
     }
     budget = budgetFor(m);
     reserved = m;
-    if (heapLimit - RUNTIME_RESERVE_BYTES - cfg.wsOutgoingBudgetBytes - MESSAGE_COST_FACTOR * m < MIN_ROOM_MEMORY_BUDGET_BYTES) {
+    if (heapLimit - RUNTIME_RESERVE_BYTES - cfg.wsOutgoingBudgetBytes - cfg.workerApplyConcurrency * MESSAGE_COST_FACTOR * m < MIN_ROOM_MEMORY_BUDGET_BYTES) {
       warnings.push(
         `the V8 heap (${MiB(heapLimit)}) is too small for the runtime (${MiB(RUNTIME_RESERVE_BYTES)}), WS_OUTGOING_BUDGET_BYTES (${MiB(cfg.wsOutgoingBudgetBytes)}) and one message: the room budget is at its floor (${MiB(MIN_ROOM_MEMORY_BUDGET_BYTES)}); raise --max-old-space-size or lower WS_OUTGOING_BUDGET_BYTES`,
       );
     }
   }
   cfg.roomMemoryBudgetBytes = budget;
-  const fullRoom = ROOM_BASE_COST_BYTES + f * conf.maxDocBytes;
+  const fullRoom = base + f * conf.maxDocBytes;
   if (budget < fullRoom) {
     warnings.push(`the room memory budget (${MiB(budget)}) is smaller than one full room at MAX_DOC_BYTES (${MiB(conf.maxDocBytes)} x ${f} = ${MiB(fullRoom)})`);
   }
@@ -559,8 +621,8 @@ export function deriveRoomLimits(cfg: Config, heapLimit: number, envBudget: numb
   };
   const share = budget * cfg.roomMemoryPrincipalShare;
   const anonShare = share * ANON_VISITOR_SHARE_RATIO;
-  lower('MAX_DOC_BYTES', 'maxDocBytes', roomCapFor(share, f), `a full room (x ${f}, +25%) must fit one user's share of the room memory budget (${MiB(share)} of ${MiB(budget)})`);
-  lower('ANON_MAX_DOC_BYTES', 'anonMaxDocBytes', Math.min(cfg.maxDocBytes, roomCapFor(anonShare, f)), `a full anonymous room must fit one anonymous visitor's share (${MiB(anonShare)})`);
+  lower('MAX_DOC_BYTES', 'maxDocBytes', roomCapFor(share, f, base), `a full room (x ${f}, +25%) must fit one user's share of the room memory budget (${MiB(share)} of ${MiB(budget)})`);
+  lower('ANON_MAX_DOC_BYTES', 'anonMaxDocBytes', Math.min(cfg.maxDocBytes, roomCapFor(anonShare, f, base)), `a full anonymous room must fit one anonymous visitor's share (${MiB(anonShare)})`);
   lower('MAX_MESSAGE_BYTES', 'maxMessageBytes', Math.min(cfg.maxDocBytes, reserved), 'a message cannot add more than a room holds (MAX_DOC_BYTES)');
   lower('ANON_MAX_MESSAGE_BYTES', 'anonMaxMessageBytes', Math.min(cfg.maxMessageBytes, cfg.anonMaxDocBytes), 'a message cannot add more than a room holds (ANON_MAX_DOC_BYTES)');
   lower('MAX_IMAGE_BYTES', 'maxImageBytes', Math.floor(IMAGE_PER_MESSAGE * cfg.maxMessageBytes), 'an image (as a data URL) must fit one message');

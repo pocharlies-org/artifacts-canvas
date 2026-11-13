@@ -1,4 +1,4 @@
-import { ANON_VISITOR_SHARE_RATIO, GROWTH_FRACTION, LOAD_FRACTION, ROOM_BASE_COST_BYTES, roomCost, type Config } from './config.js';
+import { ANON_VISITOR_SHARE_RATIO, GROWTH_FRACTION, LOAD_FRACTION, roomCost, type Config } from './config.js';
 import { encodeNotice } from '@pocharlies/artifacts-canvas-shared/protocol';
 import type { Logger } from './logging.js';
 import type { Metrics } from './metrics.js';
@@ -8,6 +8,8 @@ import type { CanvasObjectStore } from './store.js';
 import { artifactKeyFromObject, canvasLedgerKey, canvasObjectKey } from './paths.js';
 import type { AuthzClient } from './authz.js';
 import type { NoticeKind } from './types.js';
+import { StrikeBook } from './strikes.js';
+import { Semaphore } from './worker-host.js';
 
 /** Who is loading a room (the memory budget's per-principal share, fv6 H-1). */
 export interface Loader {
@@ -70,6 +72,10 @@ export class RoomManager {
 
   /** server CPU for debounced saves, shared by every room (see RoomDeps.saveBudget) */
   private readonly saveBudget: TokenBucket;
+  /** strikes of the principals whose messages made room workers fault (fv9) */
+  readonly strikes: StrikeBook;
+  /** client messages processed at once over all rooms (Config.workerApplyConcurrency) */
+  readonly applySlots: Semaphore;
 
   constructor(private readonly deps: ManagerDeps) {
     deps.metrics.roomMemoryBudget.set(deps.cfg.roomMemoryBudgetBytes);
@@ -78,6 +84,8 @@ export class RoomManager {
     deps.metrics.roomMemoryShare.set({ who: 'anon_total' }, this.anonShare());
     deps.metrics.heldProbe = () => this.heldStats();
     this.saveBudget = new TokenBucket(deps.cfg.saveCpuMsPerSec, deps.cfg.saveCpuBurstMs);
+    this.strikes = new StrikeBook(deps.cfg, deps.metrics, deps.log);
+    this.applySlots = new Semaphore(deps.cfg.workerApplyConcurrency);
   }
 
   get(name: string): Room | undefined {
@@ -108,6 +116,16 @@ export class RoomManager {
         onEmpty: (n) => this.rooms.delete(n),
         saveBudget: this.saveBudget,
         shareOf: (anonymous) => this.share(anonymous),
+        applySlots: this.applySlots,
+        onStrike: (conn, kind) => this.strikes.strike({ principal: conn.principal, anonymous: conn.identity.anonymous, ip: conn.ip }, kind),
+        onBroken: (r) => {
+          // its connections were closed (1013): they reconnect to a room loaded afresh
+          if (this.rooms.get(r.name) === r) {
+            this.rooms.delete(r.name);
+            this.deps.metrics.rooms.set(this.rooms.size);
+          }
+          r.dispose();
+        },
       });
       room = fresh;
       this.rooms.set(name, fresh);
@@ -262,10 +280,16 @@ export class RoomManager {
     // loads, its loader charged one share at most (loadCharge). Only a room the whole load budget
     // cannot hold (stored by a deployment with more memory) never loads here: 4413, no retry.
     if (charge > cfg.roomMemoryBudgetBytes * LOAD_FRACTION) return 'room_too_large';
+    // fv9 F: the anonymous pool pays the FULL cost of a room an anonymous visitor loads (the
+    // visitor itself one visitor's share at most, P1): a room whose cost alone passes the pool
+    // never loads for anonymous visitors (4413), one that does not fit beside what the pool holds
+    // waits (1013). Three visitors each loading a 5 MiB pub/ room were charged 72.67 MiB each
+    // while the rooms took 651 MiB of the 872 MiB budget.
+    if (loader?.anonymous && charge > this.anonShare()) return 'room_too_large';
     const own = loader ? this.loadCharge(charge, loader) : 0;
     if (m.total - m.idle + extra > cfg.roomMemoryBudgetBytes * LOAD_FRACTION) return 'room_memory';
     if (loader && this.held(loader.principal) + own > this.share(loader.anonymous)) return 'room_memory_principal';
-    if (loader?.anonymous && this.anonHeld() + own > this.anonShare()) return 'room_memory_anon';
+    if (loader?.anonymous && this.anonHeld() + charge > this.anonShare()) return 'room_memory_anon';
     return null;
   }
 
@@ -279,7 +303,8 @@ export class RoomManager {
    * even an empty room fits.
    */
   mayLoad(loader: Loader): string | null {
-    return this.loadRefusal(ROOM_BASE_COST_BYTES, ROOM_BASE_COST_BYTES, loader);
+    const base = this.deps.cfg.roomBaseCostBytes;
+    return this.loadRefusal(base, base, loader);
   }
 
   /**
@@ -374,7 +399,16 @@ export class RoomManager {
       let left = charge.load;
       const head = new Map<string, number>();
       for (const [p, anon] of takers) head.set(p, Math.max(0, this.share(anon) - this.held(p)));
-      let anonRoom = Math.max(0, this.anonShare() - this.anonHeld());
+      // fv9 F: load handed to anonymous visitors brings its part of what nobody is charged for
+      // (a room past a share) to the anonymous pool: each byte moved costs the pool `k`
+      let charged = 0;
+      let loads = 0;
+      for (const [, c] of room.chargeEntries()) {
+        charged += c.bytes;
+        loads += c.load;
+      }
+      const k = loads > 0 ? 1 + Math.max(0, room.cost - charged) / loads : 1;
+      let anonRoom = Math.max(0, this.anonShare() - this.anonHeld()) / k;
       let open = [...takers.keys()].filter((p) => head.get(p)! > 0);
       while (left > 1 && open.length) {
         const part = left / open.length;
@@ -508,6 +542,7 @@ export class RoomManager {
     }
     await Promise.all(all.map((r) => r.flush()));
     for (const r of all) r.dispose();
+    await Promise.all(all.map((r) => r.stopped));
     this.rooms.clear();
     this.deps.metrics.rooms.set(0);
   }

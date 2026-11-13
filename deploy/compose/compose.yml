@@ -46,10 +46,13 @@ services:
       LOG_LEVEL: info
       # the chart's memory sizing (chart/values.yaml: nodeMaxOldSpaceMb, resources.limits);
       # CANVAS_MAX_OLD_SPACE_MB + CANVAS_MEM_LIMIT run the stack at another size, e.g. 768 + 1g
-      NODE_OPTIONS: --max-old-space-size=${CANVAS_MAX_OLD_SPACE_MB:-1536}
+      NODE_OPTIONS: --max-old-space-size=${CANVAS_MAX_OLD_SPACE_MB:-1728}
+      # test only (e2e-system/adversarial-fv9.spec.ts, SYSTEM_WORKER_TEST_HOOKS=1): a client update
+      # carrying `canvas-test-hook:<busy|alloc|throw>` makes its room's worker misbehave
+      WORKER_TEST_HOOKS: ${CANVAS_WORKER_TEST_HOOKS:-false}
     # the chart's default memory limit, so the full-system suite runs under it
-    mem_limit: ${CANVAS_MEM_LIMIT:-2g}
-    memswap_limit: ${CANVAS_MEM_LIMIT:-2g}
+    mem_limit: ${CANVAS_MEM_LIMIT:-2304m}
+    memswap_limit: ${CANVAS_MEM_LIMIT:-2304m}
     depends_on:
       bootstrap: {condition: service_completed_successfully}
       gate: {condition: service_started}

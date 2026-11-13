@@ -147,6 +147,35 @@ export class Metrics {
     labelNames: ['reason'],
     registers: [this.registry],
   });
+  readonly workerFaults = new Counter({
+    name: 'canvas_worker_faults_total',
+    help: 'Room workers terminated (fv9 isolation): over the watchdog (kind="timeout"), out of their heap (kind="oom"), crashed or exited (kind="crash"), or answered with an error (kind="error")',
+    labelNames: ['kind'],
+    registers: [this.registry],
+  });
+  readonly workerRecoveries = new Counter({
+    name: 'canvas_worker_recoveries_total',
+    help: 'Rooms rebuilt in a fresh worker from their saved state and write-ahead log after a fault (outcome="ok"), or dropped because that failed too (outcome="failed")',
+    labelNames: ['outcome'],
+    registers: [this.registry],
+  });
+  readonly workers = new Gauge({
+    name: 'canvas_room_workers',
+    help: 'Room worker threads running (one per loaded room)',
+    registers: [this.registry],
+  });
+  readonly strikes = new Counter({
+    name: 'canvas_strikes_total',
+    help: 'Strikes given to the principal whose message made a room worker fault (fv9), and cooldowns started (outcome="cooldown")',
+    labelNames: ['outcome'],
+    registers: [this.registry],
+  });
+  readonly workerReply = new Histogram({
+    name: 'canvas_worker_reply_seconds',
+    help: 'Time a room worker took for a client update (guard and apply)',
+    buckets: [0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 1],
+    registers: [this.registry],
+  });
   readonly saveDuration = new Histogram({
     name: 'canvas_save_duration_seconds',
     help: 'Object storage save duration',

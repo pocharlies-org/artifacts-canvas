@@ -1,6 +1,5 @@
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
-import * as Y from 'yjs';
 import * as decoding from 'lib0/decoding';
 import * as encoding from 'lib0/encoding';
 import * as syncProtocol from 'y-protocols/sync';
@@ -14,10 +13,11 @@ import { artifactState } from './expiry.js';
 import { TokenBucket, clientIp } from './limits.js';
 import { composeIdentity, sanitizeAwarenessUpdate } from './identity.js';
 import { AnonIssuer, assignNum } from './anon.js';
-import { SCAN_WORK_NS, SPLIT_WORK_NS, applyEstimateMs, normalizeOrigin } from './config.js';
+import { applyEstimateMs, normalizeOrigin } from './config.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
 import { ledgerBound, type RoomManager } from './rooms.js';
-import { BusyError, Room, bufferCap, limitBuffered, sendWs, sentBytes, underBufferCap, type Conn } from './room.js';
+import { BusyError, Room, RoomGone, bufferCap, limitBuffered, sendConn, sendWs, sentBytes, underBufferCap, type Conn } from './room.js';
+import { WorkerFault } from './worker-host.js';
 import {
   CLOSE,
   MSG_AWARENESS,
@@ -28,7 +28,7 @@ import {
   encodeLedger,
   encodeNotice,
 } from '@pocharlies/artifacts-canvas-shared/protocol';
-import { SPLIT_COST_BYTES, applyGuarded, checkClientUpdate, utf8Length, type UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { SPLIT_COST_BYTES, utf8Length, type UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
 
 export const WS_ROUTE = '/_canvas/_/ws/';
 /** Same route when the ingress controller strips the plugin prefix. */
@@ -192,6 +192,13 @@ export class WsServer {
         const identity = composeIdentity(res, num, visitor ? this.anon.visitorId(visitor.nonce) : '');
         const principal = visitor ? `a:${visitor.nonce}` : `u:${identity.id}`;
         const ip = clientIp(req, cfg.clientIpHops);
+        // fv9: a principal (or, anonymous, its IP or every anonymous visitor) whose messages made
+        // room workers fault too often waits out its cooldown
+        const cool = this.deps.manager.strikes.coolingDown({ principal, anonymous: !!visitor, ip });
+        if (cool) {
+          this.refuseBusy(req, socket, head, cool, 'cooldown');
+          return;
+        }
         // fv6 M-A: a new visitor is a new principal (budgets of its own): minted within the
         // mint rate only, else refused with 1013 and no cookie (the client retries).
         if (visitor?.fresh && !this.anon.mint(ip, 'ws')) {
@@ -273,7 +280,7 @@ export class WsServer {
           ws.once('close', () => this.releasePrincipal(principal));
           // nothing the client sends is read before join() listens (the room may still load)
           ws.pause();
-          void this.join(ws, key.key, cookie, authorization, identity, visitor ? { nonce: visitor.nonce, num } : null, res.artifact?.ttl ?? null, principal, !!visitor);
+          void this.join(ws, key.key, cookie, authorization, identity, visitor ? { nonce: visitor.nonce, num } : null, res.artifact?.ttl ?? null, principal, !!visitor, ip);
         });
       })
       .catch((err) => {
@@ -558,6 +565,7 @@ export class WsServer {
     ttl: number | null,
     principal: string,
     anonymous: boolean,
+    ip: string | null = null,
   ): Promise<void> {
     const { cfg, manager, metrics, log } = this.deps;
     let room: Room;
@@ -586,6 +594,14 @@ export class WsServer {
         setTimeout(() => ws.terminate(), 1000).unref?.();
         return;
       }
+      if (err instanceof WorkerFault) {
+        // fv9: the stored room could not be loaded within its worker's limits (1013: retried)
+        log.error({ err: String(err), room: artifactKey }, 'room load failed in its worker');
+        metrics.wsRejected.inc({ reason: `load_${err.kind}` });
+        sendWs(ws, encodeNotice({ kind: 'busy' }));
+        ws.close(CLOSE.tryAgain, 'server busy');
+        return;
+      }
       log.error({ err: String(err), room: artifactKey }, 'room load failed');
       ws.close(1011, 'storage error');
       return;
@@ -606,8 +622,6 @@ export class WsServer {
       if (anonNum !== anonVisitor.num) identity = { ...identity, name: `Anónimo ${anonNum}` };
     }
     const t0 = performance.now();
-    const ledgerFrames = room.ledgerFrames();
-    const ledgerBytes = ledgerFrames.reduce((a, f) => a + f.byteLength, 0);
     const conn: Conn = {
       ws,
       artifactKey,
@@ -625,6 +639,7 @@ export class WsServer {
         : new TokenBucket(cfg.syncBytesPerSec, cfg.syncBurstBytes),
       cpu: this.principalOf(principal, identity.anonymous).cpu,
       principal,
+      ip,
       resync: new TokenBucket(0.5, 20),
       step1Answers: 0,
       joinSv: new Map(),
@@ -632,10 +647,10 @@ export class WsServer {
       joining: true,
       backlog: [],
       backlogBytes: 0,
-      // until the content frame is encoded, the room's last known size stands for it
-      joinBytes: ledgerBytes + room.approxBytes,
+      // until the frames are encoded, the room's last known size stands for them
+      joinBytes: room.ledgerApproxBytes + room.approxBytes,
       joinStarted: Date.now(),
-      joinFrames: ledgerFrames,
+      joinFrames: null,
       overSince: 0,
       lastSent: 0,
       lastBuffered: 0,
@@ -652,6 +667,8 @@ export class WsServer {
       log.warn({ room: artifactKey, user: identity.id, buffered: ws.bufferedAmount }, 'ws dropped: outgoing buffer over the cap');
     };
     limitBuffered(ws, cfg.wsMaxBufferedBytes + conn.joinBytes, onOver);
+    // attached before its frames are taken (fv9: they come from the worker, a job of the room):
+    // whatever the room broadcasts meanwhile waits in the backlog and follows the frames
     room.attach(conn);
     room.pendingJoins = Math.max(0, room.pendingJoins - 1);
     metrics.wsAccepted.inc({ anonymous: identity.anonymous ? 'true' : 'false' });
@@ -671,16 +688,15 @@ export class WsServer {
         return;
       }
       const t1 = performance.now();
-      conn.precharged = 0;
       try {
         this.onMessage(conn, room, buf);
       } catch (err) {
         log.warn({ err: String(err), room: artifactKey }, 'bad message');
         this.closeConn(conn, 1003, 'bad message');
       }
-      // what the message took, minus what was charged ahead for its apply (fv8 P2)
-      this.chargeCpu(conn, room, performance.now() - t1 - conn.precharged);
-      conn.precharged = 0;
+      // the main thread's own share (decoding the frame, awareness); the worker's time is
+      // charged when its answer comes (onUpdate, answerStep1)
+      this.chargeCpu(conn, room, performance.now() - t1);
       if (buf.byteLength > 256 * 1024) metrics.sampleHeap();
     });
     ws.on('pong', () => {
@@ -721,10 +737,33 @@ export class WsServer {
     // IDENTITY MUST be the first message (protocol §4.1). The ledger (read-only for clients)
     // before the content, so shapes arrive with authors.
     sendWs(ws, encodeIdentity(identity));
+    const mainMs = performance.now() - t0;
+    const gone = (err: unknown) => {
+      if (conn.closing) return;
+      // the room was dropped (a fault it could not recover from) or evicted: retry
+      if (!(err instanceof RoomGone)) log.warn({ err: String(err), room: artifactKey }, 'join frames failed');
+      sendWs(ws, encodeNotice({ kind: 'busy' }));
+      this.closeConn(conn, CLOSE.tryAgain, 'server busy');
+    };
+    let ledgerFrames: Uint8Array[];
+    try {
+      ledgerFrames = await room.ledgerFrames();
+    } catch (err) {
+      gone(err);
+      return;
+    }
+    if (conn.closing || ws.readyState !== ws.OPEN) return;
+    const t1 = performance.now();
+    const ledgerBytes = ledgerFrames.reduce((a, f) => a + f.byteLength, 0);
+    conn.joinFrames = ledgerFrames;
+    conn.joinBytes = ledgerBytes + room.approxBytes;
+    limitBuffered(ws, cfg.wsMaxBufferedBytes + conn.joinBytes, onOver);
     for (const f of ledgerFrames) sendWs(ws, f);
-    this.chargeCpu(conn, room, performance.now() - t0, false);
-    // the CPU the load took (decoding the stored documents) counts against the server-wide
-    // budgets (fv6 M-A): while they are used up, joins that would load or encode wait
+    // the main thread's own work (not the waits for the room's worker: their time is the worker's)
+    this.chargeCpu(conn, room, performance.now() - t1 + mainMs, false);
+    // the CPU the load and the join encodings took in the room's worker (decoding the stored
+    // documents, encoding the ledger) counts against the server-wide budgets (fv6 M-A): while they
+    // are used up, joins that would load or encode wait
     const loadMs = room.takeLoadMs();
     this.cpuAll.charge(loadMs);
     if (identity.anonymous) this.cpuAnon.charge(loadMs);
@@ -734,8 +773,15 @@ export class WsServer {
     // client answers with a step 2 holding what the room lacks — the edits it made while
     // disconnected. That answer is a plain client update and goes through the guard; the
     // content document holds no server-only root a client could echo back.
-    const t2 = performance.now();
-    const content = room.contentFrames();
+    let content: Awaited<ReturnType<Room['contentFrames']>>;
+    try {
+      content = await room.contentFrames();
+    } catch (err) {
+      gone(err);
+      return;
+    }
+    if (conn.closing || ws.readyState !== ws.OPEN) return;
+    const t3 = performance.now();
     conn.joinSv = content.sv;
     conn.joinFrames = [...ledgerFrames, ...content.frames];
     conn.joinBytes = ledgerBytes + content.frames.reduce((a, f) => a + f.byteLength, 0);
@@ -755,13 +801,11 @@ export class WsServer {
     conn.backlog = [];
     conn.backlogBytes = 0;
     for (const m of backlog) sendWs(ws, m);
-    this.chargeCpu(conn, room, performance.now() - t2, false);
+    this.chargeCpu(conn, room, performance.now() - t3 + room.takeLoadMs(), false);
     if (conn.deferredStep1 && !conn.closing) {
       const sv = conn.deferredStep1;
       conn.deferredStep1 = undefined;
-      const t3 = performance.now();
-      this.answerStep1(conn, room, sv);
-      this.chargeCpu(conn, room, performance.now() - t3, false);
+      void this.answerStep1(conn, room, sv, false);
     }
   }
 
@@ -813,7 +857,7 @@ export class WsServer {
     if (type === MSG_SYNC) {
       const syncType = decoding.readVarUint(dec);
       if (syncType === syncProtocol.messageYjsSyncStep1) {
-        this.answerStep1(conn, room, decoding.readVarUint8Array(dec));
+        void this.answerStep1(conn, room, decoding.readVarUint8Array(dec));
         return;
       }
       // step 2 and update carry the same payload: varUint8Array(update) (y-protocols/sync:
@@ -825,126 +869,15 @@ export class WsServer {
       const update = decoding.readVarUint8Array(dec);
       if (syncType === syncProtocol.messageYjsSyncStep2) conn.resyncAsked = false;
       if (conn.identity.readOnly) return;
-      // Protocol §5.3: a write the content guard refuses closes the connection and the
-      // update is NOT applied.
-      const check = checkClientUpdateSafe(room, conn, update, cfg);
-      if (check.bad === 'pending') {
-        // fv5 M-2: an honest tab that reconnects with offline edits can send a fresh edit
-        // before its step-2 answer (y-websocket sends local updates as soon as the socket is
-        // open); that edit depends on structs the room does not have yet. It is not applied
-        // (the room never holds pending state) and the connection stays open: the server
-        // asks with a step 1 for what it lacks, and the client's step-2 answer carries the
-        // edit too. A connection that keeps sending updates that never integrate is closed.
-        this.askResync(conn, room);
-        return;
-      }
-      if (check.bad === 'splits' || (!check.bad && applyEstimateMs(0, check.splitWork, check.scanWork) > cfg.maxApplyMs)) {
-        // fv8 P1/P2: more cuts of items (or more work to make and place them) than one update may
-        // make: Yjs would copy and scan for seconds (200 000 cuts held the server for a minute) and
-        // every cut grows the stored room. Refused like an update too large: only the sender closes.
-        this.deps.log.warn({ room: room.name, user: conn.identity.id, bytes: update.byteLength }, 'update refused: too many cuts');
-        sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
-        this.closeConn(conn, CLOSE.tooLarge, 'update cuts too many items');
-        this.deps.metrics.wsRejected.inc({ reason: 'too_many_splits' });
-        return;
-      }
-      const bad = check.bad;
-      if (bad) {
-        this.deps.log.warn({ room: room.name, user: conn.identity.id, root: bad }, 'forbidden content write');
-        this.closeConn(conn, CLOSE.forbidden, `write to ${bad} not allowed`);
-        this.deps.metrics.wsRejected.inc({ reason: 'forbidden_write' });
-        return;
-      }
-      // Document size cap (protocol §10), per connection: an update that would grow the room
-      // past THIS connection's cap is refused and only this connection is closed. The room
-      // stays open for everyone else (an anonymous visitor cannot lock the room).
-      // The ledger counts too (fv4 M4: create/delete cycles grew it ~7x the content). The
-      // sizes are the exact ones of the last save plus every accepted update since (an upper
-      // bound; every save — at most SAVE_DEBOUNCE_MS after a change — makes them exact again,
-      // deletes included). Nothing O(room) runs here: no scratch copy, no re-encoding per
-      // message (fv4 H2). An update that adds nothing (deletes only) always passes.
-      // fv5 L-2: deletes that split live items grow the encoded room too (every split becomes
-      // structs of its own), so they count against the cap with SPLIT_COST_BYTES per split.
-      // fv7 F1: and the ledger the stamper writes with it, counted ahead (its shapes, their ids
-      // and the room's longest user id: each line names the writer and the shape's creator), so a
-      // room never passes its cap by the attribution of its last update (a room at the cap must
-      // fit one share of the memory budget, and load for anyone).
-      const limit = conn.identity.anonymous ? cfg.anonMaxDocBytes : cfg.maxDocBytes;
-      const growth = update.byteLength + check.splits * SPLIT_COST_BYTES;
-      const ledger = check.grows ? ledgerBound(check.shapes, check.shapeKeyBytes, Math.max(utf8Length(conn.identity.id), room.maxUserIdBytes)) : 0;
-      if (check.grows && room.approxBytes + room.ledgerApproxBytes + growth + ledger > limit) {
-        sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
-        this.closeConn(conn, CLOSE.tooLarge, 'document too large');
-        this.deps.metrics.wsRejected.inc({ reason: 'doc_too_large' });
-        return;
-      }
-      // fv6 H-1, fv7 F1: the loaded rooms together may not grow past GROWTH_FRACTION of the
-      // memory budget, the sender past its share of it (it is charged what it writes, in full),
-      // the anonymous visitors past theirs. Refused with 1013 (busy, the client retries); nothing
-      // is applied.
-      if (check.grows) {
-        const why = this.deps.manager.growthRefusal(room, conn.principal, conn.identity.anonymous, growth, ledger);
-        if (why) {
-          this.deps.log.warn({ room: room.name, user: conn.identity.id, growth, why }, 'update refused: memory budget');
-          sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
-          this.closeConn(conn, CLOSE.tryAgain, 'server memory busy');
-          this.deps.metrics.wsRejected.inc({ reason: why });
-          return;
-        }
-      }
-      // fv8 P2: the CPU the apply will take is charged BEFORE it runs (the budgets were charged
-      // only after a message, so one message could hold the server for as long as it took): an
-      // update whose estimate the sender's budget or the server's cannot cover is refused 1013
-      // (busy: the client reconnects and sends it again once the budget refilled). One that costs
-      // more than half a burst needs half a burst (a bucket never holds more than its burst); a
-      // cheap one (under PRECHARGE_MIN_MS, the small edits fv5 M-5 lets through while the server is
-      // busy) is charged after, as before.
-      const estimate = applyEstimateMs(update.byteLength, check.splitWork, check.scanWork);
-      const covers = (b: TokenBucket) => b.level() >= Math.min(estimate, b.burst / 2);
-      if (estimate >= PRECHARGE_MIN_MS && (!covers(conn.cpu) || !covers(this.cpuAll) || (conn.identity.anonymous && !covers(this.cpuAnon)))) {
-        this.deps.log.warn({ room: room.name, user: conn.identity.id, estimateMs: Math.round(estimate) }, 'update refused: cpu budget');
+      // fv9: a principal cooling down after strikes writes nothing (1013: it retries later)
+      const cool = this.deps.manager.strikes.coolingDown({ principal: conn.principal, anonymous: conn.identity.anonymous, ip: conn.ip });
+      if (cool) {
         sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
-        this.closeConn(conn, CLOSE.tryAgain, 'server busy');
-        this.deps.metrics.wsRejected.inc({ reason: 'cpu_precharge' });
+        this.closeConn(conn, CLOSE.tryAgain, 'cooldown');
+        this.deps.metrics.wsRejected.inc({ reason: `write_${cool}` });
         return;
       }
-      conn.cpu.charge(estimate);
-      this.cpuAll.charge(estimate);
-      if (conn.identity.anonymous) this.cpuAnon.charge(estimate);
-      conn.precharged = estimate;
-      // Apply with the connection as origin (the stamper attributes it to this identity).
-      // applyGuarded ALWAYS drops whatever Yjs could not integrate, also when it throws
-      // mid-way. A clean apply marks the room dirty through the document's update event;
-      // anything else marks it here (what did integrate before a throw was broadcast).
-      let outcome: ReturnType<typeof applyGuarded> | null = null;
-      const costBefore = room.cost;
-      const changedBefore = room.contentChangedBytes;
-      try {
-        outcome = applyGuarded(room.doc, update, conn);
-      } finally {
-        // An update that only removes whole items counts what it really deleted (Yjs' own
-        // encoding of the change), not its size: a delete set that repeats deletions the room
-        // has (a full-state step 2 does) changes nothing, and counted at its size it grew the
-        // estimate with nothing behind it until a save, which no change triggers (fv7 F1).
-        room.approxBytes += check.grows ? growth : room.contentChangedBytes - changedBefore;
-        if (!outcome || outcome.threw || outcome.droppedPending) room.markDirty();
-        // fv7 F1: what the update added (content, and the ledger the stamper wrote for it) is
-        // charged to its sender, in full
-        this.deps.manager.chargeUpdate(room, conn.principal, conn.identity.anonymous, costBefore);
-      }
-      if (outcome.threw || outcome.droppedPending) {
-        this.deps.log.error(
-          { room: room.name, user: conn.identity.id, threw: outcome.threw, droppedPending: outcome.droppedPending },
-          'accepted update did not integrate cleanly: sender closed, pending dropped',
-        );
-        if (outcome.droppedPending) this.deps.metrics.pendingDropped.inc({ where: 'apply' });
-        this.closeConn(conn, CLOSE.forbidden, 'write not allowed');
-        this.deps.metrics.wsRejected.inc({ reason: outcome.threw ? 'apply_threw' : 'pending_after_apply' });
-        return;
-      }
-      const costBeforeClaim = room.cost;
-      room.claimWriters(check.writers, conn.identity.id);
-      this.deps.manager.chargeUpdate(room, conn.principal, conn.identity.anonymous, costBeforeClaim);
+      void this.onUpdate(conn, room, update);
       return;
     }
     if (type === MSG_LEDGER) {
@@ -984,6 +917,142 @@ export class WsServer {
   }
 
   /**
+   * A client update (protocol §5.3), processed by the room's worker (fv9): the guard runs there,
+   * the checks below run here on its verdict, and the worker applies it or drops it. A write the
+   * guard refuses closes the connection and the update is NOT applied. A worker that takes too
+   * long or runs out of heap on it is terminated and the room rebuilt (Room.recover): the sender
+   * is closed 4413 and struck.
+   */
+  private async onUpdate(conn: Conn, room: Room, update: Uint8Array): Promise<void> {
+    const { cfg } = this.deps;
+    let precharged = 0;
+    let growth = 0;
+    try {
+      const r = await room.update(conn, update, {
+        decide: (check) => {
+          if (check.bad === 'pending') {
+            // fv5 M-2: an honest tab that reconnects with offline edits can send a fresh edit
+            // before its step-2 answer (y-websocket sends local updates as soon as the socket is
+            // open); that edit depends on structs the room does not have yet. It is not applied
+            // (the room never holds pending state) and the connection stays open: the server
+            // asks with a step 1 for what it lacks, and the client's step-2 answer carries the
+            // edit too. A connection that keeps sending updates that never integrate is closed.
+            this.askResync(conn, room);
+            return false;
+          }
+          if (check.bad === 'splits' || check.bad === 'blocks' || (!check.bad && applyEstimateMs(0, check.splitWork, check.scanWork) > cfg.maxApplyMs)) {
+            // fv8 P1/P2, fv9: more cuts of items, merges, or more work to make and place them, or
+            // more client blocks, than one update may carry: Yjs would copy, splice and scan for
+            // seconds. Refused like an update too large: only the sender closes.
+            this.deps.log.warn({ room: room.name, user: conn.identity.id, bytes: update.byteLength, why: check.bad ?? 'work', merges: check.merges }, 'update refused: too much work');
+            sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
+            this.closeConn(conn, CLOSE.tooLarge, check.bad === 'blocks' ? 'update carries too many clients' : 'update cuts too many items');
+            this.deps.metrics.wsRejected.inc({ reason: check.bad === 'blocks' ? 'too_many_clients' : 'too_many_splits' });
+            return false;
+          }
+          const bad = check.bad;
+          if (bad) {
+            this.deps.log.warn({ room: room.name, user: conn.identity.id, root: bad }, 'forbidden content write');
+            this.closeConn(conn, CLOSE.forbidden, `write to ${bad} not allowed`);
+            this.deps.metrics.wsRejected.inc({ reason: 'forbidden_write' });
+            return false;
+          }
+          // Document size cap (protocol §10), per connection: an update that would grow the room
+          // past THIS connection's cap is refused and only this connection is closed. The room
+          // stays open for everyone else (an anonymous visitor cannot lock the room).
+          // The ledger counts too (fv4 M4: create/delete cycles grew it ~7x the content). The
+          // sizes are the exact ones of the last save plus every accepted update since (an upper
+          // bound; every save — at most SAVE_DEBOUNCE_MS after a change — makes them exact again,
+          // deletes included). Nothing O(room) runs here: no scratch copy, no re-encoding per
+          // message (fv4 H2). An update that adds nothing (deletes only) always passes.
+          // fv5 L-2: deletes that split live items grow the encoded room too (every split becomes
+          // structs of its own), so they count against the cap with SPLIT_COST_BYTES per split.
+          // fv7 F1: and the ledger the stamper writes with it, counted ahead (its shapes, their ids
+          // and the room's longest user id: each line names the writer and the shape's creator), so a
+          // room never passes its cap by the attribution of its last update (a room at the cap must
+          // fit one share of the memory budget, and load for anyone).
+          const limit = conn.identity.anonymous ? cfg.anonMaxDocBytes : cfg.maxDocBytes;
+          growth = update.byteLength + check.splits * SPLIT_COST_BYTES;
+          const ledger = check.grows ? ledgerBound(check.shapes, check.shapeKeyBytes, Math.max(utf8Length(conn.identity.id), room.maxUserIdBytes)) : 0;
+          if (check.grows && room.approxBytes + room.ledgerApproxBytes + growth + ledger > limit) {
+            sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
+            this.closeConn(conn, CLOSE.tooLarge, 'document too large');
+            this.deps.metrics.wsRejected.inc({ reason: 'doc_too_large' });
+            return false;
+          }
+          // fv6 H-1, fv7 F1: the loaded rooms together may not grow past GROWTH_FRACTION of the
+          // memory budget, the sender past its share of it (it is charged what it writes, in full),
+          // the anonymous visitors past theirs. Refused with 1013 (busy, the client retries); nothing
+          // is applied.
+          if (check.grows) {
+            const why = this.deps.manager.growthRefusal(room, conn.principal, conn.identity.anonymous, growth, ledger);
+            if (why) {
+              this.deps.log.warn({ room: room.name, user: conn.identity.id, growth, why }, 'update refused: memory budget');
+              sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+              this.closeConn(conn, CLOSE.tryAgain, 'server memory busy');
+              this.deps.metrics.wsRejected.inc({ reason: why });
+              return false;
+            }
+          }
+          // fv8 P2: the CPU the apply will take is charged BEFORE it runs: an update whose
+          // estimate the sender's budget or the server's cannot cover is refused 1013 (busy: the
+          // client reconnects and sends it again once the budget refilled). One that costs more
+          // than half a burst needs half a burst (a bucket never holds more than its burst); a
+          // cheap one (under PRECHARGE_MIN_MS, the small edits fv5 M-5 lets through while the
+          // server is busy) is charged after, as before.
+          const estimate = applyEstimateMs(update.byteLength, check.splitWork, check.scanWork);
+          const covers = (b: TokenBucket) => b.level() >= Math.min(estimate, b.burst / 2);
+          if (estimate >= PRECHARGE_MIN_MS && (!covers(conn.cpu) || !covers(this.cpuAll) || (conn.identity.anonymous && !covers(this.cpuAnon)))) {
+            this.deps.log.warn({ room: room.name, user: conn.identity.id, estimateMs: Math.round(estimate) }, 'update refused: cpu budget');
+            sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+            this.closeConn(conn, CLOSE.tryAgain, 'server busy');
+            this.deps.metrics.wsRejected.inc({ reason: 'cpu_precharge' });
+            return false;
+          }
+          conn.cpu.charge(estimate);
+          this.cpuAll.charge(estimate);
+          if (conn.identity.anonymous) this.cpuAnon.charge(estimate);
+          precharged = estimate;
+          return true;
+        },
+        applied: (check, outcome, before) => {
+          // An update that only removes whole items counts what it really deleted (Yjs' own
+          // encoding of the change), not its size: a delete set that repeats deletions the room
+          // has (a full-state step 2 does) changes nothing, and counted at its size it grew the
+          // estimate with nothing behind it until a save, which no change triggers (fv7 F1).
+          room.approxBytes += check.grows ? growth : room.contentChangedBytes - before.changed;
+          if (outcome.threw || outcome.droppedPending) room.markDirty();
+          // fv7 F1: what the update added (content, and the ledger the stamper wrote for it and
+          // for the client ids it bound) is charged to its sender, in full
+          this.deps.manager.chargeUpdate(room, conn.principal, conn.identity.anonymous, before.cost);
+          if (outcome.threw || outcome.droppedPending) {
+            this.deps.log.error(
+              { room: room.name, user: conn.identity.id, threw: outcome.threw, droppedPending: outcome.droppedPending },
+              'accepted update did not integrate cleanly: sender closed, pending dropped',
+            );
+            if (outcome.droppedPending) this.deps.metrics.pendingDropped.inc({ where: 'apply' });
+            this.closeConn(conn, CLOSE.forbidden, 'write not allowed');
+            this.deps.metrics.wsRejected.inc({ reason: outcome.threw ? 'apply_threw' : 'pending_after_apply' });
+          }
+        },
+      });
+      // what the worker took, minus what was charged ahead for its apply (fv8 P2)
+      if (r) this.chargeCpu(conn, room, r.ms - precharged);
+    } catch (err) {
+      if (err instanceof WorkerFault) {
+        // the room was rebuilt and the sender closed and struck (Room.recover): the worker time
+        // the message burned is charged to its principal and the server-wide budgets (not when the
+        // room just went away under it: evicted or expired)
+        if (!room.disposed) this.chargeCpu(conn, room, room.messageTimeout(update.byteLength) - precharged, false);
+        return;
+      }
+      if (err instanceof RoomGone) return;
+      this.deps.log.warn({ err: String(err), room: room.name }, 'bad message');
+      this.closeConn(conn, 1003, 'bad message');
+    }
+  }
+
+  /**
    * Sync step 1 from a client (fv4 H1: every 4-byte step 1 with an empty state vector was
    * answered with the whole room, buffered without bound for a peer that never read).
    *   - The answer is a diff against the client's state vector merged with the one the
@@ -994,19 +1063,10 @@ export class WsServer {
    *     for the whole room again) closes the connection with 4429.
    *   - Nothing is computed for a peer whose outgoing buffer is over the cap.
    */
-  private answerStep1(conn: Conn, room: Room, sv: Uint8Array): void {
+  private async answerStep1(conn: Conn, room: Room, sv: Uint8Array, closeInDebt = true): Promise<void> {
     if (conn.joining) {
       // its join state vector is not known yet: answered right after the content frame
-      Y.decodeStateVector(sv); // malformed = bad message, now
       conn.deferredStep1 = sv;
-      return;
-    }
-    const clientSv = Y.decodeStateVector(sv);
-    const emptySv = clientSv.size === 0;
-    if (conn.step1Answers > 0 && emptySv) {
-      this.deps.metrics.wsRejected.inc({ reason: 'sync_repeat' });
-      sendWs(conn.ws, encodeNotice({ kind: 'rate-limited' }));
-      this.closeConn(conn, CLOSE.rateLimited, 'full sync repeated');
       return;
     }
     if (!underBufferCap(conn.ws)) {
@@ -1015,21 +1075,52 @@ export class WsServer {
       conn.ws.terminate();
       return;
     }
-    const merged = new Map(conn.joinSv);
-    for (const [client, clock] of clientSv) if (clock > (merged.get(client) ?? 0)) merged.set(client, clock);
-    const diff = Y.encodeStateAsUpdate(room.doc, Y.encodeStateVector(merged));
-    if (conn.step1Answers > 0 && !conn.syncBytes.take(diff.byteLength)) {
-      this.deps.metrics.wsRejected.inc({ reason: 'sync_bytes' });
-      sendWs(conn.ws, encodeNotice({ kind: 'rate-limited' }));
-      this.closeConn(conn, CLOSE.rateLimited, 'sync budget');
-      return;
+    try {
+      await room.diff(conn, sv, {
+        refuseEmpty: () => conn.step1Answers > 0,
+        answered: (r) => {
+          // what the answer took in the worker; a principal in debt is closed (fv5 M-5), except
+          // for the answer a join owes its client
+          this.chargeCpu(conn, room, r.ms, closeInDebt);
+          if (conn.closing) return;
+          if (r.malformed) {
+            this.closeConn(conn, 1003, 'bad message');
+            return;
+          }
+          if (!r.diff) {
+            this.deps.metrics.wsRejected.inc({ reason: 'sync_repeat' });
+            sendWs(conn.ws, encodeNotice({ kind: 'rate-limited' }));
+            this.closeConn(conn, CLOSE.rateLimited, 'full sync repeated');
+            return;
+          }
+          if (!underBufferCap(conn.ws)) {
+            this.deps.metrics.wsRejected.inc({ reason: 'slow_consumer' });
+            conn.closing = true;
+            conn.ws.terminate();
+            return;
+          }
+          if (conn.step1Answers > 0 && !conn.syncBytes.take(r.diff.byteLength)) {
+            this.deps.metrics.wsRejected.inc({ reason: 'sync_bytes' });
+            sendWs(conn.ws, encodeNotice({ kind: 'rate-limited' }));
+            this.closeConn(conn, CLOSE.rateLimited, 'sync budget');
+            return;
+          }
+          conn.step1Answers++;
+          const e = encoding.createEncoder();
+          encoding.writeVarUint(e, MSG_SYNC);
+          encoding.writeVarUint(e, syncProtocol.messageYjsSyncStep2);
+          encoding.writeVarUint8Array(e, r.diff);
+          sendWs(conn.ws, encoding.toUint8Array(e));
+        },
+      });
+    } catch (err) {
+      if (err instanceof WorkerFault) {
+        if (!room.disposed) this.chargeCpu(conn, room, room.messageTimeout(sv.byteLength), false);
+        return;
+      }
+      if (err instanceof RoomGone) return;
+      this.closeConn(conn, 1003, 'bad message');
     }
-    conn.step1Answers++;
-    const e = encoding.createEncoder();
-    encoding.writeVarUint(e, MSG_SYNC);
-    encoding.writeVarUint(e, syncProtocol.messageYjsSyncStep2);
-    encoding.writeVarUint8Array(e, diff);
-    sendWs(conn.ws, encoding.toUint8Array(e));
   }
 
   /** Ask the client for what the room lacks (sync step 1), at most one request outstanding. */
@@ -1043,7 +1134,10 @@ export class WsServer {
       return;
     }
     conn.resyncAsked = true;
-    sendWs(conn.ws, room.step1Frame());
+    void room.step1Frame().then(
+      (f) => sendConn(conn, f),
+      () => undefined,
+    );
   }
 
   private async recheck(conn: Conn, room: Room): Promise<void> {
@@ -1081,25 +1175,6 @@ const PRECHARGE_MIN_MS = 1;
 /** An authz answer that says the core failed (not a decision): `core_error`, `malformed` (authz.ts). */
 function coreError(reason: string): boolean {
   return reason === 'core_error' || reason === 'malformed';
-}
-
-/**
- * The §5.3 guard with this connection's client-id ownership; it can throw on malformed
- * updates, and any throw counts as forbidden.
- */
-function checkClientUpdateSafe(room: Room, conn: Conn, update: Uint8Array, cfg: Config): UpdateCheck {
-  try {
-    return checkClientUpdate(room.doc, update, {
-      serverClient: room.doc.clientID,
-      mayWriteClient: (client) => room.mayWrite(client, conn.identity.id, conn),
-      // fv8 P1/P2: what the cuts and the placement of one update may cost Yjs (MAX_APPLY_MS)
-      maxSplits: cfg.maxSplitsPerMessage,
-      maxSplitWork: (cfg.maxApplyMs * 1e6) / SPLIT_WORK_NS,
-      maxScanWork: (cfg.maxApplyMs * 1e6) / SCAN_WORK_NS,
-    });
-  } catch {
-    return { bad: 'forbidden', writers: [], grows: false, splits: 0, splitWork: 0, scanWork: 0, shapes: 0, shapeKeyBytes: 0 };
-  }
 }
 
 /** Join deadline: the payload at WS_JOIN_MIN_BYTES_PER_SEC, never less than 30 s. */
