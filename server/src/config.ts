@@ -94,7 +94,16 @@ export interface Config {
    */
   wsStallMs: number;
   /** WebSocket ping interval; a peer that answers no ping for two intervals and drains nothing is dropped. */
-  wsPingIntervalMs: number;  /**
+  wsPingIntervalMs: number;
+  /**
+   * Incoming deadline (review S8): a connection whose socket delivered part of a message (a frame
+   * not complete, or fragments without the last one) and not its end within WS_INCOMING_TIMEOUT_MS
+   * + the bytes held / WS_INCOMING_MIN_BYTES_PER_SEC is dropped. What `ws` holds for it (up to
+   * maxPayload) is then released; answering pings meanwhile does not keep it.
+   */
+  wsIncomingTimeoutMs: number;
+  wsIncomingMinBytesPerSec: number;
+  /**
    * Bytes of sync step-2 answers per connection beyond the first one (which is free: a
    * joining or reconnecting client asks for everything it lacks once). Users / anonymous.
    */
@@ -411,6 +420,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     wsOutgoingBudgetBytes: num(env, 'WS_OUTGOING_BUDGET_BYTES', 256 * 1024 * 1024),
     wsJoinMinBytesPerSec: num(env, 'WS_JOIN_MIN_BYTES_PER_SEC', 32 * 1024),
     wsPingIntervalMs: num(env, 'WS_PING_INTERVAL_MS', 30_000),
+    wsIncomingTimeoutMs: num(env, 'WS_INCOMING_TIMEOUT_MS', 30_000),
+    wsIncomingMinBytesPerSec: num(env, 'WS_INCOMING_MIN_BYTES_PER_SEC', 32 * 1024),
     wsStallMs: num(env, 'WS_STALL_MS', 3000),
     syncBytesPerSec: num(env, 'SYNC_BYTES_PER_SEC', 1024 * 1024),
     syncBurstBytes: num(env, 'SYNC_BURST_BYTES', 4 * 1024 * 1024),
@@ -535,14 +546,40 @@ export function inflightConnBytes(maxMessageBytes: number): number {
 }
 
 /**
- * What a client message counts in flight at least (review S6): a tiny update is a few payload
- * bytes but several hundred bytes to ~1 KiB of live objects while it waits (the frame, its views,
- * the job and its promises), so counted by its bytes alone many of them from many principals never
- * reached a cap and queued without a bound. With the floor, WORKER_INFLIGHT_BYTES (64 MiB) bounds
- * the queue to ~65 000 messages, plus what each connection had already read when it was paused
- * (protocol §12), and a connection's cap (8 MiB) to ~8 000; an honest tab has a handful in flight.
+ * What `ws` reads of one message before it closes the connection 1009 (maxPayload), over the largest
+ * message cap (review S8): the y-protocols framing of a message (types and length, a few bytes) and
+ * room for a message a little over the cap to be read and refused with the `too-large` notice
+ * (4413) instead of a bare 1009.
  */
-export const INFLIGHT_MIN_COST = 1024;
+export const WS_PAYLOAD_SLACK = 64 * 1024;
+
+/**
+ * maxPayload of the WebSocket server (review S8): the message cap plus WS_PAYLOAD_SLACK, after the
+ * memory sizing lowered the caps (it was a fixed 8 MiB, twice the chart's 4 MiB cap). Also the most
+ * an unfinished frame or fragmented message can make `ws` hold for one connection, until its
+ * incoming deadline drops it.
+ */
+export function wsMaxPayload(cfg: Pick<Config, 'maxMessageBytes' | 'anonMaxMessageBytes'>): number {
+  return Math.max(cfg.maxMessageBytes, cfg.anonMaxMessageBytes) + WS_PAYLOAD_SLACK;
+}
+
+/** The incoming deadline of a connection holding `bytes` of an unfinished message (review S8). */
+export function incomingDeadlineMs(bytes: number, cfg: Pick<Config, 'wsIncomingTimeoutMs' | 'wsIncomingMinBytesPerSec'>): number {
+  return cfg.wsIncomingTimeoutMs + (bytes / cfg.wsIncomingMinBytesPerSec) * 1000;
+}
+
+/**
+ * What a client message counts in flight at least (review S6): a tiny update is a few payload
+ * bytes but holds far more while it waits (the copy of its frame, its views, the job, its async
+ * state and promises), so counted by its bytes alone many of them from many principals never
+ * reached a cap and queued without a bound. Measured (review S8; Node 22, x86-64, the main thread's
+ * heap and buffers after a GC, 11 520 queued 4-byte updates: `fv9-review.test.ts`, "calibration"):
+ * 1.65-1.7 KiB each, so the floor is 2 KiB (it was 1 KiB, an estimate). With it,
+ * WORKER_INFLIGHT_BYTES (64 MiB) bounds the queue to ~32 000 messages, plus one or two per
+ * connection (protocol §12), and a connection's cap (8 MiB) to ~4 000; an honest tab has a handful
+ * in flight.
+ */
+export const INFLIGHT_MIN_COST = 2048;
 
 /**
  * Measured resident cost of a loaded room per encoded byte (content + ledger), V8 heap and

@@ -14,6 +14,7 @@ import type { UpdateCheck } from '@pocharlies/artifacts-canvas-shared/stamper';
 import { materializeContent, materializeLedger } from '@pocharlies/artifacts-canvas-shared/ledger';
 import { CLOSE, MSG_SYNC, encodeLedger, encodeNotice } from '@pocharlies/artifacts-canvas-shared/protocol';
 import type { TokenBucket } from './limits.js';
+import type { IncomingFrames } from './incoming.js';
 import type { Emitted } from './room-core.js';
 import type { ApplyResult, CheckResult, DiffResult, FramesResult, InspectResult, LoadResult, SaveResult, StampIdentity, WorkerRequest } from './room-protocol.js';
 import { WorkerFault, WorkerHost, type Answer, type FaultKind, type Semaphore } from './worker-host.js';
@@ -41,6 +42,8 @@ export interface Conn {
   inflight: number;
   /** the server stopped reading it until its messages in flight are processed (review M-1) */
   paused?: boolean;
+  /** what its socket delivered toward a message that is not complete yet (review S8, incoming.ts) */
+  incoming?: IncomingFrames;
   /** CPU (ms) charged ahead for the apply of the message being processed (fv8 P2) */
   precharged?: number;
   /** `u:<user id>` or `a:<visitor nonce>`: the key of the per-principal limits */

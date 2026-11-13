@@ -548,14 +548,20 @@ that is gone or expired.
   nobody else is closed. One client message is processed at a time over all rooms
   (`WORKER_APPLY_CONCURRENCY` 1, the memory formula reserves one).
 - **Messages in flight** (§12): a client message (sync step 1, step 2, update) counts from its
-  receipt until its room's worker processed it, at its size and at least 1 KiB. A connection,
+  receipt until its room's worker processed it, at its size and at least 2 KiB. A connection,
   and a principal over all its connections, with two messages of the largest size in flight
   (1 MiB at least: 8 MiB, anonymous
   2 MiB) is no longer read until they are processed (TCP backpressure); a message bigger than
   `CPU_SHED_MIN_BYTES` (16 KiB) that would take everything in flight past
   `WORKER_INFLIGHT_BYTES` (64 MiB) → `1013` `busy` (metric `canvas_ws_rejected_total{reason="inflight"}`);
   a smaller one (an honest edit) is taken, and its connection is not read while it has more in
-  flight and the total is over the cap.
+  flight and the total is over the cap. A message that arrives on a connection no longer read (it
+  was in the same read) → `1013` `busy`, no strike (`canvas_ws_rejected_total{reason="inflight_paused"}`).
+- **Incoming** (§12): a message longer than the message cap plus 64 KiB closes `1009` before it
+  is read (`maxPayload`; it was a fixed 8 MiB); a connection that sent part of a message (a frame,
+  or fragments without the last one) and not its end within `WS_INCOMING_TIMEOUT_MS` (30 s) + its
+  bytes at `WS_INCOMING_MIN_BYTES_PER_SEC` (32 KiB/s) → dropped (`canvas_ws_rejected_total{reason="incoming_timeout"}`),
+  whatever pongs it sends.
 - **Awareness hardening** (§5.4): the `user` field is overwritten with the verified
   identity; states for clientIds already owned by another connection are dropped; every state
   is reduced to the presence schema.
@@ -830,9 +836,9 @@ bounded by isolation:
   client could make it hold; once messages queued, nothing did (one writer at link speed could
   make it hold hundreds of MiB of Node buffers, outside every V8 heap, and the pod was
   OOM-killed). So every sync step 1, step 2 and update counts from its receipt until it was
-  processed (or dropped), at its size and at least 1 KiB (`INFLIGHT_MIN_COST`: a tiny update holds
-  up to that while it waits, so many of them reach the caps too): a connection, and a principal
-  over all its connections, with
+  processed (or dropped), at its size and at least 2 KiB (`INFLIGHT_MIN_COST`: a tiny update holds
+  1.65-1.7 KiB of the main thread's heap while it waits, measured on Node 22 x86-64, so many of
+  them reach the caps too): a connection, and a principal over all its connections, with
   `max(2 x MAX_MESSAGE_BYTES, 1 MiB)` in flight is no longer read (`ws.pause()`) until that falls
   under (metric `canvas_ws_paused_total{why="connection"|"principal"}`); a message bigger than
   `CPU_SHED_MIN_BYTES` that would take the total past `WORKER_INFLIGHT_BYTES` (64 MiB) is refused
@@ -840,11 +846,30 @@ bounded by isolation:
   principals together; a smaller one is taken (an honest edit is never refused for it) and its
   connection, if it has more in flight, is not read until the total is under the cap
   (`why="server"`). What is held is `canvas_ws_inflight_bytes`. A connection that stays unread
-  for two `WS_PING_INTERVAL_MS` rounds (its pongs are not read either) is dropped as idle. Beyond the cap, the bound is what
-  each connection was being read when it was paused: the frame being received (at most `maxPayload`,
-  as on any connection) or, for small messages, the rest of the chunk already read (the `ws`
-  receiver emits every message of a chunk), at most `MSG_BURST` messages before the rate limit
-  closes it.
+  for two `WS_PING_INTERVAL_MS` rounds (its pongs are not read either) is dropped as idle.
+  `ws` hands its receiver a whole read and emits every message in it, also after `pause()`: a
+  read of up to 64 KiB holds thousands of tiny frames. So a message that arrives on a connection
+  already paused is refused `1013` `busy` (no strike; the client sends it again after it
+  reconnected; `canvas_ws_rejected_total{reason="inflight_paused"}`), and is never queued. Past the
+  caps each connection then adds at most two messages (the one that paused it, and when the
+  server is over its cap the one before), also a new connection, which starts with a full
+  message bucket and nothing in flight (it used to add up to `MSG_BURST`, 240, from one read). The
+  queue is at most `WORKER_INFLIGHT_BYTES` / 2 KiB + 2 per connection; connections are bounded by
+  the per-user and per-room caps and, as they come and go, by the join rate per principal.
+- **Frames in progress.** What a connection sent toward a message that is not complete yet (a
+  frame whose payload is still arriving, or the fragments of a message without its last one) is
+  held by `ws` and emits nothing: it is not in flight and not rate limited. It is bounded in size
+  by `maxPayload`, the message cap plus 64 KiB (`WS_PAYLOAD_SLACK`: a message a little over the
+  cap is still read and refused `4413` with the `too-large` notice; more closes `1009` unread; it
+  was a fixed 8 MiB, twice the chart's cap), and in time by the incoming deadline: the server
+  follows the frame headers of every read (`server/src/incoming.ts`) and drops a connection whose
+  unfinished message is older than `WS_INCOMING_TIMEOUT_MS` (30 s) + its bytes at
+  `WS_INCOMING_MIN_BYTES_PER_SEC` (32 KiB/s): 158 s for a 4 MiB message, and what `ws` held for it
+  is released. Control frames between fragments (pongs) do not extend it, so a client that never
+  sends the last fragment and answers every ping is dropped too (the idle drop only looks at
+  pongs). While the server does not read a connection (paused, above) its deadline waits. What it
+  does not bound: within its deadline a connection may hold up to `maxPayload`, and a client that
+  reconnects may do it again; there is no process-wide budget for it (the outgoing one has one).
 - **Watchdog.** Every request to a worker has a hard timeout. A client message (guard and
   apply together, one deadline): `WORKER_MESSAGE_TIMEOUT_MS` (1 000; an honest update missed 250
   under CPU contention, and a fresh worker's first message runs unoptimised code) +

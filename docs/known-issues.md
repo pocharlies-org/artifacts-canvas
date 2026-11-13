@@ -31,10 +31,11 @@ measurement: `server/test/inflight/flood.ts`; probe: `server/test/fv9/delete-bat
   (682 MiB of buffers, RSS +882 MiB); after, 9.9 MiB in flight at most from one connection and
   33 MiB from eight (buffers 31 and 90 MiB, the rest of each flood waiting in the client), RSS back
   under its baseline once done, and the honest pair in another room relayed every edit. Every
-  message also counts at least 1 KiB in flight (`INFLIGHT_MIN_COST`): a tiny update is a few bytes
-  but holds up to ~1 KiB while it waits, and by bytes alone 12 accounts x 8 connections sending
-  4-byte updates queued 19 200 messages (131 KiB counted, no connection paused), where now the cap
-  stops them at 4 192 (4 MiB cap, every connection paused; `fv9-review.test.ts`).
+  message also counts at least `INFLIGHT_MIN_COST` in flight (1 KiB first, 2 KiB since S8 measured
+  1.7 KiB): a tiny update is a few bytes but holds more while it waits, and by bytes alone 12
+  accounts x 8 connections sending 4-byte updates queued 19 200 messages (131 KiB counted, no
+  connection paused), where with the 1 KiB floor the cap stopped them at 4 192 (4 MiB cap, every
+  connection paused; `fv9-review.test.ts`).
 - [x] **F-1 — An honest bulk delete was struck (Medium).** A co-writer filled a shared board with
   10 400 shapes from one session; an honest user who selected half and pressed Delete was refused
   `4413` (the delete is estimated over `MAX_APPLY_MS`) **and struck**: three tries were a 10-minute
@@ -76,6 +77,39 @@ measurement: `server/test/inflight/flood.ts`; probe: `server/test/fv9/delete-bat
 - [x] **I-1 — "byte for byte".** A rebuilt room is the same document (content and state vector);
   its content's encoding differed in 8 of 168 rebuilds under concurrent edits (Yjs merged structs
   in another order), the ledger's never. The documentation says so now.
+
+### Second round (S8)
+
+What the in-flight bound of M-1 left out (security S8, Low while anonymous drawing is off: each
+needs many signed-in accounts acting together; it gates anonymous drawing, because with anonymous
+visitors accounts and connections are not scarce). Regressions: `server/test/fv9-review.test.ts`
+("S8", fail on the earlier code), `server/test/incoming.test.ts`.
+
+- [x] **S8 (i) — Read-ahead and churn past the cap.** `ws` emits every message of a read, also
+  after `pause()` (8.22.2: the receiver loops over what it was handed), so a connection added up to
+  `MSG_BURST` (240) messages past a cap from one read, and a new connection (a full bucket, nothing
+  in flight) as much again. Measured with the apply slot held: 96 connections sending 200 tiny
+  updates each in one write queued all 19 200 against a bound of 4 288 (4 MiB cap); 32 connections
+  that each opened, burst and closed queued 2 432 against 1 104 (1 MiB cap). Now a message that
+  arrives on a paused connection is refused `1013` `busy` (no strike; the client resends it after it
+  reconnected): 2 219 and 715 queued, under bounds of 2 240 and 720 (with the 2 KiB floor below).
+- [x] **S8 (ii) — Frames in progress.** `maxPayload` was a fixed 8 MiB (twice the 4 MiB cap), and a
+  client that sent fragments and never the last one, answering every ping, held them forever (the
+  idle drop looks at pongs only): 8 connections x 8 MiB per account, none of it in flight or rate
+  limited. Now `maxPayload` is the message cap plus 64 KiB, and a connection whose unfinished
+  message is older than `WS_INCOMING_TIMEOUT_MS` (30 s) + its bytes at
+  `WS_INCOMING_MIN_BYTES_PER_SEC` (32 KiB/s) is dropped (protocol §12). Measured: 16 connections
+  each holding a 2 MiB first fragment and answering pings, 32 MiB held, dropped at 3.4 s (deadline
+  3 s in the test), the memory back to its baseline after a GC.
+- [ ] **S8 residual — Frames within their deadline (Low).** A connection may hold up to
+  `maxPayload` (4 MiB + 64 KiB) for its deadline (158 s for 4 MiB at the defaults), and a client
+  that reconnects may do it again, so an account's 8 connections can keep ~32 MiB held; there is no
+  process-wide budget for incoming bytes (there is one for outgoing), and the chart's memory formula
+  does not count them. Anonymous visitors (2 connections each) make this cheaper; a process-wide
+  incoming budget is the fix if anonymous drawing is turned on.
+- [x] **S8 — The floor of a queued message was an estimate.** `INFLIGHT_MIN_COST` was 1 KiB;
+  measured, a queued 4-byte update holds 1 689 bytes of the main thread's heap (Node 22.23.5,
+  x86-64, 11 520 messages, after a GC). Now 2 KiB.
 
 ## Ninth verification (fv9)
 

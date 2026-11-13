@@ -55,6 +55,8 @@ data:
   WS_JOIN_MIN_BYTES_PER_SEC: {{ int64 .Values.limits.wsJoinMinBytesPerSec | quote }}
   WS_PING_INTERVAL_MS: {{ int64 .Values.limits.wsPingIntervalMs | quote }}
   WS_STALL_MS: {{ int64 .Values.limits.wsStallMs | quote }}
+  WS_INCOMING_TIMEOUT_MS: {{ int64 .Values.limits.wsIncomingTimeoutMs | quote }}
+  WS_INCOMING_MIN_BYTES_PER_SEC: {{ int64 .Values.limits.wsIncomingMinBytesPerSec | quote }}
   SYNC_BYTES_PER_SEC: {{ int64 .Values.limits.syncBytesPerSec | quote }}
   SYNC_BURST_BYTES: {{ int64 .Values.limits.syncBurstBytes | quote }}
   ANON_SYNC_BYTES_PER_SEC: {{ int64 .Values.limits.anonSyncBytesPerSec | quote }}
