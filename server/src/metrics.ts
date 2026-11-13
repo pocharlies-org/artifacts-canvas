@@ -74,6 +74,22 @@ export class Metrics {
     help: 'Bytes held for all WebSocket peers (outgoing buffers; join payloads in flight counted once per room version)',
     registers: [this.registry],
   });
+  readonly inflightBytes = new Gauge({
+    name: 'canvas_ws_inflight_bytes',
+    help: 'Bytes of client messages received and not processed yet (waiting for their room and the apply slots), over all connections; bounded by WORKER_INFLIGHT_BYTES',
+    registers: [this.registry],
+  });
+  readonly wsPaused = new Counter({
+    name: 'canvas_ws_paused_total',
+    help: 'Connections the server stopped reading while their messages in flight were over a cap: the connection\'s own (why="connection"), its principal\'s over all its connections (why="principal"), or the server\'s (why="server")',
+    labelNames: ['why'],
+    registers: [this.registry],
+  });
+  readonly walFull = new Counter({
+    name: 'canvas_wal_full_total',
+    help: 'Writes refused (1013) because their room\'s write-ahead log is full: its saves keep failing',
+    registers: [this.registry],
+  });
   readonly roomMemory = new Gauge({
     name: 'canvas_room_memory_bytes',
     help: 'Estimated resident memory of the loaded rooms (ROOM_COST_FACTOR x content + ledger, plus a base per room)',

@@ -76,6 +76,12 @@ export class RoomManager {
   readonly strikes: StrikeBook;
   /** client messages processed at once over all rooms (Config.workerApplyConcurrency) */
   readonly applySlots: Semaphore;
+  /**
+   * Bytes of client messages received and not processed yet, over all connections (review M-1:
+   * they wait for their room's queue and the apply slots); kept under WORKER_INFLIGHT_BYTES by
+   * the WebSocket server (ws.ts admitInflight)
+   */
+  inflightBytes = 0;
 
   constructor(private readonly deps: ManagerDeps) {
     deps.metrics.roomMemoryBudget.set(deps.cfg.roomMemoryBudgetBytes);
@@ -114,6 +120,10 @@ export class RoomManager {
         log: this.deps.log,
         metrics: this.deps.metrics,
         onEmpty: (n) => this.rooms.delete(n),
+        // an idle room kept for its unsaved changes (saves were failing) goes once one succeeded
+        onSaved: (r) => {
+          if (r.idle && !r.disposed && this.rooms.get(r.name) === r) void this.leave(r.name, r);
+        },
         saveBudget: this.saveBudget,
         shareOf: (anonymous) => this.share(anonymous),
         applySlots: this.applySlots,
@@ -203,14 +213,19 @@ export class RoomManager {
     return roomCost(this.deps.cfg, bytes);
   }
 
-  /** Estimated memory of the loaded rooms: in total, and of the idle ones (evicted first under pressure). */
+  /**
+   * Estimated memory of the loaded rooms: in total, and of the idle ones (evicted first under
+   * pressure). A room's write-ahead log counts where it holds more than the room's own size
+   * (review F-6: while saves fail, edits that churn a small room grow the log, not the room).
+   */
   memory(): { total: number; idle: number } {
     let total = this.reserved;
     let idle = 0;
     for (const r of this.rooms.values()) {
-      const c = r.cost;
+      const c = r.cost + r.walExcess;
       total += c;
-      if (r.idle && !r.disposed) idle += c;
+      // a room whose changes are not in storage is not evicted (F-6): it is not free either
+      if (r.idle && !r.disposed && !r.unsaved) idle += c;
     }
     return { total, idle };
   }
@@ -437,13 +452,21 @@ export class RoomManager {
     await Promise.all(all);
   }
 
-  /** Last connection left: flush and evict (once: concurrent callers await the same eviction). */
+  /**
+   * Last connection left: flush and evict (once: concurrent callers await the same eviction). A room
+   * whose save failed stays loaded, its changes in its log, until a save reaches storage (its retries
+   * go on; review F-6, fv4 L2: the room was evicted and the edits since the last save were lost).
+   */
   leave(name: string, room: Room): Promise<void> {
     if (!room.idle) return Promise.resolve();
     let p = this.evicting.get(room);
     if (!p) {
       p = (async () => {
         await room.flush();
+        if (room.unsaved && !room.disposed) {
+          this.deps.log.warn({ room: name, walBytes: room.walBytes }, 'idle room kept loaded: its changes are not in storage yet (saves failing)');
+          return;
+        }
         if (room.idle && this.rooms.get(name) === room) {
           this.rooms.delete(name);
           room.dispose();

@@ -13,7 +13,7 @@ import { artifactState } from './expiry.js';
 import { TokenBucket, clientIp } from './limits.js';
 import { composeIdentity, sanitizeAwarenessUpdate } from './identity.js';
 import { AnonIssuer, assignNum } from './anon.js';
-import { applyEstimateMs, normalizeOrigin } from './config.js';
+import { applyEstimateMs, inflightConnBytes, normalizeOrigin } from './config.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
 import { ledgerBound, type RoomManager } from './rooms.js';
 import { BusyError, Room, RoomGone, bufferCap, limitBuffered, sendConn, sendWs, sentBytes, underBufferCap, type Conn } from './room.js';
@@ -72,8 +72,13 @@ export class WsServer {
    * a visitor cookie (`r:<key>`) and per client IP for anonymous joins (`i:<ip>`)
    */
   private readonly joins = new Map<string, TokenBucket>();
-  /** per principal (`u:<id>` / `a:<visitor>`): live connections and the CPU bucket they share */
-  private readonly principals = new Map<string, { conns: number; cpu: TokenBucket }>();
+  /**
+   * per principal (`u:<id>` / `a:<visitor>`): live connections, the CPU bucket they share, and
+   * the bytes of their messages in flight (review M-1)
+   */
+  private readonly principals = new Map<string, Principal>();
+  /** connections the server stopped reading for their messages in flight (review M-1) */
+  private readonly paused = new Set<Conn>();
   /** server CPU of all connections, and of all anonymous ones (fv5 M-5) */
   private readonly cpuAll: TokenBucket;
   private readonly cpuAnon: TokenBucket;
@@ -320,13 +325,14 @@ export class WsServer {
     });
   }
 
-  private principalOf(key: string, anonymous: boolean): { conns: number; cpu: TokenBucket } {
+  private principalOf(key: string, anonymous: boolean): Principal {
     const { cfg } = this.deps;
     let p = this.principals.get(key);
     if (!p) {
       p = {
         conns: 0,
         cpu: anonymous ? new TokenBucket(cfg.anonCpuMsPerSec, cfg.anonCpuBurstMs) : new TokenBucket(cfg.cpuMsPerSec, cfg.cpuBurstMs),
+        inflight: 0,
       };
       this.principals.set(key, p);
     }
@@ -338,7 +344,96 @@ export class WsServer {
     if (!p) return;
     p.conns = Math.max(0, p.conns - 1);
     // the CPU bucket outlives the connections until it refilled: reconnecting does not reset it
-    if (p.conns === 0 && p.cpu.full()) this.principals.delete(key);
+    if (p.conns === 0 && p.cpu.full() && p.inflight === 0) this.principals.delete(key);
+  }
+
+  // ---------- messages in flight (review M-1) ----------
+  //
+  // A client message (sync step 1, step 2, update) waits for its room's queue and the apply slots
+  // before its room's worker processes it; on main it was guarded and applied in the handler, so
+  // the one thread did not read the socket meanwhile and TCP backpressure bounded what a client
+  // could make the server hold. Now every such message counts, until it is processed, against:
+  //   its connection and its principal: at inflightConnBytes() (two messages of the largest size,
+  //     1 MiB at least) the connection is no longer read (ws.pause(): TCP backpressure again) until
+  //     they are processed;
+  //   the server: a message bigger than CPU_SHED_MIN_BYTES that would take the total past
+  //     WORKER_INFLIGHT_BYTES is refused (1013 `busy`: the client sends it again after it
+  //     reconnected), a small one (an honest edit) is taken and its connection, if it had more in
+  //     flight, is no longer read until the total is under the cap or its own messages are done.
+
+  /** What one connection, and its principal over all its connections, may have in flight before it is not read. */
+  private inflightCap(conn: Conn): number {
+    const { cfg } = this.deps;
+    return inflightConnBytes(conn.identity.anonymous ? cfg.anonMaxMessageBytes : cfg.maxMessageBytes);
+  }
+
+  /**
+   * Count a client message of `bytes` in flight (see above). Returns the release to call once it
+   * was processed, or null when it was refused (the connection is closed 1013).
+   */
+  private admitInflight(conn: Conn, bytes: number): (() => void) | null {
+    const { cfg, manager, metrics, log } = this.deps;
+    const over = manager.inflightBytes + bytes > cfg.workerInflightBytes;
+    if (over && bytes > cfg.cpuShedMinBytes) {
+      log.warn({ room: conn.artifactKey, user: conn.identity.id, bytes, inflight: manager.inflightBytes }, 'ws refused: messages in flight over WORKER_INFLIGHT_BYTES');
+      metrics.wsRejected.inc({ reason: 'inflight' });
+      sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+      this.closeConn(conn, CLOSE.tryAgain, 'server busy');
+      return null;
+    }
+    const p = this.principalOf(conn.principal, conn.identity.anonymous);
+    conn.inflight += bytes;
+    p.inflight += bytes;
+    manager.inflightBytes += bytes;
+    metrics.inflightBytes.set(manager.inflightBytes);
+    const cap = this.inflightCap(conn);
+    const why = conn.inflight >= cap ? 'connection' : p.inflight >= cap ? 'principal' : over && conn.inflight > bytes ? 'server' : null;
+    if (why) this.pause(conn, why);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      conn.inflight -= bytes;
+      p.inflight -= bytes;
+      manager.inflightBytes -= bytes;
+      metrics.inflightBytes.set(manager.inflightBytes);
+      if (this.paused.size) this.resumePaused();
+    };
+  }
+
+  /** Stop reading a connection (its messages in flight are over a cap). */
+  private pause(conn: Conn, why: 'connection' | 'principal' | 'server'): void {
+    if (conn.paused || conn.closing) return;
+    conn.paused = true;
+    this.paused.add(conn);
+    this.deps.metrics.wsPaused.inc({ why });
+    try {
+      conn.ws.pause();
+    } catch {
+      /* closing */
+    }
+  }
+
+  /** Read again every paused connection whose messages in flight, its principal's and the server's allow it. */
+  private resumePaused(): void {
+    const { cfg, manager } = this.deps;
+    for (const c of this.paused) {
+      if (c.closing || c.ws.readyState !== c.ws.OPEN) {
+        this.paused.delete(c);
+        c.paused = false;
+        continue;
+      }
+      const cap = this.inflightCap(c);
+      if (c.inflight >= cap || (this.principals.get(c.principal)?.inflight ?? 0) >= cap) continue;
+      if (c.inflight > 0 && manager.inflightBytes > cfg.workerInflightBytes) continue;
+      this.paused.delete(c);
+      c.paused = false;
+      try {
+        c.ws.resume();
+      } catch {
+        /* closing */
+      }
+    }
   }
 
   /**
@@ -504,7 +599,7 @@ export class WsServer {
         }
       }
     }
-    for (const [k, p] of this.principals) if (p.conns === 0 && p.cpu.full()) this.principals.delete(k);
+    for (const [k, p] of this.principals) if (p.conns === 0 && p.cpu.full() && p.inflight === 0) this.principals.delete(k);
     let out = this.outgoing();
     if (out.total > cfg.wsOutgoingBudgetBytes) {
       // over the budget: stalled peers first, then principals over their share, then the
@@ -638,6 +733,7 @@ export class WsServer {
         ? new TokenBucket(cfg.anonSyncBytesPerSec, cfg.anonSyncBurstBytes)
         : new TokenBucket(cfg.syncBytesPerSec, cfg.syncBurstBytes),
       cpu: this.principalOf(principal, identity.anonymous).cpu,
+      inflight: 0,
       principal,
       ip,
       resync: new TokenBucket(0.5, 20),
@@ -715,6 +811,7 @@ export class WsServer {
       conn.closing = true;
       conn.backlog = [];
       conn.backlogBytes = 0;
+      this.paused.delete(conn);
       if (conn.recheckTimer) clearInterval(conn.recheckTimer);
       room.detach(conn);
       // fv8 U2: a loader that left no longer pays for what the others keep open
@@ -830,6 +927,17 @@ export class WsServer {
   /** Close once (later messages of a closing connection are ignored). */
   private closeConn(conn: Conn, code: number, reason: string): void {
     conn.closing = true;
+    if (conn.paused) {
+      // read again so that the peer's close frame is seen (what it still sends is dropped unread
+      // above); a paused socket would be held until the close timeout
+      this.paused.delete(conn);
+      conn.paused = false;
+      try {
+        conn.ws.resume();
+      } catch {
+        /* gone */
+      }
+    }
     try {
       conn.ws.close(code, reason);
     } catch {
@@ -857,7 +965,9 @@ export class WsServer {
     if (type === MSG_SYNC) {
       const syncType = decoding.readVarUint(dec);
       if (syncType === syncProtocol.messageYjsSyncStep1) {
-        void this.answerStep1(conn, room, decoding.readVarUint8Array(dec));
+        const sv = decoding.readVarUint8Array(dec);
+        const release = this.admitInflight(conn, buf.byteLength);
+        if (release) void this.answerStep1(conn, room, sv).then(release, release);
         return;
       }
       // step 2 and update carry the same payload: varUint8Array(update) (y-protocols/sync:
@@ -877,7 +987,8 @@ export class WsServer {
         this.deps.metrics.wsRejected.inc({ reason: `write_${cool}` });
         return;
       }
-      void this.onUpdate(conn, room, update);
+      const release = this.admitInflight(conn, buf.byteLength);
+      if (release) void this.onUpdate(conn, room, update).then(release, release);
       return;
     }
     if (type === MSG_LEDGER) {
@@ -945,17 +1056,22 @@ export class WsServer {
             // more client blocks, than one update may carry: Yjs would copy, splice and scan for
             // seconds. Refused like an update too large: only the sender closes.
             // (the messages are the fv8 ones: log scrapers and the fv8 full-system spec look for them)
+            const deletes = check.deletesOnly;
             this.deps.log.warn(
-              { room: room.name, user: conn.identity.id, bytes: update.byteLength, why: check.bad ?? 'work', merges: check.merges },
+              { room: room.name, user: conn.identity.id, bytes: update.byteLength, why: check.bad ?? 'work', merges: check.merges, deletesOnly: deletes },
               check.bad === 'blocks' ? 'update refused: too many clients' : 'update refused: too many cuts',
             );
-            // fv9: an honest client practically never sends one (only a delete of thousands of
-            // shapes written in one session can be over MAX_APPLY_MS): a strike, like a worker fault,
-            // so that retrying costly messages ends in a cooldown
-            this.deps.manager.strikes.strike({ principal: conn.principal, anonymous: conn.identity.anonymous, ip: conn.ip }, check.bad ?? 'work');
-            sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
-            this.closeConn(conn, CLOSE.tooLarge, check.bad === 'blocks' ? 'update carries too many clients' : 'update cuts too many items');
-            this.deps.metrics.wsRejected.inc({ reason: check.bad === 'blocks' ? 'too_many_clients' : 'too_many_splits' });
+            // fv9: a strike, like a worker fault, so that retrying costly messages ends in a
+            // cooldown. Review F-1: not for a delete (no new struct): an honest bulk delete of
+            // thousands of shapes another session wrote can be one (a co-writer who filled the board
+            // made the deleter's three tries a 10-minute cooldown on every canvas), and the guard
+            // that refused it cost the server only its own time (charged to the sender's budget).
+            if (!deletes) this.deps.manager.strikes.strike({ principal: conn.principal, anonymous: conn.identity.anonymous, ip: conn.ip }, check.bad ?? 'work');
+            // the canvas is not full: a delete of fewer shapes at a time goes through (the editor
+            // deletes big selections in parts, CanvasDoc.delete)
+            sendWs(conn.ws, encodeNotice({ kind: deletes ? 'too-costly' : 'too-large' }));
+            this.closeConn(conn, CLOSE.tooLarge, check.bad === 'blocks' ? 'update carries too many clients' : deletes ? 'delete too costly: fewer shapes at a time' : 'update cuts too many items');
+            this.deps.metrics.wsRejected.inc({ reason: check.bad === 'blocks' ? 'too_many_clients' : deletes ? 'delete_too_costly' : 'too_many_splits' });
             return false;
           }
           const bad = check.bad;
@@ -963,6 +1079,17 @@ export class WsServer {
             this.deps.log.warn({ room: room.name, user: conn.identity.id, root: bad }, 'forbidden content write');
             this.closeConn(conn, CLOSE.forbidden, `write to ${bad} not allowed`);
             this.deps.metrics.wsRejected.inc({ reason: 'forbidden_write' });
+            return false;
+          }
+          // review F-6: the room's saves keep failing and its write-ahead log is full: nothing more
+          // is accepted until a save reaches storage (1013: the client keeps the edit and sends it
+          // again once it reconnected); what was accepted is in the log and saved with the next save
+          if (room.walFull) {
+            this.deps.log.error({ room: room.name, user: conn.identity.id, walBytes: room.walBytes }, 'update refused: write-ahead log full (saves are failing)');
+            this.deps.metrics.walFull.inc();
+            sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+            this.closeConn(conn, CLOSE.tryAgain, 'server busy');
+            this.deps.metrics.wsRejected.inc({ reason: 'wal_full' });
             return false;
           }
           // Document size cap (protocol §10), per connection: an update that would grow the room
@@ -1171,10 +1298,18 @@ export class WsServer {
         return;
       }
       sendWs(conn.ws, encodeNotice({ kind: 'revoked' }));
-      conn.ws.close(CLOSE.forbidden, 'authorization revoked');
+      // closing: updates of this connection still queued are dropped, not applied after the revoke
+      this.closeConn(conn, CLOSE.forbidden, 'authorization revoked');
       this.deps.metrics.wsRejected.inc({ reason: 'revoked' });
     }
   }
+}
+
+/** A principal (`u:<id>` / `a:<visitor>`): its live connections, their CPU bucket, their messages in flight (bytes). */
+interface Principal {
+  conns: number;
+  cpu: TokenBucket;
+  inflight: number;
 }
 
 /** An update whose apply is estimated under this (ms) is not checked against the CPU budgets first (fv8 P2). */

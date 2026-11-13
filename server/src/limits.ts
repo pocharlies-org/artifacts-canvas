@@ -57,6 +57,12 @@ export class TokenBucket {
     return this.capacity;
   }
 
+  /** Fill the bucket to its capacity (a debt is forgiven too). */
+  fill(): void {
+    this.tokens = this.capacity;
+    this.last = this.clock();
+  }
+
   /** True when the bucket is full again (an idle entry a map of buckets can forget). */
   full(): boolean {
     this.refill();

@@ -175,10 +175,22 @@ export interface Config {
   workerOpNsPerByte: number;
   /**
    * Client messages processed at once over all rooms (their guard and apply): each may use its
-   * worker's heap up to the worker's limit, so this bounds the memory of the messages in flight
-   * (the budget reserves one, see roomMemoryBudget()).
+   * worker's heap up to the worker's limit, so this bounds the memory of the messages being
+   * processed (the budget reserves one, see roomMemoryBudget()); the ones waiting for a slot are
+   * bounded by WORKER_INFLIGHT_BYTES.
    */
   workerApplyConcurrency: number;
+  /**
+   * Bytes of client messages (updates, sync steps) received and not processed yet, over all
+   * connections (review M-1: messages wait for their room's queue and the apply slots, and on
+   * main the TCP backpressure of the one thread bounded them; nothing did once they queued).
+   * Over it a message bigger than CPU_SHED_MIN_BYTES is refused (1013 `busy`: the client resends
+   * it after it reconnected); a small one is taken and its connection is no longer read until
+   * its own messages are processed. A connection, and a principal over all its connections, is
+   * no longer read while it has inflightConnBytes() in flight (TCP backpressure again).
+   * Default 64 MiB: Node buffers, outside every V8 heap (chart values.yaml, "Memory").
+   */
+  workerInflightBytes: number;
   /**
    * Strikes (fv9): a principal whose messages made WORKER_STRIKES worker faults within
    * WORKER_STRIKE_WINDOW_MS is refused joins and writes for WORKER_STRIKE_COOLDOWN_MS; anonymous
@@ -188,7 +200,11 @@ export interface Config {
   workerStrikeWindowMs: number;
   workerStrikeCooldownMs: number;
   workerAnonPoolStrikes: number;
-  /** Test only: a client update carrying `canvas-test-hook:<busy|alloc|throw>` makes the worker misbehave. Never in production. */
+  /**
+   * Test only: a client update carrying `canvas-test-hook:<busy|alloc|throw>` makes the worker
+   * misbehave. Never in production: with NODE_ENV=production (the image's) the server refuses to
+   * start with it, unless WORKER_TEST_HOOKS_IN_PRODUCTION is set too (the compose test stack).
+   */
   workerTestHooks: boolean;
   /** Attribution entries of shapes deleted longer ago than this are pruned from the ledger. */
   attributionRetentionDays: number;
@@ -416,6 +432,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     workerOpTimeoutMs: num(env, 'WORKER_OP_TIMEOUT_MS', 10_000),
     workerOpNsPerByte: num(env, 'WORKER_OP_NS_PER_BYTE', 2000),
     workerApplyConcurrency: num(env, 'WORKER_APPLY_CONCURRENCY', 1),
+    workerInflightBytes: num(env, 'WORKER_INFLIGHT_BYTES', 64 * 1024 * 1024),
     workerStrikes: num(env, 'WORKER_STRIKES', 3),
     workerStrikeWindowMs: num(env, 'WORKER_STRIKE_WINDOW_MS', 600_000),
     workerStrikeCooldownMs: num(env, 'WORKER_STRIKE_COOLDOWN_MS', 600_000),
@@ -479,12 +496,31 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const heapLimit = env.HEAP_LIMIT_MB !== undefined && env.HEAP_LIMIT_MB !== '' ? num(env, 'HEAP_LIMIT_MB', 0) * 1024 * 1024 : v8.getHeapStatistics().heap_size_limit;
   cfg.heapLimitSource = env.HEAP_LIMIT_MB ? 'env' : 'v8';
   deriveRoomLimits(cfg, heapLimit, envBudget);
+  // review F-5: refused, not only warned about (a room worker could grow to the whole heap, and
+  // one message that exhausts it would take every room with it)
   if (oldSpaceFlag(env)) {
-    cfg.memoryWarnings.unshift(
-      '--max-old-space-size is set (NODE_OPTIONS or the command line): it applies to every thread and overrides the heap limit of each room worker, so a message could make one worker grow to the whole heap; size the process with HEAP_LIMIT_MB instead',
+    throw new Error(
+      '--max-old-space-size is set (NODE_OPTIONS or the command line): it applies to every thread and overrides the heap limit of each room worker, so one message could make a worker grow to the whole heap and take the process down; remove it and size the process with HEAP_LIMIT_MB',
     );
   }
+  if (cfg.workerTestHooks && env.NODE_ENV === 'production' && !bool(env, 'WORKER_TEST_HOOKS_IN_PRODUCTION', false)) {
+    throw new Error('WORKER_TEST_HOOKS is set with NODE_ENV=production: the hooks let any writer make its room\'s worker misbehave; they are for the test stacks only (WORKER_TEST_HOOKS_IN_PRODUCTION=true overrides, deploy/compose)');
+  }
+  // at least one message of the largest size must fit, else the biggest honest message never would
+  if (cfg.workerInflightBytes < cfg.maxMessageBytes) {
+    throw new Error(`WORKER_INFLIGHT_BYTES (${cfg.workerInflightBytes}) must be >= MAX_MESSAGE_BYTES (${cfg.maxMessageBytes}, after the memory sizing)`);
+  }
   return cfg;
+}
+
+/**
+ * Bytes of messages one connection, and one principal over all its connections, may have in
+ * flight before the server stops reading it (review M-1): two messages of the largest size, 1 MiB
+ * at least. An honest tab has one small update in flight, a reconnecting one its step 2 (at most a
+ * room) and an edit or two.
+ */
+export function inflightConnBytes(maxMessageBytes: number): number {
+  return Math.max(2 * maxMessageBytes, 1024 * 1024);
 }
 
 /**
@@ -509,6 +545,16 @@ export const ROOM_COST_FACTOR = 44;
 export const SPLIT_WORK_NS = 6;
 export const SCAN_WORK_NS = 250;
 export const APPLY_NS_PER_BYTE = 100;
+
+/**
+ * The versions of Yjs and its libraries every cost constant here and in the guard
+ * (shared/src/stamper.ts: SPLIT_COST_BYTES, SPLIT_BASE_WORK, SPLIT_MOVE_DIVISOR, the merge and scan
+ * counts) was measured against: they mirror Yjs internals. A bump of any of them invalidates the
+ * calibration: re-run the fv8/fv9 adversarial suites (server/test/fv8.test.ts, fv9.test.ts,
+ * e2e-system/adversarial-fv8/fv9.spec.ts, the guard fuzzer) and only then update this list. A unit
+ * test (server/test/fv9-review.test.ts) fails while the lockfile and this list differ.
+ */
+export const CALIBRATED_WITH: Readonly<Record<'yjs' | 'lib0' | 'y-protocols', string>> = { yjs: '13.6.33', lib0: '0.2.120', 'y-protocols': '1.0.7' };
 
 /** Estimated Yjs apply time (ms) of an update of `bytes` with these cut and placement counts. */
 export function applyEstimateMs(bytes: number, splitWork: number, scanWork: number): number {
@@ -629,7 +675,7 @@ export function deriveRoomLimits(cfg: Config, heapLimit: number, envBudget: numb
     reserved = m;
     if (heapLimit - RUNTIME_RESERVE_BYTES - cfg.wsOutgoingBudgetBytes - cfg.workerApplyConcurrency * MESSAGE_COST_FACTOR * m < MIN_ROOM_MEMORY_BUDGET_BYTES) {
       warnings.push(
-        `the V8 heap (${MiB(heapLimit)}) is too small for the runtime (${MiB(RUNTIME_RESERVE_BYTES)}), WS_OUTGOING_BUDGET_BYTES (${MiB(cfg.wsOutgoingBudgetBytes)}) and one message: the room budget is at its floor (${MiB(MIN_ROOM_MEMORY_BUDGET_BYTES)}); raise --max-old-space-size or lower WS_OUTGOING_BUDGET_BYTES`,
+        `the V8 heap (${MiB(heapLimit)}) is too small for the runtime (${MiB(RUNTIME_RESERVE_BYTES)}), WS_OUTGOING_BUDGET_BYTES (${MiB(cfg.wsOutgoingBudgetBytes)}) and one message: the room budget is at its floor (${MiB(MIN_ROOM_MEMORY_BUDGET_BYTES)}); raise HEAP_LIMIT_MB or lower WS_OUTGOING_BUDGET_BYTES`,
       );
     }
   }

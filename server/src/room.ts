@@ -37,6 +37,10 @@ export interface Conn {
   syncBytes: TokenBucket;
   /** server CPU time (ms) spent on the messages of this connection's PRINCIPAL (shared, fv5 M-5) */
   cpu: TokenBucket;
+  /** bytes of its messages received and not processed yet (review M-1, ws.ts admitInflight) */
+  inflight: number;
+  /** the server stopped reading it until its messages in flight are processed (review M-1) */
+  paused?: boolean;
   /** CPU (ms) charged ahead for the apply of the message being processed (fv8 P2) */
   precharged?: number;
   /** `u:<user id>` or `a:<visitor nonce>`: the key of the per-principal limits */
@@ -95,6 +99,8 @@ export interface RoomDeps {
   metrics: Metrics;
   /** called after the last connection left and the room was flushed */
   onEmpty: (name: string) => void;
+  /** a save reached storage (an idle room kept for its unsaved changes can go now, review F-6) */
+  onSaved?: (room: Room) => void;
   /**
    * Server CPU for debounced saves, shared by every room (fv6 M-A): a save encodes the whole
    * room, so a client making tiny edits in several big rooms made the server encode each of
@@ -132,6 +138,13 @@ export interface UpdateHooks {
 }
 
 const MiB = 1024 * 1024;
+/**
+ * The write-ahead log of a room may hold this many rooms at the size cap (MAX_DOC_BYTES) before its
+ * writes are refused (review F-6: while saves fail, nothing else bounded it).
+ */
+export const WAL_MAX_DOCS = 4;
+/** A failed save is retried after SAVE_DEBOUNCE_MS x 2^failures, at most this (ms). */
+const SAVE_RETRY_MAX_MS = 30_000;
 /** Young generation of a room's worker (MiB). */
 export const WORKER_YOUNG_MB = 16;
 
@@ -150,9 +163,10 @@ export const WORKER_YOUNG_MB = 16;
  * queue (one at a time, in arrival order), and every request to the worker has a watchdog. A
  * worker that misses it, runs out of heap or crashes is terminated, the sender of the message
  * that caused it is closed (4413) and struck, and the room is rebuilt in a fresh worker from its
- * saved objects plus the log of every change since (never the offending message), byte for byte
- * the room it was; the connected clients are asked (sync step 1) for anything they hold that the
- * room does not.
+ * saved objects plus the log of every change since (never the offending message): the same
+ * document it was (the same content and state vector; the encoding can differ where Yjs merged
+ * structs in another order, the ledger's never did); the connected clients are asked (sync step 1)
+ * for anything they hold that the room does not.
  *
  * Both documents are persisted to object storage (two objects) with a debounce plus on
  * last-leave (protocol §8); a successful save truncates the log.
@@ -229,6 +243,9 @@ export class Room {
   private wal: { seq: number; entries: Emitted[] }[] = [];
   private walSeq = 0;
   walBytes = 0;
+  /** saves that failed in a row (a failed save is retried with a backoff, review F-6) */
+  private saveFailures = 0;
+  private retryTimer?: ReturnType<typeof setTimeout>;
   /** the object puts of a save in flight (a recovery reads storage once they are done) */
   private putting: Promise<void> = Promise.resolve();
   /** workers that faulted and were replaced (tests, logs) */
@@ -452,6 +469,9 @@ export class Room {
         if (c.closing || c === sender || c.joining) continue;
         sendConn(c, step1);
         c.resyncAsked = true;
+        // review F-4: the rebuild asked, not the client: its resync budget (the step 1s the server
+        // may send it for updates that do not integrate) starts full again
+        c.resync.fill();
       }
     } catch (err) {
       metrics.workerRecoveries.inc({ outcome: 'failed' });
@@ -638,6 +658,28 @@ export class Room {
   /** Content + ledger bytes (the size cap's and the memory budget's measure). */
   get bytes(): number {
     return this.approxBytes + this.ledgerApproxBytes;
+  }
+
+  /**
+   * The write-ahead log is full (review F-6): saves have kept failing and it holds more than
+   * WAL_MAX_DOCS rooms' worth of changes. Writes are refused (1013, the clients keep their edits and
+   * send them again once they reconnected) until a save reaches storage; nothing accepted is lost.
+   */
+  get walFull(): boolean {
+    return this.walBytes > WAL_MAX_DOCS * this.deps.cfg.maxDocBytes;
+  }
+
+  /**
+   * The last save failed and the room holds changes storage does not (review F-6): it is not evicted
+   * while so, idle or not (its retries go on), and does not count as free memory.
+   */
+  get unsaved(): boolean {
+    return this.saveFailures > 0 && this.dirty;
+  }
+
+  /** What the log holds beyond the room's own size (counted in the memory budget, RoomManager.memory). */
+  get walExcess(): number {
+    return Math.max(0, this.walBytes - this.bytes);
   }
 
   /** A joined connection: it counts for its principal (who keeps the room loaded). */
@@ -912,12 +954,25 @@ export class Room {
           i++;
         }
         if (i) this.wal.splice(0, i);
+        if (this.saveFailures) log.info({ room: this.name, failures: this.saveFailures }, 'canvas saved again');
+        this.saveFailures = 0;
         metrics.saves.inc({ outcome: 'ok' });
+        this.deps.onSaved?.(this);
       } catch (err) {
         if (this.disposed) return;
         this.dirty = true;
+        this.saveFailures++;
         metrics.saves.inc({ outcome: 'error' });
-        log.error({ err: String(err), room: this.name }, 'canvas save failed');
+        log.error({ err: String(err), room: this.name, failures: this.saveFailures, walBytes: this.walBytes }, 'canvas save failed');
+        // review F-6: retried by itself, with a backoff (before, only the next change scheduled one,
+        // and a room whose writes are refused for a full log, or an idle one, has none); a change
+        // meanwhile still saves after the debounce
+        if (!this.retryTimer && !this.broken) {
+          this.retryTimer = setTimeout(() => {
+            this.retryTimer = undefined;
+            void this.save();
+          }, Math.min(SAVE_RETRY_MAX_MS, this.deps.cfg.saveDebounceMs * 2 ** Math.min(this.saveFailures, 6)));
+        }
       } finally {
         metrics.saveDuration.observe((performance.now() - t0) / 1000);
       }
@@ -1028,6 +1083,8 @@ export class Room {
     this.disposed = true;
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = undefined;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
     this.awareness.destroy();
     this.contentSnap = null;
     this.ledgerSnap = null;

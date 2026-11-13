@@ -63,6 +63,8 @@ export class WorkerHost {
     this.worker = new Worker(url, {
       workerData: init,
       execArgv,
+      // the worker reads no environment: it does not get the process's (S3 keys, cookie secret)
+      env: {},
       resourceLimits: { maxOldGenerationSizeMb: limits.oldMb, maxYoungGenerationSizeMb: limits.youngMb },
       stdout: false,
       stderr: false,
