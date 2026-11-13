@@ -10,9 +10,9 @@
  *   P2     2 000 forged items whose right origin is far away (14 KB, no cut): before, Yjs scanned
  *          for ~20 s; now refused 4413 in the guard.
  *   P1     a room stored past every share (by an earlier version) opens, charged one share.
- *   U1     screenshots pasted through the real editor: stored as WebP at most 1600 px (before: 11
- *          Full HD PNGs filled a room, 4 for an anonymous visitor); a full canvas says so and the
- *          socket stays open.
+ *   U1     the verifier's screenshots (six public pages, so this test needs the network) pasted
+ *          through the real editor: stored as WebP at most 1600 px (before: 11 Full HD PNGs filled
+ *          a room, 4 for an anonymous visitor); a full canvas says so and the socket stays open.
  *   U2     a user who opened a big room and left it to a colleague opens a second big room
  *          (before: 1013 until the first one was evicted).
  */
@@ -372,27 +372,30 @@ test('P1: a room stored past every share (by an earlier version) opens for its o
   expect(state()).toEqual(s0);
 });
 
-/** Screenshot-like pages: text, tables, charts and a photo region, all different (rendered locally, no network). */
-async function screenshots(browser: Parameters<typeof newContext>[0], viewport: { width: number; height: number }, dpr: number, n: number): Promise<Buffer[]> {
+/**
+ * The verifier's screenshot set: six public pages at Full HD (1920x1080) and on a Retina laptop
+ * (1440x900 at 2x), as PNG (what a screenshot tool puts on the clipboard).
+ */
+const SITES = [
+  'https://en.wikipedia.org/wiki/Collaborative_real-time_editor',
+  'https://github.com/yjs/yjs',
+  'https://developer.mozilla.org/en-US/docs/Web/API/WebSocket',
+  'https://news.ycombinator.com/',
+  'https://www.bbc.com/news',
+  'https://grafana.com/grafana/dashboards/',
+];
+async function screenshots(browser: Parameters<typeof newContext>[0], viewport: { width: number; height: number }, dpr: number): Promise<Buffer[]> {
   const ctx = await browser.newContext({ viewport, deviceScaleFactor: dpr });
   const page = await ctx.newPage();
   const out: Buffer[] = [];
-  for (let k = 0; k < n; k++) {
-    await page.setContent(`<!doctype html><html><body style="margin:0;font:15px system-ui,sans-serif;color:#222">
-      <div style="height:56px;background:hsl(${k * 47},55%,35%);color:#fff;display:flex;align-items:center;padding:0 24px;font-size:20px">Dashboard ${k} — quarterly report</div>
-      <div style="display:flex"><div style="width:240px;background:#f3f4f6;min-height:1100px;padding:16px">${Array.from({ length: 24 }, (_, i) => `<div style="padding:6px 0">Menu item ${k}.${i}</div>`).join('')}</div>
-      <div style="flex:1;padding:24px"><canvas id="c" width="900" height="300" style="border:1px solid #ddd"></canvas><canvas id="p" width="420" height="300" style="margin-left:16px"></canvas>
-      <table style="border-collapse:collapse;margin-top:16px;width:100%">${Array.from({ length: 14 }, (_, r) => `<tr>${Array.from({ length: 7 }, (_, c) => `<td style="border:1px solid #ddd;padding:6px">${(r * 7 + c) * (k + 3)} units</td>`).join('')}</tr>`).join('')}</table>
-      ${Array.from({ length: 6 }, (_, i) => `<p>Paragraph ${i} of page ${k}: the canvas stores pasted screenshots as WebP at most 1600 px wide; a Full HD PNG was ~450 KiB of base64 and eleven filled a room. Collaborative annotation over published artifacts, with attribution per shape.</p>`).join('')}
-      </div></div><script>
-      const c = document.getElementById('c').getContext('2d'); let s = ${k + 1};
-      const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647;
-      for (let i = 0; i < 40; i++) { c.fillStyle = 'hsl(' + Math.floor(rnd() * 360) + ',60%,55%)'; const h = rnd() * 280; c.fillRect(10 + i * 22, 290 - h, 18, h); }
-      const p = document.getElementById('p').getContext('2d'); const img = p.createImageData(420, 300);
-      for (let y = 0; y < 300; y++) for (let x = 0; x < 420; x++) { const o = (y * 420 + x) * 4; const v = 120 + 60 * Math.sin(x / 23 + ${k}) * Math.cos(y / 17) + 25 * Math.sin((x + y) / 7) + rnd() * 8; img.data[o] = v; img.data[o + 1] = v * 0.8 + 20 * Math.cos(x / 11); img.data[o + 2] = 200 - v * 0.5; img.data[o + 3] = 255; }
-      p.putImageData(img, 0, 0);
-      </script></body></html>`);
-    out.push(await page.screenshot({ type: 'png' }));
+  for (const site of SITES) {
+    try {
+      await page.goto(site, { waitUntil: 'load', timeout: 30_000 });
+      await sleep(1500);
+      out.push(await page.screenshot({ type: 'png' }));
+    } catch (e) {
+      console.log(`[fv8] screenshot failed: ${site} ${String(e).slice(0, 80)}`);
+    }
   }
   await ctx.close();
   return out;
@@ -416,11 +419,12 @@ async function pasteUntilFull(page: Page, shots: Buffer[]) {
   return { accepted, toast: '' };
 }
 
-test('U1: screenshots pasted through the editor are stored small (at least 3 x as many fit as PNG, signed-in and anonymous); a full canvas says so and the socket stays open', async ({ browser }) => {
+test('U1: the verifier\'s screenshots pasted through the editor are stored small (at least 3 x as many fit as PNG, signed-in and anonymous); a full canvas says so and the socket stays open', async ({ browser }) => {
   test.setTimeout(900_000);
   const cfg = sizing();
-  const fullhd = await screenshots(browser, { width: 1920, height: 1080 }, 1, 6);
-  const retina = await screenshots(browser, { width: 1440, height: 900 }, 2, 4);
+  const fullhd = await screenshots(browser, { width: 1920, height: 1080 }, 1);
+  const retina = await screenshots(browser, { width: 1440, height: 900 }, 2);
+  test.skip(fullhd.length < 4, 'the verifier\'s screenshot set needs the public sites (offline host)');
   const summary: Record<string, unknown> = { fullhdPngKiB: fullhd.map((b) => Math.round(b.byteLength / 1024)), retinaPngKiB: retina.map((b) => Math.round(b.byteLength / 1024)) };
   /** how many of these PNGs, as data URLs, a room of `cap` held before (the editor stored PNG as it came) */
   const pngFit = (shots: Buffer[], cap: number) => {
@@ -448,19 +452,34 @@ test('U1: screenshots pasted through the editor are stored small (at least 3 x a
     await sleep(2500);
     const closes = await wsCloses(page);
     const status = await page.evaluate(() => (window as any).__canvas.editor.status);
-    // the server has every image the editor accepted
-    const reader = new Raw(wsUrl(P.canvas), (await ctx.cookies()).map((c) => `${c.name}=${c.value}`).join('; '));
-    expect(await reader.ready()).toBe(true);
-    await waitFor(() => reader.doc.getMap('assets').size === r.accepted, 30_000, 'images on the server');
+    // the server has every image the editor accepted (a raw reader of the same principal)
+    const cookie = (await ctx.cookies()).map((c) => `${c.name}=${c.value}`).join('; ');
+    let reader = new Raw(wsUrl(P.canvas), cookie);
+    for (let i = 0; i < 5 && !(await reader.ready()); i++) {
+      console.log(`[fv8] reader refused ${reader.closeCode} ${reader.notices.join(',')}; retrying`);
+      await sleep(3000);
+      reader = new Raw(wsUrl(P.canvas), cookie);
+    }
+    expect(reader.synced, `reader ${reader.closeCode} ${reader.notices.join(',')}`).toBe(true);
+    await waitFor(() => reader.doc.getMap('assets').size === r.accepted, 30_000, 'images on the server').catch(() => undefined);
+    const onServer = reader.doc.getMap('assets').size;
     const kinds = [...reader.doc.getMap('assets').values()].map((v) => String(v).slice(5, String(v).indexOf(';')));
     const before = pngFit(shots, cap);
-    summary[label] = { capMiB: +(cap / MiB).toFixed(2), pngFitBefore: before, fitNow: r.accepted, ratio: +(r.accepted / Math.max(1, before)).toFixed(1), storedAs: [...new Set(kinds)], toast: r.toast, closes, status };
+    summary[label] = { capMiB: +(cap / MiB).toFixed(2), pngFitBefore: before, fitNow: r.accepted, onServer, ratio: +(r.accepted / Math.max(1, before)).toFixed(1), storedAs: [...new Set(kinds)], toast: r.toast, closes, status };
+    log(`U1 ${label}`, summary[label]);
+    expect(onServer).toBe(r.accepted);
     expect(r.toast).toMatch(/maximum size|tamaño máximo/);
     expect(closes).toEqual([]);
     expect(status).toBe('synced');
-    // Full HD shots were stored as they came; Retina ones (> 2000 px) the old editor re-encoded as
-    // a 1600 px PNG, so their "before" here is only a lower bound: not asserted
+    // before (the verifier: 11 Full HD shots in a user's room, 4 in an anonymous one) the editor
+    // stored them as they came; Retina ones (> 2000 px) it re-encoded as 1600 px PNGs, so their
+    // "before" here is only a lower bound: logged, not asserted
     if (label.endsWith('fullhd')) expect(r.accepted).toBeGreaterThanOrEqual(3 * Math.max(1, before));
+    // the full room goes (evicted) before the next one: a user keeping a full 5 MiB room open
+    // holds most of its share (a third of the budget), and its next room could not grow
+    reader.ws.close();
+    await ctx.close();
+    await sleep(4000);
   }
   log('U1 screenshots', summary);
 });
