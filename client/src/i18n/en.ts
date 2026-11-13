@@ -30,6 +30,7 @@ export const en: Record<MessageKey, string> = {
   'app.notice.readonly': 'You can only view the annotations.',
   'app.notice.rate-limited': 'Too many changes at once; wait a moment.',
   'app.notice.too-large': 'The canvas reached its maximum size.',
+  'app.notice.too-costly': 'That change was too large to apply at once; delete fewer shapes at a time.',
   'app.notice.shutdown': 'The server is restarting; reconnecting…',
   'app.notice.busy': 'The server is busy; reconnecting…',
   'app.notice.closed': 'Connection closed by the server ({code}).',

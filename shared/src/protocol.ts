@@ -24,8 +24,10 @@ export const MSG_LEDGER = 102;
 /**
  * `busy`: the server is over a capacity budget (connections, outgoing bytes, CPU) and closed
  * the connection with 1013; the client reconnects by itself.
+ * `too-costly`: a delete the server would need too long to apply at once (thousands of shapes);
+ * closed 4413 like `too-large`, but the canvas is not full: deleting fewer shapes at a time works.
  */
-export type NoticeKind = 'revoked' | 'expired' | 'readonly' | 'rate-limited' | 'too-large' | 'shutdown' | 'busy';
+export type NoticeKind = 'revoked' | 'expired' | 'readonly' | 'rate-limited' | 'too-large' | 'too-costly' | 'shutdown' | 'busy';
 
 export interface Notice {
   kind: NoticeKind;

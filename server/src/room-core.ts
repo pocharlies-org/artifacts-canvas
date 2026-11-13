@@ -172,7 +172,7 @@ export class RoomCore {
         maxClients: this.opts.maxClients,
       });
     } catch {
-      check = { bad: 'forbidden', writers: [], grows: false, splits: 0, splitWork: 0, scanWork: 0, merges: 0, shapes: 0, shapeKeyBytes: 0 };
+      check = { bad: 'forbidden', writers: [], grows: false, splits: 0, splitWork: 0, scanWork: 0, merges: 0, shapes: 0, shapeKeyBytes: 0, deletesOnly: false };
     }
     if (!check.bad) this.held = { update, check, writer };
     return check;

@@ -15,6 +15,9 @@ export { ROOT };
 const YTEXT_FIELDS = new Set(['text']);
 const YARRAY_FIELDS = new Set(['points']);
 
+/** Shapes one delete transaction (one update to the server) removes at most (see CanvasDoc.delete). */
+export const DELETE_BATCH = 1000;
+
 let idCounter = 0;
 export function newId(prefix = 's'): string {
   const rnd = Math.random().toString(36).slice(2, 10);
@@ -420,22 +423,34 @@ export class CanvasDoc {
     });
   }
 
+  /**
+   * Delete shapes. More than DELETE_BATCH of them go in several transactions (one update each,
+   * DELETE_BATCH shapes per update), still one undo step: the server refuses a delete it would
+   * need more than MAX_APPLY_MS for, and deleting thousands of shapes written from one session is
+   * one (Yjs splices that writer's struct array once per shape: 5 000 of 10 400 such shapes were
+   * refused in one update; docs/protocol.md §10).
+   */
   delete(ids: Iterable<string>) {
-    const set = new Set(ids);
-    if (!set.size) return;
-    this.transact(() => {
-      // Arrows bound to deleted shapes keep their last position, unbound.
-      for (const sid of this.shapes.keys()) {
-        if (set.has(sid)) continue;
-        const s = this.get(sid);
-        if (!s || (s.type !== 'arrow' && s.type !== 'line')) continue;
-        const patch: Record<string, unknown> = {};
-        if (s.start.bind && set.has(s.start.bind.shapeId)) patch.start = { x: s.start.x, y: s.start.y };
-        if (s.end.bind && set.has(s.end.bind.shapeId)) patch.end = { x: s.end.x, y: s.end.y };
-        if (Object.keys(patch).length) this.update(sid, patch);
-      }
-      for (const id of set) this.shapes.delete(id);
-    });
+    const all = [...new Set(ids)];
+    if (!all.length) return;
+    const set = new Set(all);
+    for (let i = 0; i < all.length; i += DELETE_BATCH) {
+      this.transact(() => {
+        if (i === 0) {
+          // Arrows bound to deleted shapes keep their last position, unbound.
+          for (const sid of this.shapes.keys()) {
+            if (set.has(sid)) continue;
+            const s = this.get(sid);
+            if (!s || (s.type !== 'arrow' && s.type !== 'line')) continue;
+            const patch: Record<string, unknown> = {};
+            if (s.start.bind && set.has(s.start.bind.shapeId)) patch.start = { x: s.start.x, y: s.start.y };
+            if (s.end.bind && set.has(s.end.bind.shapeId)) patch.end = { x: s.end.x, y: s.end.y };
+            if (Object.keys(patch).length) this.update(sid, patch);
+          }
+        }
+        for (const id of all.slice(i, i + DELETE_BATCH)) this.shapes.delete(id);
+      });
+    }
   }
 
   setStyle(ids: string[], style: Partial<Style>) {

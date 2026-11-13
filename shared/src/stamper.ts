@@ -327,6 +327,12 @@ export interface UpdateCheck {
    */
   shapes: number;
   shapeKeyBytes: number;
+  /**
+   * the update carries no new struct: only deletes (and structs the room has). Set on refusals
+   * too, once the structs were read: the server does not strike the sender of a delete the guard
+   * refuses for its work (an honest bulk delete can be one, see docs/protocol.md §10)
+   */
+  deletesOnly: boolean;
 }
 
 /**
@@ -424,7 +430,7 @@ export function forbiddenRootWrite(doc: Y.Doc, update: Uint8Array, opts: GuardOp
 
 /** forbiddenRootWrite plus the client ids the update writes with. */
 export function checkClientUpdate(doc: Y.Doc, update: Uint8Array, opts: GuardOptions = {}): UpdateCheck {
-  if (hasPending(doc)) return { bad: 'room-pending', writers: [], grows: false, splits: 0, splitWork: 0, scanWork: 0, merges: 0, shapes: 0, shapeKeyBytes: 0 };
+  if (hasPending(doc)) return { bad: 'room-pending', writers: [], grows: false, splits: 0, splitWork: 0, scanWork: 0, merges: 0, shapes: 0, shapeKeyBytes: 0, deletesOnly: false };
   return fastCheck(doc, update, opts);
 }
 
@@ -534,7 +540,9 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
   const serverClient = opts.serverClient ?? doc.clientID;
   const decoded = Y.decodeUpdate(update);
   const writers: number[] = [];
-  const no = (bad: string): UpdateCheck => ({ bad, writers, grows: false, splits: 0, splitWork: 0, scanWork: 0, merges: 0, shapes: 0, shapeKeyBytes: 0 });
+  /** known once the structs were read (see UpdateCheck.deletesOnly) */
+  let deletesOnly = false;
+  const no = (bad: string): UpdateCheck => ({ bad, writers, grows: false, splits: 0, splitWork: 0, scanWork: 0, merges: 0, shapes: 0, shapeKeyBytes: 0, deletesOnly });
   /** shape ids written or deleted (see UpdateCheck.shapes) */
   const touchedShapes = new Set<string>();
   const touchShape = (loc: Loc) => {
@@ -595,6 +603,7 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
     arr.push(s);
     if (s instanceof Y.Item) items.push(s);
   }
+  deletesOnly = fresh.size === 0;
 
   const findFresh = (id: Y.ID): Y.Item | Y.GC | null => {
     const arr = fresh.get(id.client);
@@ -1294,7 +1303,7 @@ function fastCheck(doc: Y.Doc, update: Uint8Array, opts: GuardOptions): UpdateCh
   }
   let shapeKeyBytes = 0;
   for (const k of touchedShapes) shapeKeyBytes += utf8Length(k);
-  return { bad: null, writers, grows: fresh.size > 0 || splits > 0, splits, splitWork, scanWork, merges, shapes: touchedShapes.size, shapeKeyBytes };
+  return { bad: null, writers, grows: fresh.size > 0 || splits > 0, splits, splitWork, scanWork, merges, shapes: touchedShapes.size, shapeKeyBytes, deletesOnly };
 }
 
 /** Clocks of [clock, clock + len) of `client` that the (canonical: sorted, disjoint) delete set deletes. */
