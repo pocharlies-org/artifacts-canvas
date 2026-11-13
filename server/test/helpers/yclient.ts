@@ -66,9 +66,11 @@ export class TestClient {
         encoding.writeVarUint(e, 0);
         syncProtocol.writeSyncStep1(e, this.doc);
         ws.send(encoding.toUint8Array(e));
-        // IDENTITY follows the upgrade once the room is loaded: resolve when it arrived (or
-        // the server closed), so callers can assert on `identity` right away
-        waitFor(() => this.lastIdentity !== null || ws.readyState !== WebSocket.OPEN, 3000).then(resolve, () => resolve());
+        // resolve once the join is complete — the server's sync step 1 comes after the identity,
+        // the ledger and the content (fv9: the frames come from the room's worker, so the content
+        // can arrive a while after the identity) — or the server closed, so callers can assert on
+        // `identity` and on the room's documents right away
+        waitFor(() => this.step1Received > 0 || ws.readyState !== WebSocket.OPEN, 15_000).then(resolve, () => resolve());
       });
       ws.on('error', reject);
       ws.on('close', (code) => {
