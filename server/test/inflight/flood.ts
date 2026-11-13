@@ -9,7 +9,12 @@
  * socket buffer), so what the server holds is what it chose to read.
  *
  *   npm run build -w shared -w server
- *   npx tsx server/test/inflight/flood.ts [serverEntry=server/dist/index.js] [conns=1] [messages=100]
+ *   npx tsx server/test/inflight/flood.ts [serverEntry=server/dist/index.js] [conns=1] [messages=100] [kind=image|shapes]
+ *
+ * kind: what the writer's room holds and every message re-sends: `image`, one 3.9 MiB image it wrote
+ * (cheap to process: the server nearly keeps up with a fast link), or `shapes`, 9 000 shapes a
+ * co-writer's session stored (3.3 MiB of structs the guard walks one by one: slower to process
+ * than the link delivers).
  *
  * Prints one JSON line. Against a build without the in-flight cap (the fv9 branch before the
  * review) the RSS follows what the link delivers; with it, it stays near the baseline.
@@ -23,12 +28,14 @@ import { startFakeCore, allowUser } from '../../../dev/fake-core.js';
 import { startS3Mock } from '../../../dev/s3-mock.js';
 import { TEST_ORIGIN, TestClient, waitFor } from '../helpers/yclient.js';
 import { syncMsg } from '../fv9/craft.js';
+import { testCore } from '../helpers/core.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, '..', '..', '..');
 const entry = path.resolve(process.argv[2] ?? path.join(repo, 'server', 'dist', 'index.js'));
 const CONNS = Number(process.argv[3] ?? 1);
 const MESSAGES = Number(process.argv[4] ?? 100);
+const KIND = (process.argv[5] ?? 'image') as 'image' | 'shapes';
 const MiB = 1024 * 1024;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const mib = (b: number) => Math.round((b / MiB) * 10) / 10;
@@ -111,16 +118,40 @@ const join = async (key: string, cookie: string) => {
   return c;
 };
 
-// the writer's room holds one 3.9 MiB image (accepted: under the 5 MiB room and 4 MiB message caps)
-const m0 = await join(floodKey, 'sid=mallory');
-m0.doc.transact(() => {
-  m0.doc.getMap('assets').set('a0', 'data:image/png;base64,' + 'A'.repeat(Math.floor(3.9 * MiB)));
+// the writer's room: one 3.9 MiB image it writes, or 9 000 shapes stored by a co-writer's session
+// (under the 5 MiB room and 4 MiB message caps)
+const mapOf = (o: Record<string, unknown>) => {
   const s = new Y.Map<unknown>();
-  for (const [k, v] of Object.entries({ id: 'i0', type: 'image', assetId: 'a0', x: 0, y: 0, w: 60, h: 40, rotation: 0, index: 0, groupId: '', locked: false, opacity: 1 })) s.set(k, v);
-  m0.doc.getMap('shapes').set('i0', s);
-});
+  for (const [k, v] of Object.entries(o)) s.set(k, v);
+  return s;
+};
+if (KIND === 'shapes') {
+  const room = testCore(1000);
+  const d = new Y.Doc();
+  const origin = { identity: { id: 'sam@corp', name: 'sam', anonymous: false, color: '#000' } };
+  for (let b = 0; b < 9000; b += 500) {
+    const sv = Y.encodeStateVector(d);
+    d.transact(() => {
+      for (let i = b; i < b + 500; i++) d.getMap('shapes').set(`f${i}`, mapOf({ id: `f${i}`, type: 'geo', geo: 'rectangle', x: i, y: i, w: 10, h: 10, rotation: 0, index: i, groupId: '', locked: false, color: 'black', fill: 'none', dash: 'solid', size: 'm', font: 'draw', arrowheads: 'end', opacity: 1 }));
+    });
+    Y.applyUpdate(room.doc, Y.encodeStateAsUpdate(d, sv), origin);
+  }
+  const saved = room.save();
+  const now = new Date().toUTCString();
+  s3.objects.set(`_plugins/canvas/${floodKey}.ydoc`, { body: saved.content, lastModified: now } as never);
+  s3.objects.set(`_plugins/canvas/${floodKey}.ydoc.ledger`, { body: saved.ledger, lastModified: now } as never);
+}
+const m0 = await join(floodKey, 'sid=mallory');
+if (KIND === 'image') {
+  m0.doc.transact(() => {
+    m0.doc.getMap('assets').set('a0', 'data:image/png;base64,' + 'A'.repeat(Math.floor(3.9 * MiB)));
+    m0.doc.getMap('shapes').set('i0', mapOf({ id: 'i0', type: 'image', assetId: 'a0', x: 0, y: 0, w: 60, h: 40, rotation: 0, index: 0, groupId: '', locked: false, opacity: 1 }));
+  });
+} else {
+  await waitFor(() => m0.doc.getMap('shapes').size === 9000, 30_000, 'room synced');
+}
 await sleep(3000);
-if (m0.closeCode !== null) throw new Error(`the image was refused: ${m0.closeCode}\n${log}`);
+if (m0.closeCode !== null) throw new Error(`the writer was closed before the flood: ${m0.closeCode}\n${log}`);
 const flood = syncMsg(Y.encodeStateAsUpdate(m0.doc));
 
 // the honest pair in another room
@@ -199,12 +230,13 @@ for (const [k, v] of mm) {
 }
 const ls = [...lat].sort((a, b) => a - b);
 console.log(JSON.stringify({
-  node: process.version, entry: path.relative(repo, entry), conns: CONNS, messageMiB: mib(flood.byteLength), messagesPerConn: MESSAGES,
+  node: process.version, entry: path.relative(repo, entry), kind: KIND, conns: CONNS, messageMiB: mib(flood.byteLength), messagesPerConn: MESSAGES,
   sent: sent.reduce((a, b) => a + b, 0), sentMiB: mib(sent.reduce((a, b) => a + b, 0) * flood.byteLength), floodMs,
   floodCloses: floods.map((c) => c.closeCode),
   baselineRssMiB: Math.round(baseline), peakRssMiB: Math.round(peakRss), peakOverBaselineMiB: Math.round(peakRss - baseline), afterRssMiB: Math.round(after),
   peakInflightMiB: mib(peakInflight), baseExternalMiB: mib(baseExternal), peakExternalMiB: mib(peakExternal),
   paused: sumOf(mm, 'canvas_ws_paused_total'), rejected,
+  workerReplies: mm.get('canvas_worker_reply_seconds_count') ?? null, pendingResync: mm.get('canvas_pending_resync_total') ?? null,
   honest: { edits, relayed: lat.length, p50: ls[Math.floor(ls.length / 2)] ?? null, p95: ls[Math.floor(ls.length * 0.95)] ?? null, max: ls[ls.length - 1] ?? null, anaClose: ana.closeCode, bobClose: bob.closeCode },
   serverExited: exited,
 }));

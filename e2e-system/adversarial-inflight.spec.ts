@@ -2,12 +2,16 @@
  * Review M-1 on the full system (the canvas under the chart's memory limit, the real core): client
  * messages wait for their room and the one apply slot, and nothing bounded what one writer could
  * make the canvas hold while they waited (on main the one thread did not read the socket meanwhile).
- * A signed-in member floods its own room with 4 MiB updates the guard accepts (re-sends of an image
- * the room holds), 100 of them from one connection and then 100 from each of 8 (MAX_CONNS_PER_USER),
- * each connection sending as fast as the canvas reads. The canvas must stop reading (TCP
- * backpressure), keep canvas_ws_inflight_bytes under WORKER_INFLIGHT_BYTES (64 MiB), its resident
- * memory within baseline + that cap + one message per connection + a margin, never restart; and a
- * signed-in user in another room keeps relaying edits to a second one.
+ * A signed-in member floods its room with 3.3 MiB updates the guard accepts: re-sends of the 9 000
+ * shapes a co-writer's session stored there (as an honest reconnect re-sends structs; the guard walks
+ * them one by one, so the canvas processes them slower than the link delivers them), 100 from one
+ * connection and then 100 from each of 8 (MAX_CONNS_PER_USER), each connection sending as fast as the
+ * canvas reads. The canvas must stop reading (TCP backpressure), keep canvas_ws_inflight_bytes under
+ * WORKER_INFLIGHT_BYTES (64 MiB), its memory (cgroup) within baseline + that cap + one message being
+ * read per connection + one message being processed in a worker (60 x 4 MiB) + 96 MiB, never
+ * restart; and a signed-in user in another room keeps relaying edits to a second one. Measured
+ * before the fix (server/test/inflight/flood.ts, x86): one connection made the canvas hold 344 MiB of
+ * buffers (+508 MiB RSS), eight connections of 25 messages 682 MiB (+882 MiB RSS).
  */
 import { execFileSync } from 'node:child_process';
 import { expect, test, type BrowserContext } from '@playwright/test';
@@ -15,7 +19,7 @@ import WebSocket from 'ws';
 import * as Y from 'yjs';
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
-import { BASE, container, newContext, openWithLogin, publish, type UserName } from './lib';
+import { BASE, container, mc, newContext, openWithLogin, publish, type UserName } from './lib';
 
 test.describe.configure({ mode: 'serial' });
 const MiB = 1024 * 1024;
@@ -156,7 +160,9 @@ async function flood(url: string, cookie: string, msg: Uint8Array, conns: number
   const t0 = Date.now();
   const r0 = restarts();
   const base = cgroupMiB();
-  const baseRss = metrics().get('process_resident_memory_bytes')! / MiB;
+  const m0 = metrics();
+  const baseRss = m0.get('process_resident_memory_bytes')! / MiB;
+  const delta = (m: Map<string, number>, prefix: string) => sum(m, prefix) - sum(m0, prefix);
   let peak = { cgroup: base, rss: baseRss, inflight: 0, external: 0 };
   let sampling = true;
   const sampler = (async () => {
@@ -195,7 +201,8 @@ async function flood(url: string, cookie: string, msg: Uint8Array, conns: number
     conns, sent: sent.reduce((a, b) => a + b, 0), floodMs: Date.now() - t0, closes: cs.map((c) => c.closeCode),
     baseCgroupMiB: Math.round(base), peakCgroupMiB: Math.round(peak.cgroup), baseRssMiB: Math.round(baseRss), peakRssMiB: Math.round(peak.rss),
     peakInflightMiB: Math.round(peak.inflight * 10) / 10, peakExternalMiB: Math.round(peak.external),
-    paused: sum(m, 'canvas_ws_paused_total'), refusedInflight: sum(m, 'canvas_ws_rejected_total{reason="inflight"}'), cpuPrecharge: sum(m, 'canvas_ws_rejected_total{reason="cpu_precharge"}'),
+    paused: delta(m, 'canvas_ws_paused_total'), refusedInflight: delta(m, 'canvas_ws_rejected_total{reason="inflight"}'),
+    cpu: delta(m, 'canvas_ws_rejected_total{reason="cpu_precharge"}') + delta(m, 'canvas_ws_rejected_total{reason="cpu_budget"}'),
     restarts: restarts() - r0, oomKilled: oomKilled(),
   };
   for (const c of cs) c.ws.terminate();
@@ -204,8 +211,8 @@ async function flood(url: string, cookie: string, msg: Uint8Array, conns: number
 
 test('M-1 live: a writer flooding 4 MiB updates from one and from 8 connections: the canvas stops reading, holds at most WORKER_INFLIGHT_BYTES in flight, its memory stays bounded, it never restarts, and another room keeps relaying', async ({ browser }) => {
   test.setTimeout(900_000);
-  // user1 floods (no strike is involved: what stops it is the backpressure, the in-flight cap and its
-  // CPU budget, 1013); user2 is the honest pair
+  // user1 floods (what stops it is the backpressure, the in-flight cap and its CPU budget, not a
+  // strike: the re-sends are accepted); user2 is the honest pair
   const c1 = await cookieOf(browser, 'user1');
   const c2 = await cookieOf(browser, 'user2');
   const other = publish({ users: ['test2@example.com'] }, `inflight-other-${Date.now()}`);
@@ -213,17 +220,24 @@ test('M-1 live: a writer flooding 4 MiB updates from one and from 8 connections:
   const bob = new Raw(wsUrl(other.canvas), c2);
   expect(await ana.ready()).toBe(true);
   expect(await bob.ready()).toBe(true);
-  // the flooder's own room holds one 3.9 MiB image (under the 5 MiB room and 4 MiB message caps)
+  // the flooder's room: 9 000 shapes a co-writer's session stored (written to MinIO before anyone
+  // joins; under the 5 MiB room cap), re-sent whole by every message (3.3 MiB < the 4 MiB cap)
   const room = publish({ users: ['test@example.com'] }, `inflight-flood-${Date.now()}`);
+  {
+    // the content object alone (a room stored before it had a ledger loads with an empty one)
+    const d = new Y.Doc();
+    d.transact(() => {
+      for (let i = 0; i < 9000; i++) d.getMap('shapes').set(`f${i}`, mapOf(geo(`f${i}`, i)));
+    });
+    expect(mc(`mc pipe "local/artifacts/_plugins/canvas/${room.key}.ydoc" >/dev/null && echo ok`, Buffer.from(Y.encodeStateAsUpdate(d))).out.trim()).toBe('ok');
+  }
   const w = new Raw(wsUrl(room.canvas), c1);
   expect(await w.ready()).toBe(true);
-  w.doc.transact(() => {
-    w.doc.getMap('assets').set('a0', 'data:image/png;base64,' + 'A'.repeat(Math.floor(3.9 * MiB)));
-    w.doc.getMap('shapes').set('i0', mapOf({ id: 'i0', type: 'image', assetId: 'a0', x: 0, y: 0, w: 60, h: 40, rotation: 0, index: 0, groupId: '', locked: false, opacity: 1 }));
-  });
-  await sleep(4000);
-  expect(w.closeCode).toBeNull();
+  const t0 = Date.now();
+  while (w.doc.getMap('shapes').size < 9000 && Date.now() - t0 < 30_000) await sleep(200);
+  expect(w.doc.getMap('shapes').size).toBe(9000);
   const msg = syncMsg(Y.encodeStateAsUpdate(w.doc));
+  expect(msg.byteLength).toBeLessThan(4 * MiB);
   w.ws.close();
   await sleep(1000);
   const results: Record<string, unknown> = { messageMiB: Math.round((msg.byteLength / MiB) * 100) / 100 };
@@ -235,20 +249,22 @@ test('M-1 live: a writer flooding 4 MiB updates from one and from 8 connections:
     results[`conns${conns}`] = { ...r, honest };
     log(`${conns} connection(s)`, results[`conns${conns}`]);
     // bounded: the in-flight cap, and the memory within baseline + the cap + one message being read
-    // per connection + 192 MiB (the guard's and the apply's heap for a 4 MiB message, GC timing)
+    // per connection + one being processed in a worker (60 x 4 MiB, the chart's formula) + 96 MiB
+    // (allocator, GC timing). Before the fix one connection alone took the canvas +508 MiB.
     expect(r.peakInflightMiB).toBeLessThanOrEqual(64);
-    expect(r.peakCgroupMiB - r.baseCgroupMiB).toBeLessThanOrEqual(64 + conns * 4 + 192);
+    expect(r.peakCgroupMiB - r.baseCgroupMiB).toBeLessThanOrEqual(64 + conns * 4 + 240 + 96);
     expect(r.restarts).toBe(0);
     expect(r.oomKilled).toBe('false');
     // the canvas stopped reading (or closed) the flooding connections instead of buffering them
-    expect(r.paused + r.refusedInflight + r.cpuPrecharge).toBeGreaterThan(0);
+    expect(r.paused + r.refusedInflight).toBeGreaterThan(0);
     // the honest pair: never closed, every edit relayed
     expect(ana.closeCode).toBeNull();
     expect(bob.closeCode).toBeNull();
     expect(honest.relayed).toBeGreaterThan(0);
     // every edit relayed but the last one or two, still on their way when the count stopped
     expect(honest.lost).toBeLessThanOrEqual(2);
-    // CPU budget of the flooder: let it refill before the next round (its joins wait while in debt)
+    // CPU budget of the flooder: let it refill before the next round (its joins wait while in debt;
+    // a 4429 close is terminal for a browser, this client simply joins again)
     await sleep(25_000);
   }
   log('M-1', results);

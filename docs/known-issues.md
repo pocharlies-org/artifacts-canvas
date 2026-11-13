@@ -17,7 +17,13 @@ measurement: `server/test/inflight/flood.ts`; probe: `server/test/fv9/delete-bat
   processed: a connection, and a principal, with two messages of the largest size in flight (8 MiB)
   is no longer read (TCP backpressure again); a message over 16 KiB that would take the total past
   `WORKER_INFLIGHT_BYTES` (64 MiB) is refused `1013`; an honest edit is never refused for it
-  (protocol §12). The memory formula and the chart's render check count the cap.
+  (protocol §12). The memory formula and the chart's render check count the cap. Measured with
+  `server/test/inflight/flood.ts` (x86, Node 22, the chart's `HEAP_LIMIT_MB`; re-sends of a stored
+  9 000-shape room, 3.3 MiB each): before, one connection made the server read 330 MiB at once
+  (344 MiB of buffers, RSS +508 MiB, still +500 after) and eight connections of 25 messages 660 MiB
+  (682 MiB of buffers, RSS +882 MiB); after, 9.9 MiB in flight at most from one connection and
+  33 MiB from eight (buffers 31 and 90 MiB, the rest of each flood waiting in the client), RSS back
+  under its baseline once done, and the honest pair in another room relayed every edit.
 - [x] **F-1 — An honest bulk delete was struck (Medium).** A co-writer filled a shared board with
   10 400 shapes from one session; an honest user who selected half and pressed Delete was refused
   `4413` (the delete is estimated over `MAX_APPLY_MS`) **and struck**: three tries were a 10-minute

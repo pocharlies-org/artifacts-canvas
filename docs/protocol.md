@@ -822,7 +822,8 @@ bounded by isolation:
   `1013` `busy` (`canvas_ws_rejected_total{reason="inflight"}`), which is what bounds many
   principals together; a smaller one is taken (an honest edit is never refused for it) and its
   connection, if it has more in flight, is not read until the total is under the cap
-  (`why="server"`). What is held is `canvas_ws_inflight_bytes`. Beyond the cap, the bound is one
+  (`why="server"`). What is held is `canvas_ws_inflight_bytes`. A connection that stays unread
+  for two `WS_PING_INTERVAL_MS` rounds (its pongs are not read either) is dropped as idle. Beyond the cap, the bound is one
   message per connection being read when it was paused (the `ws` receiver's frame, at most its
   `maxPayload`, as on any connection).
 - **Watchdog.** Every request to a worker has a hard timeout. A client message (guard and
