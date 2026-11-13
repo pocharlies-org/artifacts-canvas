@@ -332,7 +332,8 @@ describe('fv6 H-1: loaded rooms are bounded by a memory budget', () => {
     void c.connect().catch(() => undefined);
     await waitFor(async () => app.manager.rooms.size === 1, 3000, 'load started');
     c.ws.terminate();
-    await sleep(800);
+    // fv9: the load also starts the room's worker; once it is in, the abandoned room is evicted
+    await waitFor(async () => app.manager.rooms.size === 0, 10_000, 'room evicted').catch(() => undefined);
     expect(app.manager.rooms.size).toBe(0);
   }, 30_000);
 });
@@ -424,15 +425,20 @@ describe('fv6 M-A: minted principals, shared join encodes, CPU debt', () => {
     share(key, 'bob');
     const bob = await join(app, key, 'sid=bob');
     await settled(bob, 4000);
+    // a reader sees each edit once the room's worker applied it (fv9: reading the room itself
+    // would encode it)
+    const reader = await join(app, key, 'sid=bob');
+    await settled(reader, 4000);
     const room = app.manager.get(key)!;
     const e0 = room.encodes;
     for (let i = 0; i < 300; i++) {
       (bob.doc.getMap('shapes').get('f2') as Y.Map<unknown>).set('x', i);
-      await waitFor(async () => ((await room.inspect()).doc.getMap('shapes').get('f2') as Y.Map<unknown>).get('x') === i, 3000, 'edit');
+      await waitFor(() => (reader.doc.getMap('shapes').get('f2') as Y.Map<unknown>).get('x') === i, 3000, 'edit');
       await room.step1Frame();
     }
     expect(room.encodes).toBe(e0);
     bob.close();
+    reader.close();
   }, 60_000);
 
   it('a principal in CPU debt joins nobody until its budget refilled (1013)', async () => {

@@ -401,8 +401,10 @@ export class Room {
     this.restarts++;
     metrics.workerFaults.inc({ kind: fault.kind });
     log.warn({ room: this.name, kind: fault.kind, err: fault.message, user: sender?.identity.id, walEntries: this.wal.length, walBytes: this.walBytes }, 'room worker fault: rebuilding the room');
+    // the strike counts also when the sender already went away (sending and disconnecting at once
+    // would otherwise evade it)
+    if (sender) this.deps.onStrike?.(sender, fault.kind);
     if (sender && !sender.closing) {
-      this.deps.onStrike?.(sender, fault.kind);
       sendWs(sender.ws, encodeNotice({ kind: 'too-large' }));
       sender.closing = true;
       try {
