@@ -779,7 +779,9 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
   });
 
   it('p4: anonymous visitors share one server-wide CPU share; a logged-in user is not shed by it', async () => {
-    const app = await startApp({ ANON_CPU_TOTAL_MS_PER_SEC: '1', ANON_CPU_TOTAL_BURST_MS: '1' });
+    // the burst covers the first write's estimate (fv8 P2: an update the budget cannot cover is
+    // refused before it is applied), which then spends it
+    const app = await startApp({ ANON_CPU_TOTAL_MS_PER_SEC: '1', ANON_CPU_TOTAL_BURST_MS: '50' });
     const key = 'pub/p4/index.html';
     core.rules.set(key, allowAnon());
     core.rulesByCookie.set(`sid=bob|${key}`, allowUser('bob@corp', 'Bob'));

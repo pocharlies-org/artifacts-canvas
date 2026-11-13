@@ -135,6 +135,18 @@ export interface Config {
   anonCpuTotalBurstMs: number;
   /** While a total CPU budget is used up, messages bigger than this are refused (1013, retry). */
   cpuShedMinBytes: number;
+  /**
+   * Cuts of items one update may make (fv8 P1/P2: every cut is a struct of its own in the stored
+   * room, and Yjs copies the item to make it; an insert between every two points of two strokes,
+   * 200 000 cuts in 3.97 MB, held the server for a minute and stored a room past every share).
+   * Over it, or over MAX_APPLY_MS, the sender is closed 4413 `too-large` and nothing is applied.
+   */
+  maxSplitsPerMessage: number;
+  /**
+   * Estimated Yjs time (ms) the cuts and placement of one update may take (applyEstimateMs()
+   * without the bytes term, with the costs measured on x86); over it the update is refused 4413.
+   */
+  maxApplyMs: number;
   /** Attribution entries of shapes deleted longer ago than this are pruned from the ledger. */
   attributionRetentionDays: number;
   /**
@@ -343,6 +355,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     anonCpuTotalMsPerSec: num(env, 'ANON_CPU_TOTAL_MS_PER_SEC', 150),
     anonCpuTotalBurstMs: num(env, 'ANON_CPU_TOTAL_BURST_MS', 1500),
     cpuShedMinBytes: num(env, 'CPU_SHED_MIN_BYTES', 16 * 1024),
+    maxSplitsPerMessage: num(env, 'MAX_SPLITS_PER_MESSAGE', 5000),
+    maxApplyMs: num(env, 'MAX_APPLY_MS', 50),
     attributionRetentionDays: num(env, 'ATTRIBUTION_RETENTION_DAYS', 30),
     anonMintRatePerMin: num(env, 'ANON_MINT_RATE_PER_MIN', 120),
     anonMintBurst: num(env, 'ANON_MINT_BURST', 60),
@@ -406,6 +420,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
  * with a text label 21.7x, strokes 4.2x). The worst, plus 10%.
  */
 export const ROOM_COST_FACTOR = 44;
+/**
+ * Yjs apply time of an update, per unit (fv8 P2, server/test/fv8/split-cpu-cal.ts, split-growth.ts
+ * and scan-probe.ts on x86-64, Node 22): UpdateCheck.splitWork (cuts: worst 4.5 ns per unit, a
+ * long points list cut in many places), UpdateCheck.scanWork (placement scans: 189-193 ns per
+ * item scanned) and the update's bytes (integrating its structs: 65 ns per byte for 20 000 new
+ * shapes). The worst measured plus 30-50%. The server refuses an update whose cuts and placement
+ * are estimated over MAX_APPLY_MS, and pre-charges the whole estimate to the CPU budgets before
+ * it applies one.
+ */
+export const SPLIT_WORK_NS = 6;
+export const SCAN_WORK_NS = 250;
+export const APPLY_NS_PER_BYTE = 100;
+
+/** Estimated Yjs apply time (ms) of an update of `bytes` with these cut and placement counts. */
+export function applyEstimateMs(bytes: number, splitWork: number, scanWork: number): number {
+  return (bytes * APPLY_NS_PER_BYTE + splitWork * SPLIT_WORK_NS + scanWork * SCAN_WORK_NS) / 1e6;
+}
+
 /** Resident cost of an empty loaded room (two documents, awareness, caches): measured 11-12 KiB. */
 export const ROOM_BASE_COST_BYTES = 32 * 1024;
 

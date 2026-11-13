@@ -14,7 +14,7 @@ import { artifactState } from './expiry.js';
 import { TokenBucket, clientIp } from './limits.js';
 import { composeIdentity, sanitizeAwarenessUpdate } from './identity.js';
 import { AnonIssuer, assignNum } from './anon.js';
-import { normalizeOrigin } from './config.js';
+import { SCAN_WORK_NS, SPLIT_WORK_NS, applyEstimateMs, normalizeOrigin } from './config.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
 import { ledgerBound, type RoomManager } from './rooms.js';
 import { BusyError, Room, bufferCap, limitBuffered, sendWs, sentBytes, underBufferCap, type Conn } from './room.js';
@@ -671,13 +671,16 @@ export class WsServer {
         return;
       }
       const t1 = performance.now();
+      conn.precharged = 0;
       try {
         this.onMessage(conn, room, buf);
       } catch (err) {
         log.warn({ err: String(err), room: artifactKey }, 'bad message');
         this.closeConn(conn, 1003, 'bad message');
       }
-      this.chargeCpu(conn, room, performance.now() - t1);
+      // what the message took, minus what was charged ahead for its apply (fv8 P2)
+      this.chargeCpu(conn, room, performance.now() - t1 - conn.precharged);
+      conn.precharged = 0;
       if (buf.byteLength > 256 * 1024) metrics.sampleHeap();
     });
     ws.on('pong', () => {
@@ -698,6 +701,8 @@ export class WsServer {
       conn.backlogBytes = 0;
       if (conn.recheckTimer) clearInterval(conn.recheckTimer);
       room.detach(conn);
+      // fv8 U2: a loader that left no longer pays for what the others keep open
+      if (!room.principals.has(conn.principal)) manager.handOver(room);
       awarenessProtocol.removeAwarenessStates(room.awareness, Array.from(conn.clientIds), null);
       metrics.connections.dec({ anonymous: identity.anonymous ? 'true' : 'false' });
       void manager.leave(artifactKey, room);
@@ -822,7 +827,7 @@ export class WsServer {
       if (conn.identity.readOnly) return;
       // Protocol §5.3: a write the content guard refuses closes the connection and the
       // update is NOT applied.
-      const check = checkClientUpdateSafe(room, conn, update);
+      const check = checkClientUpdateSafe(room, conn, update, cfg);
       if (check.bad === 'pending') {
         // fv5 M-2: an honest tab that reconnects with offline edits can send a fresh edit
         // before its step-2 answer (y-websocket sends local updates as soon as the socket is
@@ -831,6 +836,16 @@ export class WsServer {
         // asks with a step 1 for what it lacks, and the client's step-2 answer carries the
         // edit too. A connection that keeps sending updates that never integrate is closed.
         this.askResync(conn, room);
+        return;
+      }
+      if (check.bad === 'splits' || (!check.bad && applyEstimateMs(0, check.splitWork, check.scanWork) > cfg.maxApplyMs)) {
+        // fv8 P1/P2: more cuts of items (or more work to make and place them) than one update may
+        // make: Yjs would copy and scan for seconds (200 000 cuts held the server for a minute) and
+        // every cut grows the stored room. Refused like an update too large: only the sender closes.
+        this.deps.log.warn({ room: room.name, user: conn.identity.id, bytes: update.byteLength }, 'update refused: too many cuts');
+        sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
+        this.closeConn(conn, CLOSE.tooLarge, 'update cuts too many items');
+        this.deps.metrics.wsRejected.inc({ reason: 'too_many_splits' });
         return;
       }
       const bad = check.bad;
@@ -877,6 +892,26 @@ export class WsServer {
           return;
         }
       }
+      // fv8 P2: the CPU the apply will take is charged BEFORE it runs (the budgets were charged
+      // only after a message, so one message could hold the server for as long as it took): an
+      // update whose estimate the sender's budget or the server's cannot cover is refused 1013
+      // (busy: the client reconnects and sends it again once the budget refilled). One that costs
+      // more than half a burst needs half a burst (a bucket never holds more than its burst); a
+      // cheap one (under PRECHARGE_MIN_MS, the small edits fv5 M-5 lets through while the server is
+      // busy) is charged after, as before.
+      const estimate = applyEstimateMs(update.byteLength, check.splitWork, check.scanWork);
+      const covers = (b: TokenBucket) => b.level() >= Math.min(estimate, b.burst / 2);
+      if (estimate >= PRECHARGE_MIN_MS && (!covers(conn.cpu) || !covers(this.cpuAll) || (conn.identity.anonymous && !covers(this.cpuAnon)))) {
+        this.deps.log.warn({ room: room.name, user: conn.identity.id, estimateMs: Math.round(estimate) }, 'update refused: cpu budget');
+        sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+        this.closeConn(conn, CLOSE.tryAgain, 'server busy');
+        this.deps.metrics.wsRejected.inc({ reason: 'cpu_precharge' });
+        return;
+      }
+      conn.cpu.charge(estimate);
+      this.cpuAll.charge(estimate);
+      if (conn.identity.anonymous) this.cpuAnon.charge(estimate);
+      conn.precharged = estimate;
       // Apply with the connection as origin (the stamper attributes it to this identity).
       // applyGuarded ALWAYS drops whatever Yjs could not integrate, also when it throws
       // mid-way. A clean apply marks the room dirty through the document's update event;
@@ -1040,6 +1075,9 @@ export class WsServer {
   }
 }
 
+/** An update whose apply is estimated under this (ms) is not checked against the CPU budgets first (fv8 P2). */
+const PRECHARGE_MIN_MS = 1;
+
 /** An authz answer that says the core failed (not a decision): `core_error`, `malformed` (authz.ts). */
 function coreError(reason: string): boolean {
   return reason === 'core_error' || reason === 'malformed';
@@ -1049,14 +1087,18 @@ function coreError(reason: string): boolean {
  * The §5.3 guard with this connection's client-id ownership; it can throw on malformed
  * updates, and any throw counts as forbidden.
  */
-function checkClientUpdateSafe(room: Room, conn: Conn, update: Uint8Array): UpdateCheck {
+function checkClientUpdateSafe(room: Room, conn: Conn, update: Uint8Array, cfg: Config): UpdateCheck {
   try {
     return checkClientUpdate(room.doc, update, {
       serverClient: room.doc.clientID,
       mayWriteClient: (client) => room.mayWrite(client, conn.identity.id, conn),
+      // fv8 P1/P2: what the cuts and the placement of one update may cost Yjs (MAX_APPLY_MS)
+      maxSplits: cfg.maxSplitsPerMessage,
+      maxSplitWork: (cfg.maxApplyMs * 1e6) / SPLIT_WORK_NS,
+      maxScanWork: (cfg.maxApplyMs * 1e6) / SCAN_WORK_NS,
     });
   } catch {
-    return { bad: 'forbidden', writers: [], grows: false, splits: 0, shapes: 0, shapeKeyBytes: 0 };
+    return { bad: 'forbidden', writers: [], grows: false, splits: 0, splitWork: 0, scanWork: 0, shapes: 0, shapeKeyBytes: 0 };
   }
 }
 

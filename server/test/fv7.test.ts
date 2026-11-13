@@ -264,7 +264,7 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
     }, 120_000);
   }
 
-  it('a charge stays with the room after its principal leaves, until the room is evicted; readers pay nothing; growth is charged in full to its writer', async () => {
+  it('what a principal wrote stays charged to it after it leaves, until the room is evicted (its load charge moves to who keeps the room open: fv8 U2); readers pay nothing; growth is charged in full to its writer', async () => {
     const app = await startApp({ ROOM_MEMORY_BUDGET_BYTES: String(256 * MiB) });
     const mgr = app.manager;
     const key = 'u/d/index.html';
@@ -295,13 +295,17 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
     // the save measured the room: the charges add up to its cost, mallory's did not move
     expect(mgr.held('u:mallory@corp') + mgr.held('u:ana@corp') + mgr.held('u:carl@corp')).toBeCloseTo(room.cost, 0);
     expect(mgr.held('u:mallory@corp')).toBe(loaded);
-    // mallory and ana leave: carl keeps the room loaded, their charges stay (nothing became free)
+    // mallory and ana leave: carl keeps the room loaded. What ana wrote stays hers; the room's
+    // cost at load moves from mallory, who loaded it, to carl, who keeps it open (fv8 U2). Nothing
+    // became free: the charges still add up to the room's cost.
+    const anaWrote = mgr.held('u:ana@corp');
     m.close();
     a.close();
     await waitFor(() => room.principals.size === 1, 5000, 'left');
-    expect(mgr.held('u:mallory@corp')).toBe(loaded);
-    expect(mgr.held('u:ana@corp')).toBeGreaterThan(0);
-    expect(mgr.held('u:carl@corp')).toBe(0);
+    expect(mgr.held('u:mallory@corp')).toBe(0);
+    expect(mgr.held('u:ana@corp')).toBeCloseTo(anaWrote, 0);
+    expect(mgr.held('u:carl@corp')).toBeCloseTo(loaded, 0);
+    expect(mgr.held('u:mallory@corp') + mgr.held('u:ana@corp') + mgr.held('u:carl@corp')).toBeCloseTo(room.cost, 0);
     // the last reader leaves: the room is evicted and so are its charges
     c.close();
     await waitFor(() => !mgr.get(key), 5000, 'evicted');
@@ -406,23 +410,38 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
     for (const c of [...held, ...keepers, p6]) c.close();
   });
 
-  it('a stored room that costs more than the loader\'s whole share is refused 4413 too-large (it can never load for it); smaller rooms load', async () => {
+  it('a stored room that costs more than the loader\'s whole share loads, charged one share (fv8 P1: it was refused 4413 for good); only one the whole load budget cannot hold is refused 4413', async () => {
     const app = await startApp({ ROOM_MEMORY_BUDGET_BYTES: String(64 * MiB) });
     const big = 'u/big/index.html';
+    const huge = 'u/huge/index.html';
     const small = 'u/small/index.html';
     const bytes = await seed(big, 2000);
+    const hugeBytes = await seed(huge, 6000);
     await seed(small, 100);
     share(big, 'mallory');
+    share(huge, 'mallory');
     share(small, 'mallory');
     expect(roomCost(cfgOf(app), bytes)).toBeGreaterThan(app.manager.share(false));
     const c = await join(app, big, 'sid=mallory');
-    expect(await c.closed).toBe(4413);
-    expect(c.notices.map((n) => n.kind)).toContain('too-large');
-    expect(await rejected(app, 'room_too_large')).toBe(1);
-    expect(app.manager.get(big)).toBeUndefined();
+    expect(await joined(c)).toBeNull();
+    expect(c.doc.getMap('shapes').size).toBe(2000);
+    // charged one share, not the room's whole cost
+    expect(app.manager.held('u:mallory@corp')).toBeCloseTo(app.manager.share(false), 0);
+    // its share is used up: another room waits (1013, retryable), never 4413
     const s = await join(app, small, 'sid=mallory');
-    expect(await joined(s)).toBeNull();
-    s.close();
+    expect(await s.closed).toBe(1013);
+    c.close();
+    await waitFor(() => !app.manager.get(big), 5000, 'evicted');
+    const s2 = await join(app, small, 'sid=mallory');
+    expect(await joined(s2)).toBeNull();
+    s2.close();
+    // a room whose cost passes what the whole budget loads (85%) never loads here: 4413
+    expect(roomCost(cfgOf(app), hugeBytes)).toBeGreaterThan(64 * MiB * LOAD_FRACTION);
+    const h = await join(app, huge, 'sid=mallory');
+    expect(await h.closed).toBe(4413);
+    expect(h.notices.map((n) => n.kind)).toContain('too-large');
+    expect(await rejected(app, 'room_too_large')).toBe(1);
+    expect(app.manager.get(huge)).toBeUndefined();
   });
 
   it('the ledger an update adds is counted ahead by the shapes it touches: one big image in a new room fits a share (fv6 counted 2.6 x its size), a move of thousands of shapes counts their attribution', async () => {

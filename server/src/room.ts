@@ -35,6 +35,8 @@ export interface Conn {
   syncBytes: TokenBucket;
   /** server CPU time (ms) spent on the messages of this connection's PRINCIPAL (shared, fv5 M-5) */
   cpu: TokenBucket;
+  /** CPU (ms) charged ahead for the apply of the message being processed (fv8 P2) */
+  precharged?: number;
   /** `u:<user id>` or `a:<visitor nonce>`: the key of the per-principal limits */
   principal: string;
   /** server step-1 requests answering a `pending` update (fv5 M-2), per connection */
@@ -96,6 +98,12 @@ export interface RoomDeps {
    * (last leave, shutdown) never wait.
    */
   saveBudget?: TokenBucket;
+  /**
+   * The most one principal may be charged for (RoomManager.share): a room's charge to one
+   * principal never goes past it (fv8 P1: a stored room that costs more than a share loads,
+   * charged one share at most).
+   */
+  shareOf?: (anonymous: boolean) => number;
 }
 
 /**
@@ -144,9 +152,12 @@ export class Room {
    * The room's memory, charged to the principals that brought it in (fv7 F1, RoomManager): the
    * room's cost at load to the principal that loaded it, and what every accepted update added to
    * the room's size estimate to the principal that sent it, in full. Nobody else is charged for
-   * them (a principal that only reads in the room pays nothing), and they stay while the room is
-   * loaded, whoever keeps it loaded (a charged principal that leaves still pays). Together they
-   * are the room's cost (settleCharges). Cleared when the room is evicted.
+   * them (a principal that only reads in the room pays nothing), and what it wrote stays charged
+   * to it while the room is loaded, whoever keeps it loaded (a writer that leaves still pays). The
+   * load charge of a principal that leaves moves to the principals still connected, as far as
+   * their shares hold it (fv8 U2: the loader kept paying for a room its colleagues kept open).
+   * Together they are the room's cost (settleCharges), never more than a share each. Cleared when
+   * the room is evicted.
    */
   private readonly charges = new Map<string, Charge>();
   /** content bytes of the updates the document emitted (Yjs' own encoding of what changed) */
@@ -335,14 +346,33 @@ export class Room {
   charge(principal: string, anonymous: boolean, bytes: number, written = true): void {
     if (!(bytes > 0)) return;
     let c = this.charges.get(principal);
-    if (!c) this.charges.set(principal, (c = { anonymous, bytes: 0, written: 0 }));
+    if (!c) this.charges.set(principal, (c = { anonymous, bytes: 0, written: 0, load: 0 }));
     c.bytes += bytes;
     if (written) c.written += bytes;
+    else c.load += bytes;
   }
 
   /** What `principal` is charged for this room. */
   chargeOf(principal: string): number {
     return this.charges.get(principal)?.bytes ?? 0;
+  }
+
+  /** The part of `principal`'s charge that is the room's cost at load (fv8 U2: handed over when it leaves). */
+  loadChargeOf(principal: string): number {
+    return this.charges.get(principal)?.load ?? 0;
+  }
+
+  /** Move `bytes` of `from`'s load charge to `to`, as a load charge of its own (fv8 U2, RoomManager.handOver). */
+  handOverLoad(from: string, to: string, anonymous: boolean, bytes: number): number {
+    const c = this.charges.get(from);
+    if (!c) return 0;
+    const b = Math.min(bytes, c.load, c.bytes);
+    if (!(b > 0)) return 0;
+    c.load -= b;
+    c.bytes -= b;
+    if (c.bytes <= 0 && c.written <= 0) this.charges.delete(from);
+    this.charge(to, anonymous, b, false);
+    return b;
   }
 
   /** What the anonymous visitors together are charged for this room. */
@@ -380,7 +410,10 @@ export class Room {
     if (written > 0) {
       for (const c of this.charges.values()) if (c.written > 0) c.bytes = Math.max(0, c.bytes - c.written + (changed * c.written) / written);
     } else if (changed < 0 && total > 0) {
-      for (const c of this.charges.values()) c.bytes = (c.bytes * target) / total;
+      for (const c of this.charges.values()) {
+        c.bytes = (c.bytes * target) / total;
+        c.load = (c.load * target) / total;
+      }
     } else if (changed > 0) {
       let to = fallback ? { principal: fallback.principal, anonymous: fallback.anonymous } : null;
       if (!to) {
@@ -389,7 +422,14 @@ export class Room {
       }
       if (to) this.charge(to.principal, to.anonymous, changed, false);
     }
-    for (const c of this.charges.values()) c.written = 0;
+    // fv8 P1: nobody is charged more than a share for one room (a stored room bigger than that
+    // loads, the rest of its cost charged to nobody; the size cap refuses it any growth)
+    const shareOf = this.deps.shareOf;
+    for (const c of this.charges.values()) {
+      c.written = 0;
+      if (shareOf) c.bytes = Math.min(c.bytes, shareOf(c.anonymous));
+      c.load = Math.min(c.load, c.bytes);
+    }
   }
 
   /** Nobody is connected nor about to: the room can be evicted. */
@@ -651,6 +691,11 @@ export interface Charge {
   bytes: number;
   /** charged for its updates since the room was last measured (see settleCharges) */
   written: number;
+  /**
+   * the part charged for the room's cost at load (its own load, or one handed over to it): it
+   * moves to the principals still connected when this one leaves (fv8 U2, RoomManager.handOver)
+   */
+  load: number;
 }
 
 /** A document encoded in full for joins, and the messages broadcast since (see Room). */

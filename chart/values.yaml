@@ -171,6 +171,11 @@ limits:
   anonCpuTotalMsPerSec: 150
   anonCpuTotalBurstMs: 1500
   cpuShedMinBytes: 16384
+  # Cuts of items one update may make, and the Yjs time (ms) its cuts and placement may take by
+  # the server's estimate (fv8 P1/P2: one update of 200 000 cuts held the server for a minute and
+  # stored a room past every share). Over either, the sender is closed 4413.
+  maxSplitsPerMessage: 5000
+  maxApplyMs: 50
   # Attribution of shapes deleted longer ago than this is pruned from the ledger.
   attributionRetentionDays: 30
   # Loaded-room memory budget in bytes (see "Memory" below). 0 = derived by the server from the

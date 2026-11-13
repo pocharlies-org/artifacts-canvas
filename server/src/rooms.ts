@@ -107,6 +107,7 @@ export class RoomManager {
         metrics: this.deps.metrics,
         onEmpty: (n) => this.rooms.delete(n),
         saveBudget: this.saveBudget,
+        shareOf: (anonymous) => this.share(anonymous),
       });
       room = fresh;
       this.rooms.set(name, fresh);
@@ -256,13 +257,21 @@ export class RoomManager {
    */
   private loadRefusal(extra: number, charge: number, loader: Loader | undefined, m = this.memory()): string | null {
     const { cfg } = this.deps;
-    // a room whose cost alone passes the loader's whole share never loads for it (a room stored
-    // bigger than this deployment's cap, e.g. before the memory was lowered): no point retrying
-    if (loader && charge > this.share(loader.anonymous)) return 'room_too_large';
+    // fv8 P1: a room the server stored is never refused for good because a share cannot hold it
+    // (one update grew a room past every share and it was refused 4413 to everyone, for good): it
+    // loads, its loader charged one share at most (loadCharge). Only a room the whole load budget
+    // cannot hold (stored by a deployment with more memory) never loads here: 4413, no retry.
+    if (charge > cfg.roomMemoryBudgetBytes * LOAD_FRACTION) return 'room_too_large';
+    const own = loader ? this.loadCharge(charge, loader) : 0;
     if (m.total - m.idle + extra > cfg.roomMemoryBudgetBytes * LOAD_FRACTION) return 'room_memory';
-    if (loader && this.held(loader.principal) + charge > this.share(loader.anonymous)) return 'room_memory_principal';
-    if (loader?.anonymous && this.anonHeld() + charge > this.anonShare()) return 'room_memory_anon';
+    if (loader && this.held(loader.principal) + own > this.share(loader.anonymous)) return 'room_memory_principal';
+    if (loader?.anonymous && this.anonHeld() + own > this.anonShare()) return 'room_memory_anon';
     return null;
+  }
+
+  /** What a load of a room costing `cost` charges its loader: the cost, one share at most (fv8 P1). */
+  loadCharge(cost: number, loader: Loader): number {
+    return Math.min(cost, this.share(loader.anonymous));
   }
 
   /**
@@ -296,7 +305,13 @@ export class RoomManager {
       }
       if (m.total + extra <= cfg.roomMemoryBudgetBytes * LOAD_FRACTION) {
         this.reserved += extra;
-        if (loader) room.charge(loader.principal, loader.anonymous, charge, false);
+        if (loader && charge > this.share(loader.anonymous)) {
+          log.warn(
+            { room: room.name, bytes, cost: Math.round(charge), share: Math.round(this.share(loader.anonymous)), anonymous: loader.anonymous },
+            'stored room costs more than a share: loaded, its loader charged one share; the size cap refuses it any growth',
+          );
+        }
+        if (loader) room.charge(loader.principal, loader.anonymous, this.loadCharge(charge, loader), false);
         let released = false;
         return () => {
           if (released) return;
@@ -337,6 +352,48 @@ export class RoomManager {
    */
   chargeUpdate(room: Room, principal: string, anonymous: boolean, costBefore: number): void {
     room.charge(principal, anonymous, room.cost - costBefore);
+  }
+
+  /**
+   * fv8 U2: a principal's last connection left `room` while others keep it loaded. The load
+   * charges of the principals no longer connected (what the room cost when they loaded it, or
+   * what was handed over to them) move to the principals still connected, split evenly, each at
+   * most what its share still holds (an anonymous visitor's also within the anonymous share);
+   * what nobody can take stays where it was, and moves at a later leave. Before, a user who
+   * opened a big room and left it to colleagues kept paying for it, and could not open a second
+   * one (refused 1013 for as long as they kept it open). What a principal WROTE stays charged to
+   * it (fv7 F1: a writer pays for its growth while the room is loaded, whoever keeps it loaded).
+   */
+  handOver(room: Room): void {
+    if (room.idle || room.disposed) return;
+    const takers = new Map<string, boolean>();
+    for (const c of room.conns.values()) takers.set(c.principal, c.identity.anonymous);
+    if (!takers.size) return;
+    for (const [from, charge] of [...room.chargeEntries()]) {
+      if (takers.has(from) || !(charge.load > 0)) continue;
+      let left = charge.load;
+      const head = new Map<string, number>();
+      for (const [p, anon] of takers) head.set(p, Math.max(0, this.share(anon) - this.held(p)));
+      let anonRoom = Math.max(0, this.anonShare() - this.anonHeld());
+      let open = [...takers.keys()].filter((p) => head.get(p)! > 0);
+      while (left > 1 && open.length) {
+        const part = left / open.length;
+        const next: string[] = [];
+        let round = 0;
+        for (const p of open) {
+          const anon = takers.get(p)!;
+          const give = Math.min(part, head.get(p)!, anon ? anonRoom : Infinity);
+          const moved = give > 0 ? room.handOverLoad(from, p, anon, give) : 0;
+          round += moved;
+          left -= moved;
+          head.set(p, head.get(p)! - moved);
+          if (anon) anonRoom -= moved;
+          if (head.get(p)! > 1 && (!anon || anonRoom > 1)) next.push(p);
+        }
+        if (round < 1) break;
+        open = next;
+      }
+    }
   }
 
   /** Flush and evict every idle room (no connection, no join waiting for it). */

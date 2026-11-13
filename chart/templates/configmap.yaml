@@ -81,6 +81,8 @@ data:
   ANON_CPU_TOTAL_MS_PER_SEC: {{ int64 .Values.limits.anonCpuTotalMsPerSec | quote }}
   ANON_CPU_TOTAL_BURST_MS: {{ int64 .Values.limits.anonCpuTotalBurstMs | quote }}
   CPU_SHED_MIN_BYTES: {{ int64 .Values.limits.cpuShedMinBytes | quote }}
+  MAX_SPLITS_PER_MESSAGE: {{ int64 .Values.limits.maxSplitsPerMessage | quote }}
+  MAX_APPLY_MS: {{ int64 .Values.limits.maxApplyMs | quote }}
   ATTRIBUTION_RETENTION_DAYS: {{ int64 .Values.limits.attributionRetentionDays | quote }}
   # loaded-room memory budget: derived by the server from the V8 heap limit unless set
   {{- if .Values.limits.roomMemoryBudgetBytes }}
