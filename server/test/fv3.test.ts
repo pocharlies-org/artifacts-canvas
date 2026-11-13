@@ -180,7 +180,7 @@ describe('fv3 HIGH: zero-length structs (Z1) cannot touch the ledger', () => {
     expect((await roomDocs(app, key))!.doc.getMap('shapes').has('s1')).toBe(true);
     // bob moving the shape is just an update: ana stays the creator
     bob.doc.transact(() => (bob.doc.getMap('shapes').get('s1') as Y.Map<unknown>).set('x', 11));
-    await waitFor(async () => ((await roomDocs(app, key))!.ledger.getMap('attribution').get('s1') as { updatedBy?: string })?.updatedBy === 'bob@corp', 3000, 'bob stamped');
+    await waitFor(async () => ((await roomDocs(app, key))?.ledger.getMap('attribution').get('s1') as { updatedBy?: string })?.updatedBy === 'bob@corp', 3000, 'bob stamped');
     expect((await roomDocs(app, key))!.ledger.getMap('attribution').get('s1')).toMatchObject({ createdBy: 'ana@corp', updatedBy: 'bob@corp' });
     // the room still encodes, saves and loads; a new joiner gets everything
     await app.manager.get(key)!.flush();

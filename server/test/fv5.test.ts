@@ -681,7 +681,7 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
       ana0.doc.transact(() => {
         for (let i = 0; i < 2000; i++) ana0.doc.getMap('shapes').delete(`f${i}`);
       });
-      await waitFor(async () => (await roomDocs(filler, key))!.doc.getMap('shapes').size === 10_000, 10_000, 'deletes');
+      await waitFor(async () => (await roomDocs(filler, key))?.doc.getMap('shapes').size === 10_000, 10_000, 'deletes');
       ana0.close();
       await waitFor(async () => filler.manager.get(key) === undefined, 5000, 'flushed');
       await filler.close();
@@ -744,7 +744,7 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
       const s = performance.now();
       const want = Math.random();
       bob.doc.getMap('meta').set('p', want);
-      await waitFor(async () => (await roomDocs(app, key2))!.doc.getMap('meta').get('p') === want, 10_000, 'rtt');
+      await waitFor(async () => (await roomDocs(app, key2))?.doc.getMap('meta').get('p') === want, 10_000, 'rtt');
       rtts.push(performance.now() - s);
       await sleep(100);
     }
@@ -765,14 +765,19 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
     users(key);
     const ana = new TestClient(`${base(app)}/${key}`);
     await ana.connect();
+    // the join is complete (the server's step 1 answered): else ana's step-2 answer can carry the
+    // big write below a second time, and that copy finds the server-wide budget used up (fv9: the
+    // join frames come from the room's worker, so the step 1 can arrive after the write)
+    await waitFor(() => ana.step1Received > 0, 5000, 'joined');
     // an expensive message spends the whole server-wide burst
     ana.doc.transact(() => {
       for (let i = 0; i < 3000; i++) ana.doc.getMap('shapes').set(`s${i}`, shapeMap(geo(`s${i}`, i)));
     });
     await waitFor(async () => (await roomDocs(app, key))?.doc.getMap('shapes').size === 3000, 10_000, 'big write');
+    expect(ana.closeCode).toBeNull();
     // a small edit still goes through
     ana.doc.getMap('meta').set('small', 1);
-    await waitFor(async () => (await roomDocs(app, key))!.doc.getMap('meta').get('small') === 1, 3000, 'small write');
+    await waitFor(async () => (await roomDocs(app, key))?.doc.getMap('meta').get('small') === 1, 3000, 'small write');
     // the next big one is shed: 1013 (y-websocket reconnects and resends what the room lacks)
     ana.doc.getMap('meta').set('big', 'q'.repeat(64 * 1024));
     expect(await ana.closed).toBe(1013);
@@ -789,6 +794,7 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
     core.rulesByCookie.set(`sid=bob|${key}`, allowUser('bob@corp', 'Bob'));
     const a1 = new TestClient(`${base(app)}/${key}`);
     await a1.connect();
+    await waitFor(() => a1.step1Received > 0, 5000, 'joined'); // see p3/p4
     a1.doc.transact(() => {
       for (let i = 0; i < 2000; i++) a1.doc.getMap('shapes').set(`s${i}`, shapeMap(geo(`s${i}`, i)));
     });
@@ -801,7 +807,7 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
     const bob = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob.connect();
     bob.doc.getMap('meta').set('bob', 'q'.repeat(64 * 1024));
-    await waitFor(async () => ((await roomDocs(app, key))!.doc.getMap('meta').get('bob') as string | undefined)?.length === 64 * 1024, 3000, 'bob write');
+    await waitFor(async () => ((await roomDocs(app, key))?.doc.getMap('meta').get('bob') as string | undefined)?.length === 64 * 1024, 3000, 'bob write');
     expect(bob.closeCode).toBeNull();
     bob.close();
     a1.close();

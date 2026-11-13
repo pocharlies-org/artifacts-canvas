@@ -192,7 +192,7 @@ describe('fv4 H1: sync step 1 is no amplifier', () => {
     prov.messageHandlers[102] = () => undefined;
     await waitFor(async () => doc.getMap('shapes').size === 3000, 10_000, 'bob synced');
     doc.getMap('shapes').set('bob1', shapeMap(geo('bob1')));
-    await waitFor(async () => (await roomDocs(app, key))!.doc.getMap('shapes').has('bob1'), 3000, 'bob wrote');
+    await waitFor(async () => (await roomDocs(app, key))?.doc.getMap('shapes').has('bob1'), 3000, 'bob wrote');
     prov.destroy();
     ana.close();
   });

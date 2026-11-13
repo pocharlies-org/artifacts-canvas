@@ -200,7 +200,7 @@ describe('fv6 H-1: loaded rooms are bounded by a memory budget', () => {
     expect(await settled(second, 2000)).toBeNull();
     // the loaded rooms stay usable: an edit lands
     second.doc.getMap('shapes').set('after', shapeMap(geo('after')));
-    await waitFor(async () => (await roomDocs(app, keys[0]))!.doc.getMap('shapes').has('after'), 5000, 'edit lands');
+    await waitFor(async () => (await roomDocs(app, keys[0]))?.doc.getMap('shapes').has('after'), 5000, 'edit lands');
     // the holder of room 1 leaves: its room is evicted, and the refused room loads now
     held[1].close();
     await waitFor(async () => !app.manager.get(keys[1]), 5000, 'room 1 evicted');
@@ -233,7 +233,7 @@ describe('fv6 H-1: loaded rooms are bounded by a memory budget', () => {
           const s = c.doc.getMap('shapes');
           for (let i = b; i < b + 25; i++) s.set(`f${i}`, shapeMap(geo(`f${i}`, i)));
         });
-        await waitFor(async () => c.closeCode !== null || (await roomDocs(app, k))!.doc.getMap('shapes').size >= b + 25, 10_000, 'batch').catch(() => undefined);
+        await waitFor(async () => c.closeCode !== null || (await roomDocs(app, k))?.doc.getMap('shapes').size >= b + 25, 10_000, 'batch').catch(() => undefined);
         if (c.closeCode !== null) at = b;
       }
       closes.push(c.closeCode);
@@ -686,7 +686,7 @@ describe('fv6 L-A: paused sockets cannot hold the outgoing budget against honest
     expect(dropped2).toBeGreaterThan(0);
     // the existing honest connections still edit
     carol.doc.getMap('shapes').set('after', shapeMap(geo('after')));
-    await waitFor(async () => (await roomDocs(app, team))!.doc.getMap('shapes').has('after'), 10_000, 'carol edits');
+    await waitFor(async () => (await roomDocs(app, team))?.doc.getMap('shapes').has('after'), 10_000, 'carol edits');
     expect(carol.closeCode).toBeNull();
     expect(holders.every((b) => b.readyState === WebSocket.OPEN)).toBe(true);
     for (const c of [carol, dave]) c.close();
