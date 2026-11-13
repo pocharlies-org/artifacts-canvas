@@ -13,9 +13,15 @@
  *   F-5  --max-old-space-size was only warned about (it overrides every worker's heap limit).
  *   F-6  while saves kept failing the write-ahead log grew without a bound.
  *   S6   tiny messages from many principals counted a few bytes each and never reached the cap:
- *        every message now counts at least INFLIGHT_MIN_COST (1 KiB).
+ *        every message now counts at least INFLIGHT_MIN_COST (2 KiB since S8 measured what one holds).
  *   S7   the series the chart's alerts read were born at their first event (increase() missed it):
  *        now exposed at 0 from the start.
+ *   S8   what the in-flight bound left out: `ws` emits every message of a read also after pause(),
+ *        so an unpaced burst, or a new connection (a full message bucket), queued up to MSG_BURST
+ *        messages past the cap per connection; maxPayload was a fixed 8 MiB; and a client could hold
+ *        an unfinished fragmented message forever while answering pings. Now a message of a paused
+ *        connection is refused 1013, maxPayload follows the message cap, and a connection holding an
+ *        unfinished message past its deadline is dropped.
  * And the bump discipline: the cost constants are tied to the Yjs versions they were measured on.
  * The full-system variant of M-1 (RSS of the canvas under the chart's limit) is
  * e2e-system/adversarial-inflight.spec.ts; the process-level measurement server/test/inflight/flood.ts.
@@ -24,16 +30,18 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import v8 from 'node:v8';
+import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import * as Y from 'yjs';
-import { CALIBRATED_WITH, inflightConnBytes, loadConfig } from '../src/config.js';
+import { CALIBRATED_WITH, INFLIGHT_MIN_COST, inflightConnBytes, loadConfig } from '../src/config.js';
 import { createApp, type App } from '../src/app.js';
 import { MemoryCanvasObjectStore } from '../src/store.js';
 import { createLogger } from '../src/logging.js';
 import { Room, WAL_MAX_DOCS, type Conn } from '../src/room.js';
 import { WsServer } from '../src/ws.js';
 import { startFakeCore, allowUser, type FakeCore } from './helpers/fakecore.js';
-import { TEST_ORIGIN, TestClient, waitFor } from './helpers/yclient.js';
+import { TEST_ORIGIN, TestClient, expectClose, waitFor } from './helpers/yclient.js';
 import { testCore } from './helpers/core.js';
 import { syncMsg } from './fv9/craft.js';
 import { CanvasDoc, DELETE_BATCH } from '../../client/src/model/doc';
@@ -70,6 +78,17 @@ async function startApp(env: Record<string, string> = {}): Promise<App> {
 const port = (app: App) => (app.server.address() as { port: number }).port;
 const base = (app: App) => `ws://127.0.0.1:${port(app)}/_canvas/_/ws`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// S8: what the process holds, after collecting garbage (the heap, and the Buffers outside it)
+v8.setFlagsFromString('--expose-gc');
+const gc = vm.runInNewContext('gc') as () => void;
+async function settledMemory(): Promise<{ heap: number; buffers: number }> {
+  for (let i = 0; i < 3; i++) {
+    gc();
+    await sleep(30);
+  }
+  const m = process.memoryUsage();
+  return { heap: m.heapUsed, buffers: m.arrayBuffers };
+}
 type MetricName = 'wsRejected' | 'strikes' | 'wsPaused' | 'walFull';
 async function metric(app: App, name: MetricName, label?: string, value?: string): Promise<number> {
   const m = await (app.metrics[name] as unknown as { get(): Promise<{ values: { labels: Record<string, string>; value: number }[] }> }).get();
@@ -202,7 +221,7 @@ describe('M-1: client messages in flight are bounded', () => {
     }
   }, 90_000);
 
-  it('many principals sending tiny updates (a worker that never answers): every message counts at least 1 KiB in flight, so the server\'s cap bounds how many messages wait, not only their bytes; the counters return to 0 once processed', async () => {
+  it('many principals sending tiny updates (a worker that never answers): every message counts at least INFLIGHT_MIN_COST in flight, so the server\'s cap bounds how many messages wait, not only their bytes; the counters return to 0 once processed', async () => {
     // review S6: counted by payload bytes only, a 4-byte update cost ~7 counted bytes and several hundred
     // bytes of live objects; 12 accounts x 8 connections could queue without a bound, the cap never reached
     const cap = 4 * MiB;
@@ -244,16 +263,17 @@ describe('M-1: client messages in flight are bounded', () => {
       const queued = jobs.mock.calls.length;
       const gauge = (await app.metrics.inflightBytes.get()).values[0]?.value ?? 0;
       const paused = conns.filter((c) => c.paused && !c.closing);
-      console.log('[S6 tiny updates]', JSON.stringify({ connections: n, sent: n * rounds, queued, bound: cap / KiB + 2 * n, inflightKiB: +(gauge / KiB).toFixed(1), capKiB: cap / KiB, paused: paused.length }));
+      const F = INFLIGHT_MIN_COST;
+      console.log('[S6 tiny updates]', JSON.stringify({ connections: n, sent: n * rounds, queued, bound: cap / F + 2 * n, inflightKiB: +(gauge / KiB).toFixed(1), capKiB: cap / KiB, paused: paused.length }));
       expect(clients.every((c) => c.closeCode === null)).toBe(true);
       expect(gauge).toBe(app.manager.inflightBytes);
       // a small message is always taken (an honest edit is never refused): past the cap, one or two per connection
-      expect(gauge).toBeLessThanOrEqual(cap + 2 * n * KiB);
+      expect(gauge).toBeLessThanOrEqual(cap + 2 * n * F);
       expect(await metric(app, 'wsRejected', 'reason', 'inflight')).toBe(0);
       // the cap is reached: every connection that kept sending is no longer read (TCP backpressure)
       expect(paused.length).toBe(n);
       expect(await metric(app, 'wsPaused', 'why', 'server')).toBe(n);
-      expect(queued).toBeLessThanOrEqual(cap / KiB + 2 * n);
+      expect(queued).toBeLessThanOrEqual(cap / F + 2 * n);
       release();
       released = true;
       // everything is processed, the paused connections are read again and their rest processed too
@@ -510,10 +530,221 @@ describe('alert series exposed at 0 (review S7)', () => {
       'canvas_saves_total{outcome="error"}',
       'canvas_ws_paused_total{why="connection"}',
       'canvas_ws_paused_total{why="principal"}',
+      // review I-3: the third reason a connection is no longer read
+      'canvas_ws_paused_total{why="server"}',
       'canvas_ws_rejected_total{reason="delete_too_costly"}',
+      // S8: a message read ahead on a paused connection, an unfinished message held past its deadline
+      'canvas_ws_rejected_total{reason="inflight_paused"}',
+      'canvas_ws_rejected_total{reason="incoming_timeout"}',
     ];
     const missing = [...alerted, ...optional].filter((s) => !lines.has(`${s} 0`));
     expect(missing).toEqual([]);
     expect(lines.has('canvas_strikes_total{outcome="cooldown"} 0')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+describe('S8: read-ahead, churn and unfinished messages are bounded', () => {
+  const KiB = 1024;
+  /** a valid update of 4 bytes (no struct, an empty delete set entry): the guard accepts it, no strike */
+  const tiny = () => syncMsg(new Uint8Array([0, 1, 0, 0]));
+  /**
+   * `count` copies of `msg` in ONE socket write, so the server reads them in one chunk: uncorked,
+   * Node writes the first frame at once and the rest together, and the server reads the first alone.
+   */
+  const burstOneRead = (c: TestClient, msg: Uint8Array, count: number) => {
+    const socket = (c.ws as unknown as { _socket: { cork(): void; uncork(): void } })._socket;
+    socket.cork();
+    for (let k = 0; k < count; k++) c.sendRaw(msg);
+    socket.uncork();
+  };
+
+  it('unpaced burst: 96 connections each send 200 tiny updates at once (one read each); `ws` emits every message of a read also after pause(), and those of a paused connection are refused 1013, so the queue stays within cap / INFLIGHT_MIN_COST + 2 per connection', async () => {
+    const cap = 4 * MiB;
+    const app = await startApp({ HEAP_LIMIT_MB: '1776', WORKER_INFLIGHT_BYTES: String(cap) });
+    const accounts = 12;
+    const perAccount = 8; // MAX_CONNS_PER_USER
+    const burst = 200; // under MSG_BURST (240): nobody is rate limited
+    expect(burst).toBeLessThan(loadConfig({ ...BASE_ENV }).msgBurst);
+    const clients: TestClient[] = [];
+    for (let a = 0; a < accounts; a++) {
+      const key = `u/s8-burst-${a}/index.html`;
+      share(key, `b${a}`);
+      for (let i = 0; i < perAccount; i++) clients.push(await join(app, key, `sid=b${a}`));
+    }
+    const n = clients.length;
+    expect(clients.every((c) => c.closeCode === null)).toBe(true);
+    await waitFor(() => app.manager.inflightBytes === 0, 10_000, 'joins processed');
+    const msg = tiny();
+    const jobs = vi.spyOn(Room.prototype, 'update');
+    const release = await app.manager.applySlots.acquire();
+    let released = false;
+    try {
+      // every message of a connection in one write: one read holds them all
+      for (const c of clients) burstOneRead(c, msg, burst);
+      await sleep(1000);
+      const queued = jobs.mock.calls.length;
+      const gauge = (await app.metrics.inflightBytes.get()).values[0]?.value ?? 0;
+      const refused = clients.filter((c) => c.closeCode === 1013);
+      const F = INFLIGHT_MIN_COST;
+      console.log('[S8 unpaced burst]', JSON.stringify({ connections: n, sent: n * burst, queued, bound: cap / F + 2 * n, inflightKiB: +(gauge / KiB).toFixed(1), capKiB: cap / KiB, refused: refused.length }));
+      expect(queued).toBeLessThanOrEqual(cap / F + 2 * n);
+      expect(gauge).toBeLessThanOrEqual(cap + 2 * n * F);
+      // a refused connection was told to come back (busy, 1013: no strike); the others are still open
+      expect(clients.every((c) => c.closeCode === null || c.closeCode === 1013)).toBe(true);
+      expect(refused.every((c) => c.notices.some((x) => x.kind === 'busy'))).toBe(true);
+      expect(refused.length).toBeGreaterThan(0);
+      expect(await metric(app, 'wsRejected', 'reason', 'inflight_paused')).toBe(refused.length);
+      expect(await metric(app, 'strikes')).toBe(0);
+      release();
+      released = true;
+      await waitFor(() => jobs.mock.calls.length === queued && app.manager.inflightBytes === 0, 60_000, 'every queued message processed');
+      expect(jobs.mock.calls.length).toBe(queued);
+      expect((await app.metrics.inflightBytes.get()).values[0]?.value).toBe(0);
+      const open = clients.filter((c) => c.closeCode === null);
+      expect(open.length).toBe(n - refused.length);
+    } finally {
+      if (!released) release();
+      jobs.mockRestore();
+    }
+  }, 120_000);
+
+  it('calibration: what a queued tiny message holds (its frame copy, views, the job and its promises) is within INFLIGHT_MIN_COST, the least it counts in flight', async () => {
+    // under every cap for a floor up to 4 KiB (11 520 messages < 64 MiB; 120 per connection, 960 per
+    // principal < 8 MiB): every message queues
+    const app = await startApp({ HEAP_LIMIT_MB: '1776' });
+    const accounts = 12;
+    const burst = 120;
+    const clients: TestClient[] = [];
+    for (let a = 0; a < accounts; a++) {
+      const key = `u/s8-cal-${a}/index.html`;
+      share(key, `k${a}`);
+      for (let i = 0; i < 8; i++) clients.push(await join(app, key, `sid=k${a}`));
+    }
+    const n = clients.length * burst;
+    await waitFor(() => app.manager.inflightBytes === 0, 10_000, 'joins processed');
+    const msg = tiny();
+    const release = await app.manager.applySlots.acquire();
+    let released = false;
+    try {
+      const before = await settledMemory();
+      for (const c of clients) burstOneRead(c, msg, burst);
+      await waitFor(() => app.manager.inflightBytes >= n * Math.min(INFLIGHT_MIN_COST, 1024), 10_000, 'every message queued');
+      await sleep(300);
+      const after = await settledMemory();
+      const perMessage = (after.heap + after.buffers - (before.heap + before.buffers)) / n;
+      console.log('[S8 calibration]', JSON.stringify({ queued: n, heapKiB: +((after.heap - before.heap) / 1024).toFixed(0), buffersKiB: +((after.buffers - before.buffers) / 1024).toFixed(0), perMessageB: Math.round(perMessage), floorB: INFLIGHT_MIN_COST }));
+      expect(clients.every((c) => c.closeCode === null)).toBe(true);
+      expect(perMessage).toBeGreaterThan(0);
+      expect(perMessage).toBeLessThanOrEqual(INFLIGHT_MIN_COST);
+      release();
+      released = true;
+      await waitFor(() => app.manager.inflightBytes === 0, 60_000, 'every message processed');
+    } finally {
+      if (!released) release();
+    }
+  }, 120_000);
+
+  it('churn: a new connection starts with a full message bucket and nothing in flight; while the server is over the cap each one adds at most two messages, and the join limit ends the churn', async () => {
+    // a 1 MiB cap (and messages, which the cap must hold): the churn passes it fast; the join burst
+    // (20) refills at 1 a minute, so the run's length on a slow host does not decide whether it ends
+    const cap = MiB;
+    const app = await startApp({ HEAP_LIMIT_MB: '1776', MAX_MESSAGE_BYTES: String(MiB), WORKER_INFLIGHT_BYTES: String(cap), JOIN_RATE_PER_MIN: '1' });
+    const msg = tiny();
+    const burst = 200;
+    const filler = 'u/s8-churn-fill/index.html';
+    share(filler, 'f');
+    const fill: TestClient[] = [];
+    for (let i = 0; i < 8; i++) fill.push(await join(app, filler, 'sid=f'));
+    const accounts = 4;
+    const keyOf = (a: number) => `u/s8-churn-${a}/index.html`;
+    for (let a = 0; a < accounts; a++) share(keyOf(a), `c${a}`);
+    await waitFor(() => app.manager.inflightBytes === 0, 10_000, 'joins processed');
+    const jobs = vi.spyOn(Room.prototype, 'update');
+    const release = await app.manager.applySlots.acquire();
+    let released = false;
+    try {
+      for (const c of fill) burstOneRead(c, msg, burst);
+      await waitFor(() => app.manager.inflightBytes >= cap, 5000, 'the server is over the cap');
+      let opened = fill.length;
+      let refusedJoins = 0;
+      // more rounds than JOIN_BURST (20): every account opens a connection, bursts, closes it, again
+      for (let r = 0; r < 25; r++) {
+        await Promise.all(
+          Array.from({ length: accounts }, async (_, a) => {
+            const c = await join(app, keyOf(a), `sid=c${a}`);
+            if (c.closeCode !== null) {
+              if (c.closeCode === 1013) refusedJoins++;
+              return;
+            }
+            opened++;
+            burstOneRead(c, msg, burst);
+            await sleep(100);
+            c.ws.close();
+          }),
+        );
+      }
+      await sleep(500);
+      const queued = jobs.mock.calls.length;
+      const gauge = (await app.metrics.inflightBytes.get()).values[0]?.value ?? 0;
+      const F = INFLIGHT_MIN_COST;
+      console.log('[S8 churn]', JSON.stringify({ opened, refusedJoins, queued, bound: cap / F + 2 * opened, inflightKiB: +(gauge / KiB).toFixed(1), capKiB: cap / KiB }));
+      expect(queued).toBeLessThanOrEqual(cap / F + 2 * opened);
+      expect(gauge).toBeLessThanOrEqual(cap + 2 * opened * F);
+      expect(refusedJoins).toBeGreaterThan(0);
+      release();
+      released = true;
+      await waitFor(() => app.manager.inflightBytes === 0, 60_000, 'every queued message processed or dropped');
+    } finally {
+      if (!released) release();
+      jobs.mockRestore();
+    }
+  }, 120_000);
+
+  it('fragment hold: connections that send the first 2 MiB fragment of a message and never its last, answering every ping, are dropped once their incoming deadline passes, and what they held is released; an idle connection is not', async () => {
+    // deadline: WS_INCOMING_TIMEOUT_MS + held / WS_INCOMING_MIN_BYTES_PER_SEC = 1 s + 2 s
+    const app = await startApp({ HEAP_LIMIT_MB: '1776', WS_INCOMING_TIMEOUT_MS: '1000', WS_INCOMING_MIN_BYTES_PER_SEC: String(MiB), WS_PING_INTERVAL_MS: '500' });
+    const key = 'u/s8-frag/index.html';
+    share(key, 'h1', 'h2', 'idle');
+    const holders: TestClient[] = [];
+    for (const u of ['h1', 'h2']) for (let i = 0; i < 8; i++) holders.push(await join(app, key, `sid=${u}`));
+    const idle = await join(app, key, 'sid=idle');
+    const n = holders.length;
+    expect([...holders, idle].every((c) => c.closeCode === null)).toBe(true);
+    await waitFor(() => app.manager.inflightBytes === 0, 10_000, 'joins processed');
+    const frag = new Uint8Array(2 * MiB).fill(3);
+    let pings = 0;
+    for (const c of holders) c.ws.on('ping', () => pings++); // the ws client answers each with a pong
+    const before = await settledMemory();
+    const t0 = Date.now();
+    for (const c of holders) c.ws.send(frag, { binary: true, fin: false });
+    await sleep(1500);
+    const holding = await settledMemory();
+    expect(holders.every((c) => c.closeCode === null)).toBe(true);
+    expect(holding.buffers - before.buffers).toBeGreaterThan(0.75 * n * frag.byteLength);
+    await waitFor(() => holders.every((c) => c.closeCode !== null), 8000, 'the holders dropped after their deadline');
+    const elapsed = Date.now() - t0;
+    const released = await settledMemory();
+    console.log('[S8 fragment hold]', JSON.stringify({ connections: n, heldMiB: +((holding.buffers - before.buffers) / MiB).toFixed(1), afterMiB: +((released.buffers - before.buffers) / MiB).toFixed(1), droppedAfterMs: elapsed, pings }));
+    expect(elapsed).toBeGreaterThanOrEqual(2500);
+    expect(pings).toBeGreaterThanOrEqual(n); // they answered pings while holding: the idle drop did not catch them
+    expect(released.buffers - before.buffers).toBeLessThan(0.25 * n * frag.byteLength);
+    expect(await metric(app, 'wsRejected', 'reason', 'incoming_timeout')).toBe(n);
+    expect(idle.closeCode).toBeNull();
+  }, 60_000);
+
+  it('maxPayload follows the message cap: a message a little over the cap gets the too-large notice (4413); one past the cap plus 64 KiB of slack is not read (1009), at the chart\'s 4 MiB and at a configured 1 MiB', async () => {
+    for (const [env, cap] of [[{}, 4 * MiB], [{ MAX_MESSAGE_BYTES: String(MiB) }, MiB]] as const) {
+      const app = await startApp({ HEAP_LIMIT_MB: '1776', ...env });
+      const key = `u/s8-payload-${cap}/index.html`;
+      share(key, 'p');
+      const over = await join(app, key, 'sid=p');
+      over.sendRaw(new Uint8Array(cap + KiB));
+      await expectClose(over, 4413);
+      expect(over.notices.some((x) => x.kind === 'too-large')).toBe(true);
+      const past = await join(app, key, 'sid=p');
+      past.sendRaw(new Uint8Array(cap + 64 * KiB + 1));
+      await expectClose(past, 1009);
+    }
   });
 });

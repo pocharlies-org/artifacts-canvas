@@ -70,12 +70,14 @@ an in-memory object store; the S3 store is covered against s3rver — no Docker 
 | `MSG_RATE_PER_SEC` / `MSG_BURST` | `120` / `240` | Over → NOTICE + `4429`. |
 | `ANON_MSG_RATE_PER_SEC` / `ANON_MSG_BURST` | `30` / `60` | |
 | `MAX_DOC_BYTES` / `ANON_MAX_DOC_BYTES` | `5 MiB` / `1.25 MiB` | An update that would grow the doc past the sender's cap → NOTICE + `4413` for that connection only. Lowered at start (warning) to what one share of the room memory budget holds. |
-| `MAX_MESSAGE_BYTES` / `ANON_MAX_MESSAGE_BYTES` | `4 MiB` / `1 MiB` | Never above the room caps. |
+| `MAX_MESSAGE_BYTES` / `ANON_MAX_MESSAGE_BYTES` | `4 MiB` / `1 MiB` | Never above the room caps. A message longer than the larger + 64 KiB closes `1009` unread. |
+| `WS_INCOMING_TIMEOUT_MS` / `WS_INCOMING_MIN_BYTES_PER_SEC` | `30000` / `32768` | Deadline of an unfinished message (a frame or fragments without the last one): the first + its bytes at the second, then the connection is dropped. |
 | `MAX_IMAGE_BYTES` / `ANON_MAX_IMAGE_BYTES` | `2 MiB` / `512 KiB` | Advertised to the client in the wrapper config (at most 70% of the message cap). The wrapper also advertises the visitor's room cap, so the editor says the canvas is full before the server would refuse an image. |
 | `MAX_SPLITS_PER_MESSAGE` | `5000` | Cuts of items one update may make (inserts or deletes inside an item, origins of structs the room has): each is a struct of its own in the stored room and costs Yjs a copy of the item. Over → NOTICE + `4413` for that connection. |
 | `MAX_APPLY_MS` | `50` | Yjs time the cuts and placement scans of one update may take, by the server's estimate (costs measured on x86, `config.ts`). Over → NOTICE + `4413`. The whole apply is also charged to the CPU budgets before it runs: an update they cannot cover → NOTICE `busy` + `1013`. |
 | `ARTIFACT_PREFIXES` | *(any valid key)* | Optional key-space allowlist (comma separated). |
-| `ANON_ALLOWED_PREFIXES` | `pub/` | Anonymous is only ever accepted here. |
+| `ANON_ENABLED` | `true` (chart: `false`) | Anonymous drawing. `false`: a visitor without credentials is refused before the core is asked, and any anonymous answer of the core too, whatever `ANON_ALLOWED_PREFIXES` holds. |
+| `ANON_ALLOWED_PREFIXES` | `pub/` | With `ANON_ENABLED`, anonymous is only ever accepted here (a list with no prefix: nowhere). |
 | `EXPIRED_REASONS` / `GONE_REASONS` | `expired` / `object-missing` | Authz `reason` values (core gate vocabulary) treated as expired / gone. |
 | `ALLOWED_ORIGINS` | origin of `ARTIFACT_BASE_URL` | Comma-separated browser origins (`scheme://host[:port]`) allowed to open the WebSocket; missing/`null`/foreign Origin → `4403`. |
 | `METRICS_PORT` / `METRICS_HOST` | `9091` / `0.0.0.0` | Internal Prometheus listener (`/metrics` only); `0` disables it. Never routed publicly. |

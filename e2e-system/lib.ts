@@ -30,15 +30,23 @@ export const USERS = {
 } as const;
 export type UserName = keyof typeof USERS;
 
-/** The id of the running container of a compose service of the stack. */
+/**
+ * The id of the running container of a compose service of the stack. Compose labels the image it
+ * builds with the project and service too, so a `docker run` of that image (or a `docker compose
+ * run` one-off) also matches those two labels: only the service's own container carries
+ * `com.docker.compose.oneoff=False`. More than one match is an error, never a guess (review T-1: a
+ * throwaway container of the image was picked and the suite read and restarted the wrong one).
+ */
 export function container(service: string): string {
-  const id = execFileSync('docker', [
+  const ids = execFileSync('docker', [
     'ps', '-q',
     '--filter', `label=com.docker.compose.project=${PROJECT}`,
     '--filter', `label=com.docker.compose.service=${service}`,
-  ], { encoding: 'utf8' }).trim().split('\n')[0];
-  if (!id) throw new Error(`service ${service} of compose project ${PROJECT} is not running`);
-  return id;
+    '--filter', 'label=com.docker.compose.oneoff=False',
+  ], { encoding: 'utf8' }).trim().split('\n').filter((s) => s !== '');
+  if (ids.length === 0) throw new Error(`service ${service} of compose project ${PROJECT} is not running`);
+  if (ids.length > 1) throw new Error(`service ${service} of compose project ${PROJECT}: ${ids.length} running containers (${ids.join(', ')}), expected one`);
+  return ids[0];
 }
 
 /** Run `mc` inside the MinIO container with the admin alias `local` (MinIO root). */

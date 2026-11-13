@@ -13,7 +13,8 @@ import { artifactState } from './expiry.js';
 import { TokenBucket, clientIp } from './limits.js';
 import { composeIdentity, sanitizeAwarenessUpdate } from './identity.js';
 import { AnonIssuer, assignNum } from './anon.js';
-import { INFLIGHT_MIN_COST, applyEstimateMs, inflightConnBytes, normalizeOrigin } from './config.js';
+import { INFLIGHT_MIN_COST, applyEstimateMs, incomingDeadlineMs, inflightConnBytes, normalizeOrigin, wsMaxPayload } from './config.js';
+import { IncomingFrames } from './incoming.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
 import { ledgerBound, type RoomManager } from './rooms.js';
 import { BusyError, Room, RoomGone, bufferCap, limitBuffered, sendConn, sendWs, sentBytes, underBufferCap, type Conn } from './room.js';
@@ -65,7 +66,12 @@ const SET_COOKIE = Symbol('canvas-set-cookie');
 type UpgradeReq = IncomingMessage & { [SET_COOKIE]?: string };
 
 export class WsServer {
-  readonly wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
+  /**
+   * maxPayload from the message caps (review S8; it was a fixed 8 MiB): a message past the cap plus
+   * WS_PAYLOAD_SLACK closes 1009 before it is read, and it is the most an unfinished frame or
+   * fragmented message makes `ws` hold for one connection (see IncomingFrames for how long).
+   */
+  readonly wss: WebSocketServer;
   readonly anon: AnonIssuer;
   /**
    * join buckets per principal (`u:<id>`, `a:<visitor>`), per room for anonymous joins without
@@ -87,6 +93,7 @@ export class WsServer {
 
   constructor(private readonly deps: WsDeps) {
     const { cfg } = deps;
+    this.wss = new WebSocketServer({ noServer: true, maxPayload: wsMaxPayload(cfg) });
     this.anon = deps.anon ?? new AnonIssuer(cfg.anonCookieSecret, cfg);
     this.cpuAll = new TokenBucket(cfg.cpuTotalMsPerSec, cfg.cpuTotalBurstMs);
     this.cpuAnon = new TokenBucket(cfg.anonCpuTotalMsPerSec, cfg.anonCpuTotalBurstMs);
@@ -148,7 +155,9 @@ export class WsServer {
     // is refused before the core is asked (each refused attempt cost an authz round trip: q2's
     // attackers made 670 a second). Only anonymous joins spend a visitor's join budget, so a
     // browser that logged in meanwhile is refused only while that budget refills (seconds).
-    if (!authorization) {
+    // With anonymous drawing off there are no anonymous principals: authz.ts refuses a visitor
+    // without credentials before the core is asked (4403 below), and any anonymous answer.
+    if (!authorization && this.deps.cfg.anonEnabled) {
       const v = this.anon.parse(cookie);
       if (v) {
         const p = `a:${v.nonce}`;
@@ -285,7 +294,11 @@ export class WsServer {
           ws.once('close', () => this.releasePrincipal(principal));
           // nothing the client sends is read before join() listens (the room may still load)
           ws.pause();
-          void this.join(ws, key.key, cookie, authorization, identity, visitor ? { nonce: visitor.nonce, num } : null, res.artifact?.ttl ?? null, principal, !!visitor, ip);
+          // review S8: every chunk `ws` reads is also followed here, frame header by frame header, so
+          // the sweep sees a message whose end does not come (attached while paused: nothing is missed)
+          const incoming = new IncomingFrames();
+          socket.on('data', (chunk: Buffer) => incoming.feed(chunk, Date.now()));
+          void this.join(ws, key.key, cookie, authorization, identity, visitor ? { nonce: visitor.nonce, num } : null, res.artifact?.ttl ?? null, principal, !!visitor, ip, incoming);
         });
       })
       .catch((err) => {
@@ -360,6 +373,10 @@ export class WsServer {
   //     WORKER_INFLIGHT_BYTES is refused (1013 `busy`: the client sends it again after it
   //     reconnected), a small one (an honest edit) is taken and its connection, if it had more in
   //     flight, is no longer read until the total is under the cap or its own messages are done.
+  // And a message that arrives on a connection already paused is refused (review S8): `ws` hands the
+  // receiver a whole read and emits every message in it, also after pause(), so a connection could
+  // add up to MSG_BURST messages past a cap in one read (a new connection too, with a full bucket).
+  // Now each adds at most the one that paused it, and the one before when the server is over its cap.
 
   /** What one connection, and its principal over all its connections, may have in flight before it is not read. */
   private inflightCap(conn: Conn): number {
@@ -374,6 +391,17 @@ export class WsServer {
    */
   private admitInflight(conn: Conn, bytes: number): (() => void) | null {
     const { cfg, manager, metrics, log } = this.deps;
+    if (conn.paused) {
+      // read ahead of the pause (review S8): refused, not queued; 1013 `busy` and no strike, the
+      // client sends it again after it reconnected (y-websocket syncs what the room lacks)
+      log.debug({ room: conn.artifactKey, user: conn.identity.id, bytes }, 'ws refused: message on a paused connection');
+      metrics.wsRejected.inc({ reason: 'inflight_paused' });
+      sendWs(conn.ws, encodeNotice({ kind: 'busy' }));
+      this.closeConn(conn, CLOSE.tryAgain, 'server busy');
+      // what it sends meanwhile is read and dropped: not for the 30 s of the close handshake
+      setTimeout(() => conn.ws.terminate(), 1000).unref?.();
+      return null;
+    }
     const cost = Math.max(bytes, INFLIGHT_MIN_COST);
     const over = manager.inflightBytes + cost > cfg.workerInflightBytes;
     if (over && bytes > cfg.cpuShedMinBytes) {
@@ -532,7 +560,7 @@ export class WsServer {
     if (conn.closing) return;
     this.deps.metrics.wsRejected.inc({ reason });
     this.deps.log.warn(
-      { room: conn.artifactKey, user: conn.identity.id, buffered: conn.ws.bufferedAmount + conn.backlogBytes, reason },
+      { room: conn.artifactKey, user: conn.identity.id, buffered: conn.ws.bufferedAmount + conn.backlogBytes, incoming: conn.incoming?.held ?? 0, reason },
       'ws dropped',
     );
     conn.closing = true;
@@ -581,6 +609,18 @@ export class WsServer {
         if ((conn.joining || conn.joinFrames) && now - conn.joinStarted > joinDeadlineMs(conn.joinBytes, cfg.wsJoinMinBytesPerSec)) {
           this.drop(conn, 'join_timeout');
           continue;
+        }
+        // review S8: part of a message and not its end (a frame in progress, fragments without the
+        // last one) past WS_INCOMING_TIMEOUT_MS + its bytes at WS_INCOMING_MIN_BYTES_PER_SEC: dropped,
+        // and what `ws` held for it with it. Pongs do not keep it. While the server does not read
+        // the connection (paused) the clock waits: the rest of the message is in the socket.
+        const rx = conn.incoming;
+        if (rx && rx.since) {
+          if (conn.paused) rx.since = now;
+          else if (now - rx.since > incomingDeadlineMs(rx.held, cfg)) {
+            this.drop(conn, 'incoming_timeout');
+            continue;
+          }
         }
         if (ping) {
           if (conn.awaitingPong) {
@@ -663,6 +703,7 @@ export class WsServer {
     principal: string,
     anonymous: boolean,
     ip: string | null = null,
+    incoming: IncomingFrames | null = null,
   ): Promise<void> {
     const { cfg, manager, metrics, log } = this.deps;
     let room: Room;
@@ -736,6 +777,7 @@ export class WsServer {
         : new TokenBucket(cfg.syncBytesPerSec, cfg.syncBurstBytes),
       cpu: this.principalOf(principal, identity.anonymous).cpu,
       inflight: 0,
+      incoming: incoming ?? undefined,
       principal,
       ip,
       resync: new TokenBucket(0.5, 20),

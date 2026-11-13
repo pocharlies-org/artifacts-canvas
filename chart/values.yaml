@@ -59,12 +59,20 @@ s3:
     secretAccessKeyKey: secret-key
 
 # --- Anonymous visitors ---
+# enabled: anonymous drawing (rendered as ANON_ENABLED, always: the server never falls back to
+# its own default, which is on). false (the default): a visitor without a session is refused
+# before the core is asked (the wrapper page sends it to core.loginUrl when set, else 403; the
+# WebSocket closes 4403), and so is any anonymous answer of the core, whatever
+# limits.anonAllowedPrefixes holds; no anonymous-visitor cookie is minted. true: anonymous
+# visitors draw on the keys the core opens to them, inside limits.anonAllowedPrefixes only.
+# Must be a boolean (the render fails otherwise).
 # ANON_COOKIE_SECRET signs the anonymous-visitor cookie (server-assigned "Anónimo NNNN"
 # pseudonym and the visitor id their attribution is bound to). Without it each pod uses a
 # random per-process key: cookies (and anonymous ids) do not survive a restart and are not
 # valid on another replica. REQUIRED when deployment.replicas > 1. Never put the value here:
 # reference an existing Secret (ExternalSecrets / operator-created), at least 32 random bytes.
 anon:
+  enabled: false
   cookieSecretRef:
     name: "" # e.g. artifacts-canvas-anon
     key: anon-cookie-secret
@@ -125,6 +133,12 @@ limits:
   # A peer holding more than 256 KiB that drained less than wsJoinMinBytesPerSec for this long
   # counts as stalled (dropped first when the outgoing budget is short).
   wsStallMs: 3000
+  # A peer that sent part of a message (a frame, or fragments without the last one) and not its
+  # end within wsIncomingTimeoutMs + its bytes at wsIncomingMinBytesPerSec is dropped, and what the
+  # server held for it is released; answering pings does not keep it. A message is at most
+  # maxMessageBytes + 64 KiB (more is closed 1009 unread): 158 s at the defaults.
+  wsIncomingTimeoutMs: 30000
+  wsIncomingMinBytesPerSec: 32768
   # Sync step-2 answers after the first one per connection, bytes/s and burst.
   syncBytesPerSec: 1048576
   syncBurstBytes: 4194304
@@ -195,6 +209,8 @@ limits:
   roomMemoryAnonShare: 0.3333
   # Optional key-space allowlist, e.g. ["runs/", "pub/"]. Empty = any structurally valid key.
   artifactPrefixes: []
+  # Where anonymous visitors may draw when anon.enabled is true (empty = the server's default,
+  # pub/). It does not turn anonymous drawing off: anon.enabled does.
   anonAllowedPrefixes: ["pub/"]
 
 # --- Room isolation (fv9) ---
@@ -215,7 +231,8 @@ limits:
 # connections (Node buffers, outside every V8 heap; part of the memory formula below). Over it a
 # message bigger than limits.cpuShedMinBytes is refused (1013, the client resends it); a connection,
 # and a principal over all its connections, is no longer read (TCP backpressure) while it has two
-# messages of the largest size in flight (1 MiB at least).
+# messages of the largest size in flight (1 MiB at least), and a message that arrives on it
+# meanwhile is refused (1013). Every message counts 2 KiB at least (what a tiny one holds queued).
 worker:
   messageTimeoutMs: 1000
   timeoutNsPerByte: 1000
