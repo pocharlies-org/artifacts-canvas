@@ -145,7 +145,7 @@ its own message type, LEDGER (102).
 | 2 | AUTH | server → client | y-protocols/auth (permission denied + reason) |
 | 3 | QUERY_AWARENESS | client → server | — |
 | **100** | **IDENTITY** | server → client | `varString` JSON `Identity` (below). MUST be the **first** message on every connection. |
-| **101** | **NOTICE** | server → client | `varString` JSON `{kind, message?}`, `kind` ∈ `revoked`, `expired`, `readonly`, `rate-limited`, `too-large`, `shutdown`, `busy` (a capacity refusal, closed `1013`: the client reconnects by itself) |
+| **101** | **NOTICE** | server → client | `varString` JSON `{kind, message?}`, `kind` ∈ `revoked`, `expired`, `readonly`, `rate-limited`, `too-large`, `too-costly` (a delete the server would need too long to apply at once, closed `4413`: the canvas is not full, fewer shapes at a time go through), `shutdown`, `busy` (a capacity refusal, closed `1013`: the client reconnects by itself) |
 | **102** | **LEDGER** | server → client **only** | `varUint8Array` Yjs update (v1) of the room's ledger document. A client that sends a 102 is closed `4403` (`ledger is read-only`); its bytes are never applied. |
 
 ```ts
@@ -479,7 +479,14 @@ load waits for it, and a failed load leaves no room behind), saves debounced (`S
 and flushes on last leave and on shutdown; each save writes the ledger, then the content. Saves
 are serialized. Every change since the last save that reached storage is also kept, in order, in
 the room's write-ahead log on the main thread (the updates the documents emitted: what was
-broadcast); a save truncates it once both objects are written.
+broadcast); a save truncates it once both objects are written. A save that fails is retried by
+itself (`SAVE_DEBOUNCE_MS` x 2^failures, at most 30 s; a change meanwhile still saves after the
+debounce). While the saves fail the log is bounded: past `WAL_MAX_DOCS` (4) x `MAX_DOC_BYTES`
+the room refuses every write `1013` `busy` (nothing is applied: the clients keep their edits and
+send them again once they reconnected) until a save reaches storage; what the log holds beyond
+the room's own size counts in the memory budget (§11); and a room whose changes are not in
+storage is not evicted when its last connection leaves (before, it was, and the edits since its
+last save were lost: fv4 L2), it is once a save succeeds.
 Credentials are scoped by the core to `_plugins/canvas/` (Get/Put/Delete/List on the prefix
 only).
 
@@ -515,12 +522,25 @@ that is gone or expired.
   the message, the apply up to twice its estimate on top). A message that makes its room's
   worker miss the watchdog, run out of heap or crash closes its sender `4413` (notice
   `too-large`) with a **strike**, and so does an update the guard refuses for the work it would
-  cost (cuts, merges, deletes, placement over the caps, client blocks: `4413`); `WORKER_STRIKES` (3) within `WORKER_STRIKE_WINDOW_MS` (10 min)
+  cost (cuts, merges, deletes, placement over the caps, client blocks: `4413`), except one that
+  only deletes: an honest bulk delete of thousands of shapes another session wrote can be one, so
+  it is refused `4413` with notice `too-costly` and no strike (the guard that refused it cost only
+  its own time, charged to the sender; the editor deletes big selections `DELETE_BATCH` (1 000)
+  shapes per update: 414 ms estimated at most for a room past the size cap,
+  `server/test/fv9/delete-batch.ts`); `WORKER_STRIKES` (3) within `WORKER_STRIKE_WINDOW_MS` (10 min)
   refuse the principal's joins and writes for `WORKER_STRIKE_COOLDOWN_MS` (10 min) → `1013`;
   anonymous visitors also per client IP (when `CLIENT_IP_HOPS` says where it is) and all
   together after `WORKER_ANON_POOL_STRIKES` (10). The room is rebuilt in a fresh worker and
   nobody else is closed. One client message is processed at a time over all rooms
   (`WORKER_APPLY_CONCURRENCY` 1, the memory formula reserves one).
+- **Messages in flight** (§12): a client message (sync step 1, step 2, update) counts from its
+  receipt until its room's worker processed it. A connection, and a principal over all its
+  connections, with two messages of the largest size in flight (1 MiB at least: 8 MiB, anonymous
+  2 MiB) is no longer read until they are processed (TCP backpressure); a message bigger than
+  `CPU_SHED_MIN_BYTES` (16 KiB) that would take everything in flight past
+  `WORKER_INFLIGHT_BYTES` (64 MiB) → `1013` `busy` (metric `canvas_ws_rejected_total{reason="inflight"}`);
+  a smaller one (an honest edit) is taken, and its connection is not read while it has more in
+  flight and the total is over the cap.
 - **Awareness hardening** (§5.4): the `user` field is overwritten with the verified
   identity; states for clientIds already owned by another connection are dropped; every state
   is reduced to the presence schema.
@@ -648,7 +668,9 @@ that is gone or expired.
   So the charges of a room always add up to its cost, and the loaded rooms cost what the
   principals are charged together.
   **Bounds.** Loads stop at 85% of the budget (after evicting rooms nobody is connected to),
-  growth at 80%, both with `1013` `busy`. A principal may be charged at most
+  growth at 80%, both with `1013` `busy`. A room's write-ahead log counts too where it holds more
+  than the room's own size (saves failing: §8), and a room whose changes are not in storage is
+  not counted as evictable. A principal may be charged at most
   `ROOM_MEMORY_PRINCIPAL_SHARE` (a third of the budget; an anonymous visitor a quarter of that),
   all anonymous visitors together `ROOM_MEMORY_ANON_SHARE` (a third; the two shares together may
   not pass 80%). For a room an anonymous visitor loads, the anonymous pool pays the room's
@@ -779,11 +801,30 @@ bounded by isolation:
   `--max-old-space-size`: that V8 flag applies to every thread and overrides each worker's limit
   (measured: a worker limited to 47 MiB ran out of memory at 1 728 MiB under
   `--max-old-space-size=1728`); the heap the budget is derived from is `HEAP_LIMIT_MB`, and the
-  server warns at start when the flag is set. One client message is processed at a time
+  server refuses to start when the flag is set (`NODE_OPTIONS` or the command line; it only
+  warned before). One client message is processed at a time
   over all rooms (`WORKER_APPLY_CONCURRENCY`; a message holds its slot for its guard and apply),
   so at most one worker is past its room's size at a time: the process holds the loaded rooms
-  (≤ 85% of the budget) plus one worker's headroom plus the main thread (chart `values.yaml`,
-  "Memory").
+  (≤ 85% of the budget) plus one worker's headroom plus the main thread plus the messages in
+  flight (chart `values.yaml`, "Memory"; the chart refuses to render a memory limit that cannot
+  hold that for its `heapLimitMb`). Workers get an empty environment (`env: {}`): nothing in them
+  reads it, and they do not need the process's secrets.
+- **Messages in flight.** A client message waits for its room's queue and the apply slot before
+  a worker processes it. On the single-threaded server it was guarded and applied in the
+  handler, so the process did not read the socket meanwhile and TCP backpressure bounded what a
+  client could make it hold; once messages queued, nothing did (one writer at link speed could
+  make it hold hundreds of MiB of Node buffers, outside every V8 heap, and the pod was
+  OOM-killed). So every sync step 1, step 2 and update counts from its receipt until it was
+  processed (or dropped): a connection, and a principal over all its connections, with
+  `max(2 x MAX_MESSAGE_BYTES, 1 MiB)` in flight is no longer read (`ws.pause()`) until that falls
+  under (metric `canvas_ws_paused_total{why="connection"|"principal"}`); a message bigger than
+  `CPU_SHED_MIN_BYTES` that would take the total past `WORKER_INFLIGHT_BYTES` (64 MiB) is refused
+  `1013` `busy` (`canvas_ws_rejected_total{reason="inflight"}`), which is what bounds many
+  principals together; a smaller one is taken (an honest edit is never refused for it) and its
+  connection, if it has more in flight, is not read until the total is under the cap
+  (`why="server"`). What is held is `canvas_ws_inflight_bytes`. Beyond the cap, the bound is one
+  message per connection being read when it was paused (the `ws` receiver's frame, at most its
+  `maxPayload`, as on any connection).
 - **Watchdog.** Every request to a worker has a hard timeout. A client message (guard and
   apply together, one deadline): `WORKER_MESSAGE_TIMEOUT_MS` (1 000; an honest update missed 250
   under CPU contention, and a fresh worker's first message runs unoptimised code) +
@@ -799,10 +840,15 @@ bounded by isolation:
   flight are done) plus its **write-ahead log** — every change the documents emitted since that
   save, content and ledger, in order, replayed with an origin the stamper ignores (the ledger is
   replayed, not stamped again) — and never the offending message (it emitted nothing the main
-  thread kept: changes are taken in only with a worker's answer). The rebuilt room is byte for
-  byte the one it replaces (content and ledger encodings; `server/test/fv9.test.ts`); its join
-  frames and state vector stay valid. Then every connected client is sent a sync step 1: an
-  honest tab answers with whatever the room lacks (nothing, normally; its edits that queued
+  thread kept: changes are taken in only with a worker's answer). The rebuilt room is the same
+  document as the one it replaces: the same content and state vector, its join frames stay valid;
+  the ledger's encoding is byte for byte the same, the content's can differ where Yjs merged
+  structs in another order under concurrent edits (8 of 168 rebuilds in the review's PoC, each
+  the same document; `server/test/fv9.test.ts` checks bytes without concurrent edits, and
+  `canvas_worker_recoveries_total{outcome="differs"}` compares state vectors). Then every
+  connected client is sent a sync step 1, and its resync budget (the step 1s the server may send
+  it for updates that do not integrate, 20) is filled again: the rebuild asked, not the client.
+  An honest tab answers with whatever the room lacks (nothing, normally; its edits that queued
   behind the fault are processed after the rebuild). Messages of the room queue meanwhile (the
   room's jobs run one at a time, in arrival order). If the rebuild fails too, every connection
   of the room is closed `1013` (they reconnect and resync) and the room is dropped; its log is

@@ -1,5 +1,65 @@
 # Known issues
 
+## Review of the fv9 branch (security and QA)
+
+The security review and the independent QA verification of the room-isolation branch found one
+Medium (M-1) and six more (F-1 to F-6), plus a wording issue (I-1). Regressions:
+`server/test/fv9-review.test.ts`, `client/tests/doc.test.ts`, `e2e-system/adversarial-inflight.spec.ts`;
+measurement: `server/test/inflight/flood.ts`; probe: `server/test/fv9/delete-batch.ts`.
+
+- [x] **M-1 — Client messages queued without a bound behind the apply slot (Medium).** A message
+  waits for its room's queue and the one apply slot; on the single-threaded server it was guarded
+  and applied in the handler, so TCP backpressure bounded what a client could make the process
+  hold, and once messages queued nothing did: one signed-in writer sending 4 MiB updates the guard
+  accepts at link speed made the server hold what arrived (Node buffers, outside every V8 heap and
+  the room budget) until its CPU budget closed it, ~0.6 GiB per account on 1 Gbps against 328 MiB
+  of headroom: OOM-killed, every room down. Now every message counts in flight until it is
+  processed: a connection, and a principal, with two messages of the largest size in flight (8 MiB)
+  is no longer read (TCP backpressure again); a message over 16 KiB that would take the total past
+  `WORKER_INFLIGHT_BYTES` (64 MiB) is refused `1013`; an honest edit is never refused for it
+  (protocol §12). The memory formula and the chart's render check count the cap.
+- [x] **F-1 — An honest bulk delete was struck (Medium).** A co-writer filled a shared board with
+  10 400 shapes from one session; an honest user who selected half and pressed Delete was refused
+  `4413` (the delete is estimated over `MAX_APPLY_MS`) **and struck**: three tries were a 10-minute
+  cooldown on every canvas, reads included, and the notice said the canvas was full. Now a
+  refused update that only deletes is not struck and says `too-costly` ("delete fewer shapes at a
+  time"), and the editor deletes a selection `DELETE_BATCH` (1 000) shapes per update (one undo
+  step): 414 ms estimated at most, also for a room past the size cap. Still refused, not struck:
+  an undo of thousands of shapes (one transaction) and a big delete made offline (it comes back as
+  one step 2).
+- [ ] **F-2 — One cookieless client locks every anonymous visitor out for 10 minutes (Medium if
+  anonymous drawing is on; Low while it is off).** See "The anonymous strike pool" below: 10
+  updates of 257 client blocks (43 KB in all) are 10 guard refusals, each a strike of the
+  anonymous pool, and every anonymous join and write is refused `1013` for the cooldown. Signed-in
+  users are never affected. **Fix before enabling anonymous drawing**, together with the real
+  `CLIENT_IP_HOPS` of the deployment's proxy path (with more than one appending proxy, the per-IP
+  key is the previous proxy's address, and its threshold is lower than the pool's).
+  Suggested fix: no pool strike for guard refusals (they cost the server only the guard, charged);
+  keep the pool for real worker faults, or pool per client IP prefix.
+- [ ] **F-3 — One accepted costly message holds every room's edits (Low, design).** The entry "One
+  client message is processed at a time" below, measured: a 12-byte delete the guard accepts
+  (~0.75 s of Yjs in a 10 400-shape room) delays an edit in another room by up to 0.74 s, three
+  principals doing it together by 2.2 s; no strike (it is accepted), bounded by the CPU budgets.
+- [x] **F-4 — A rebuild did not refill the resync budget.** The one honest refusal seen under
+  constant forced rebuilds (below) is consistent with it: a rebuild sends every tab a step 1 but
+  left its resync budget (20 step-1 requests, +1 every 2 s) as it was. Now the budget is filled
+  again for every tab a rebuild asks.
+- [x] **F-5 — `--max-old-space-size` was only warned about (Low).** With it every room worker may
+  grow to the whole heap (a 64 MiB worker ran out at 1 668 MiB), so one message that exhausts a
+  heap takes every room down. The server now refuses to start with it (`NODE_OPTIONS` or the
+  command line), and the chart refuses to render a `resources.limits.memory` that cannot hold its
+  `heapLimitMb` (values.yaml, "Memory"). Also: the worker test hooks refuse to start under
+  `NODE_ENV=production` unless `WORKER_TEST_HOOKS_IN_PRODUCTION` says it is a test stack, and the
+  workers get an empty environment.
+- [x] **F-6 — The write-ahead log grew without a bound while saves failed (Low).** Now a failed
+  save is retried by itself with a backoff; past 4 rooms at the size cap the room refuses writes
+  `1013` until a save succeeds (nothing accepted is lost: the clients send the refused edits again
+  once they reconnect); what the log holds beyond the room counts in the memory budget; and a room
+  whose changes are not in storage is not evicted (fv4 L2 below, fixed with it).
+- [x] **I-1 — "byte for byte".** A rebuilt room is the same document (content and state vector);
+  its content's encoding differed in 8 of 168 rebuilds under concurrent edits (Yjs merged structs
+  in another order), the ledger's never. The documentation says so now.
+
 ## Ninth verification (fv9)
 
 All findings of fv9 are fixed: A (a run of items Yjs merges, 183 KB, crashed the canvas out of
@@ -7,14 +67,15 @@ heap), B (separate mergeable pairs, 5.4 s), C (a delete-only update enabling mer
 (formatting items in a note, 60 s per anonymous message), E (the guard's own dependency check,
 27 s), F (anonymous visitors charged one visitor share for rooms that cost the budget 651 MiB).
 On top of the fixes, every room now runs in a worker thread of its own with a heap limit and a
-watchdog (protocol §12), so a path nobody has found yet costs one room's worker, rebuilt byte
-for byte, never the process. Regressions: `server/test/fv9.test.ts`,
+watchdog (protocol §12), so a path nobody has found yet costs one room's worker, rebuilt as the
+same document, never the process. Regressions: `server/test/fv9.test.ts`,
 `e2e-system/adversarial-fv9.spec.ts`; PoCs and probes: `server/test/fv9/`. What the new design
 leaves open:
 
-- [ ] **One client message is processed at a time over all rooms (Low, design).** The apply slot
-  (`WORKER_APPLY_CONCURRENCY` 1) bounds the memory of the messages in flight to one worker's
-  headroom, as one main thread did before; a message holds it for its guard and apply, so other
+- [ ] **One client message is processed at a time over all rooms (Low, design; review F-3).** The
+  apply slot (`WORKER_APPLY_CONCURRENCY` 1) bounds the memory of the messages being processed to
+  one worker's headroom, as one main thread did before (the ones waiting for it are bounded by
+  `WORKER_INFLIGHT_BYTES`, review M-1); a message holds it for its guard and apply, so other
   rooms' updates wait behind it (up to its watchdog: 1 s + 1 us per byte, its apply up to twice
   its estimate, `MAX_APPLY_MS` 1 000 ms at most). Honest edits take well under a millisecond; an
   attacker's messages are bounded by the CPU budgets and the strikes. The main thread never
@@ -28,21 +89,23 @@ leaves open:
   the default caps. A pool of workers would cost less but a fault would cost every room in the
   faulted worker, and their heap limits could not follow one room.
 
-- [ ] **The anonymous strike pool can be used to lock anonymous visitors out (Low).** Cookieless
+- [ ] **The anonymous strike pool can be used to lock anonymous visitors out (Low while anonymous
+  drawing is off, Medium once it is on: review F-2, above).** Cookieless
   visitors are a new principal on every connection, so their strikes also count together:
   `WORKER_ANON_POOL_STRIKES` (10) worker faults from anonymous messages within 10 minutes refuse
   every anonymous join and write for 10 minutes. With `CLIENT_IP_HOPS` set, an IP that faults
   `WORKER_STRIKES` times is refused first. Signed-in users are never affected.
   Suggested fix: a pool per client IP prefix when the IP is known, the global pool only without.
 
-- [ ] **A delete of thousands of shapes one tab created in one session can be refused (Low).**
+- [x] **A delete of thousands of shapes one tab created in one session can be refused (Low).**
   Yjs splices the writer's struct array once per deleted shape (its fields merge into one GC
   struct), so deleting the first 6 000 of 12 000 shapes written from one client id takes Yjs
   ~0.9 s on x86; the guard counts it and refuses a delete estimated over `MAX_APPLY_MS` (1 000)
-  with 4413. Deleting them in smaller selections, or from a later session (another client id),
-  works.
+  with 4413. Since the review (F-1) the editor deletes big selections in parts of 1 000 shapes,
+  and a refused delete is not struck and says `too-costly`; an undo of thousands of shapes is
+  still one update and can still be refused.
 
-- [ ] **One honest refusal under constant forced rebuilds, not reproduced (Low, open).** The
+- [x] **One honest refusal under constant forced rebuilds, not reproduced (Low; review F-4).** The
   honest-edit fuzzer with the room's worker replaced at 1% of its steps (~1 rebuild per 100
   steps, far more than any fault rate) refused one honest tab once: `4403 write to pending not
   allowed` (its resync budget, 20 step-1 requests, ran out) in seed 204, y-websocket order, run 8,
@@ -50,7 +113,9 @@ leaves open:
   rebuilds on a Mac otherwise gave 0 refusals and 0 divergence, and that seed did not repeat it.
   Without rebuilds: 0 in 107 254 updates. Suspected: the resync budget, not the rebuilt state
   (`canvas_worker_recoveries_total{outcome="differs"}` stays 0).
-  Suggested fix: reproduce with `HONEST_DUMP`; reset a connection's resync budget on a rebuild.
+  The review did not reproduce it either (790 runs of that seed, 28 741 updates, 3 694 rebuilds:
+  0 refusals). Fixed by its suspected cause: a rebuild now fills the resync budget of every tab it
+  asks for a step 1 (review F-4).
 
 - [ ] **A rebuild that fails drops the room's log (Low).** If a room cannot be rebuilt after a
   fault (its saved objects unreadable, the replay failing — never seen), its connections are
@@ -277,12 +342,13 @@ meant to become one GitHub issue.
   claim arrives, not on the first write; or refuse new client ids from a principal that
   announced none.
 
-- [ ] **L2 — A failed save at last leave still evicts the room (Low).** `RoomManager.leave`
-  (`server/src/rooms.ts`) drops the room after `flush()` even when the save failed: the unsaved
-  edits are lost and then relayed by the next tab as in M1.
-  Suggested fix: keep the room (and retry the save with backoff) while it is dirty after a
-  failed flush; evict only once a save succeeded or after a bounded number of retries, with a
-  metric and an error log.
+- [x] **L2 — A failed save at last leave still evicts the room (Low).** `RoomManager.leave`
+  (`server/src/rooms.ts`) dropped the room after `flush()` even when the save failed: the unsaved
+  edits were lost and then relayed by the next tab as in M1. Fixed with the review's F-6: a room
+  whose changes are not in storage stays loaded (and is not counted as evictable memory), its
+  save retried with a backoff (at most every 30 s), and is evicted once a save succeeds; its log is
+  bounded meanwhile. Not bounded in time: while storage stays down, such idle rooms stay loaded
+  (`canvas_saves_total{outcome="error"}`).
 
 - [ ] **L3 — Draw strokes are expensive to render (Low).** The largest stroke the server accepts
   (`MAX_POINTS` = 300 000 numbers, a ~600 KB update) renders to 44.5 MB of SVG. Bounded by the

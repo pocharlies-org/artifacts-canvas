@@ -3,7 +3,8 @@
  * verification's PoCs, live. Before: one anonymous 183 KB message ran the canvas out of heap
  * (container restarted), one 0.72 MB anonymous message froze it 64 s. Now every room runs in a
  * worker thread of its own (fv9 isolation) and the known paths are counted and refused in the
- * guard. For every PoC: its sender is closed (4413/4403), a signed-in user in ANOTHER room sees
+ * guard. For every PoC: its sender is closed (4413/4403; C, a delete, is not struck since the
+ * review's F-1), a signed-in user in ANOTHER room sees
  * the canvas answer WebSocket pings within 200 ms the whole time, the canvas container never
  * restarts, and the attacked room keeps every honest edit (a fresh joiner gets exactly what an
  * honest participant holds). F: anonymous visitors cannot fill the memory budget with stored
@@ -300,9 +301,17 @@ test('fv9 A-E live: every PoC is refused in its room\'s worker; the canvas answe
       await sleep(4000);
     }
     expect(a.closeCode).toBeNull();
-    results.C = await attack('C', { honest, victim: v, attacker: a, update: deleteRanges(900_004, 360_000, 80_000), joinUrl: wsUrl(cRoom.canvas), joinCookie: c2, want: 4413, strikes: 1 });
+    // review F-1: an update that only deletes is refused (`too-costly`) but not struck: an honest
+    // bulk delete can be one
+    results.C = await attack('C', { honest, victim: v, attacker: a, update: deleteRanges(900_004, 360_000, 80_000), joinUrl: wsUrl(cRoom.canvas), joinCookie: c2, want: 4413, strikes: 0 });
+    expect(a.notices).toContain('too-costly');
   }
-  // three strikes of user3 within the window: its joins wait out the cooldown (1013), user2's do not
+  {
+    // the third strike of user3: B again (pairs the guard refuses for their merges)
+    const a = await mallory();
+    results.B2 = await attack('B2', { honest, victim, attacker: a, update: mergePairs(points(a.doc, 'd0'), points(a.doc, 'd1'), 900_005, 100_000), joinUrl: wsUrl(userRoom.canvas), joinCookie: c2, want: 4413, strikes: 1 });
+  }
+  // three strikes of user3 within the window (B, E, B2): its joins wait out the cooldown (1013), user2's do not
   const after = new Raw(wsUrl(userRoom.canvas), c3);
   await after.ready(10_000);
   const coolCode = await after.closed(10_000);

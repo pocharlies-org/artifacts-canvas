@@ -146,7 +146,9 @@ past every share opening for its owner, screenshots pasted through the editor un
 canvas is full, a user opening a second big room after leaving the first to a colleague, the fv9 messages that
 crashed or froze the canvas (runs and pairs of items Yjs merges, deletes that make it merge, formatting items,
 20 000 client blocks) refused while a signed-in user in another room sees pings answered within 200 ms and the
-container never restarts, anonymous visitors unable to fill the memory with stored `pub/` rooms, and — with
+container never restarts, anonymous visitors unable to fill the memory with stored `pub/` rooms, a signed-in
+writer flooding 4 MiB updates from one and from eight connections while the canvas stops reading it and stays
+within its in-flight cap and memory, and — with
 `CANVAS_WORKER_TEST_HOOKS=true` for `docker compose up` and `SYSTEM_WORKER_TEST_HOOKS=1` for the suite — a room
 worker that loops forever or allocates without bound replaced while the canvas lives on); and finally the core's own
 `deploy/compose/e2e.sh`, which must still pass with the plugin enabled. The canvas container runs under the
@@ -215,7 +217,10 @@ The canvas is a core plugin (design §8): the core answers *who may see this art
 
    The chart ships the Deployment, Service (`http` 8080, `metrics` 9091), ConfigMap, ServiceAccount and a
    NetworkPolicy: `http` only from the ingress controller's namespace and the core's namespace, `metrics`
-   only from `networkPolicy.metricsNamespaces`.
+   only from `networkPolicy.metricsNamespaces`; with `alerts.enabled` also a PrometheusRule (strike
+   cooldowns, worker timeouts, failed rebuilds, in-flight refusals, writes refused while saves fail).
+   It refuses to render a `resources.limits.memory` that cannot hold its `heapLimitMb` (see "Memory"
+   in `values.yaml`: change both together).
 
 ## Configuration reference (server)
 
@@ -267,8 +272,10 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `WORKER_MESSAGE_TIMEOUT_MS`, `WORKER_TIMEOUT_NS_PER_BYTE` | `1000`, `1000` | Watchdog of a client message in its room's worker (guard and apply; the apply up to twice its estimate on top). Missed, out of heap or crashed: the worker is terminated, the room rebuilt from storage and its write-ahead log, the sender closed `4413` and struck (fv9, protocol §12). |
 | `WORKER_OP_TIMEOUT_MS`, `WORKER_OP_NS_PER_BYTE` | `10000`, `2000` | Watchdog of an operation on a whole room (load, join encodings, save, a rebuild's replay). |
 | `WORKER_APPLY_CONCURRENCY` | `1` | Client messages processed at once over all rooms (the memory budget reserves one message per slot). |
+| `WORKER_INFLIGHT_BYTES` | `67108864` | Client messages received and not processed yet, over all connections (64 MiB; Node buffers outside the heap, counted in the chart's memory formula). Past it a message over `CPU_SHED_MIN_BYTES` → `1013`; a connection, and a principal, with `max(2 × MAX_MESSAGE_BYTES, 1 MiB)` in flight is not read until it is processed (protocol §12). |
 | `WORKER_STRIKES`, `WORKER_STRIKE_WINDOW_MS`, `WORKER_STRIKE_COOLDOWN_MS`, `WORKER_ANON_POOL_STRIKES` | `3`, `600000`, `600000`, `10` | Strikes within the window put a principal (anonymous: also its IP, and all anonymous visitors after the pool's count) in a cooldown: joins and writes `1013`. |
-| `HEAP_LIMIT_MB` | V8's heap limit | The heap the process may use, all threads together: the loaded-room budget is derived from it. Use it, not `--max-old-space-size`: that V8 flag applies to every thread and overrides each room worker's own heap limit (fv9; the server warns at start when it is set). |
+| `HEAP_LIMIT_MB` | V8's heap limit | The heap the process may use, all threads together: the loaded-room budget is derived from it. Use it, not `--max-old-space-size`: that V8 flag applies to every thread and overrides each room worker's own heap limit, and the server refuses to start with it (`NODE_OPTIONS` or the command line). The chart refuses a `resources.limits.memory` too small for its `heapLimitMb` (values.yaml, "Memory"). |
+| `WORKER_TEST_HOOKS` | `false` | Test stacks only: a client update carrying `canvas-test-hook:<busy\|alloc\|throw>` makes its room's worker misbehave. Refused at start under `NODE_ENV=production` (the image's) unless `WORKER_TEST_HOOKS_IN_PRODUCTION=true` (the compose stack sets both); the chart renders neither. |
 | `ROOM_BASE_COST_BYTES` | `16777216` | Resident cost of an empty loaded room, its worker thread included (measured 15.7 MiB in the image). |
 | `ALLOWED_ORIGINS` | origin of `ARTIFACT_BASE_URL` | Comma-separated browser origins (`scheme://host[:port]`) allowed to open the WebSocket. A missing, `null` or foreign `Origin` is closed `4403` (cross-site WebSocket hijacking guard). |
 | `METRICS_PORT` / `METRICS_HOST` | `9091` / `0.0.0.0` | Internal Prometheus listener (`/metrics` only; `0` disables it). The public listener answers `404` for `/metrics`. |
