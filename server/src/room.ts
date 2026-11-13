@@ -435,6 +435,7 @@ export class Room {
         if (this.step1Cache && this.step1Cache.version === this.contentVersion && !bytesEqual(this.step1Cache.raw, sv)) {
           // never seen; the join caches are dropped so that no join gets frames of another state
           log.error({ room: this.name }, 'rebuilt room differs from the one it replaces');
+          metrics.workerRecoveries.inc({ outcome: 'differs' });
           this.contentSnap = null;
           this.ledgerSnap = null;
         }

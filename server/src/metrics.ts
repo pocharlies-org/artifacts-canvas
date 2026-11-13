@@ -155,7 +155,7 @@ export class Metrics {
   });
   readonly workerRecoveries = new Counter({
     name: 'canvas_worker_recoveries_total',
-    help: 'Rooms rebuilt in a fresh worker from their saved state and write-ahead log after a fault (outcome="ok"), or dropped because that failed too (outcome="failed")',
+    help: 'Rooms rebuilt in a fresh worker from their saved state and write-ahead log after a fault (outcome="ok"), or dropped because that failed too (outcome="failed"); outcome="differs": a rebuilt room whose state vector is not the one it replaced (never expected)',
     labelNames: ['outcome'],
     registers: [this.registry],
   });

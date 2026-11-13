@@ -537,6 +537,7 @@ describe('fv9 isolation: a message that makes its room\'s worker misbehave costs
       expect(r.refusals).toEqual({});
       expect(r.refused + r.diverged).toBe(0);
       expect(r.restarts).toBeGreaterThan(20);
+      expect(r.rebuildsDiffering).toBe(0);
     }
   }, 300_000);
 });

@@ -62,6 +62,8 @@ export interface HonestResult {
   resyncs: number;
   /** forced worker restarts (fv9: the room rebuilt from storage and its log mid-session) */
   restarts: number;
+  /** rebuilt rooms whose state vector differed from the room they replaced (must stay 0) */
+  rebuildsDiffering: number;
   refusals: Record<string, { n: number; example: string }>;
   ops: Record<string, number>;
   ms: number;
@@ -162,7 +164,7 @@ const tick = () => new Promise<void>((r) => setImmediate(r));
 export async function runHonestFuzz(runs: number, seed: number, steps = 400, mode: HonestMode = 'client', restartRate = 0): Promise<HonestResult> {
   const rnd = lcg(seed * 2654435761 + (mode === 'client' ? 1 : 2));
   const pick = <T>(a: readonly T[]): T => a[Math.floor(rnd() * a.length)];
-  const res: HonestResult = { seed, mode, runs: 0, steps: 0, updates: 0, reconnects: 0, refused: 0, diverged: 0, resyncs: 0, restarts: 0, refusals: {}, ops: {}, ms: 0 };
+  const res: HonestResult = { seed, mode, runs: 0, steps: 0, updates: 0, reconnects: 0, refused: 0, diverged: 0, resyncs: 0, restarts: 0, rebuildsDiffering: 0, refusals: {}, ops: {}, ms: 0 };
   const t0 = Date.now();
   const cfg = loadConfig({
     GATE_AUTHZ_URL: 'http://core.invalid/authz', ARTIFACT_BASE_URL: 'http://core.invalid/a', S3_BUCKET: 'canvas-fuzz',
@@ -565,6 +567,7 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
       }
     }
     res.resyncs += ((await metrics.pendingResync.get()).values[0]?.value ?? 0) - resyncs0;
+    res.rebuildsDiffering = (await metrics.workerRecoveries.get()).values.filter((v) => v.labels.outcome === 'differs').reduce((a, v) => a + v.value, 0);
     for (const t of tabs) {
       if (t.link) disconnect(t);
       t.conn?.destroy();
