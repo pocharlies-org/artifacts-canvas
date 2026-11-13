@@ -81,8 +81,10 @@ inline element in the wrapper HTML (JSON, HTML-escaped):
 ```
 
 Fields: `artifactPath`, `room`, `frameUrl`, `wsUrl`, `vendorUrl`, `shareUrl`, `pageWidth`,
-`title`, `lang` (`es` default, `en`), `maxImageBytes`, `dev` (never `true` in production: it
-enables a local identity and the `?as=` / `?room=` / `?artifact=` query parameters).
+`title`, `lang` (`es` default, `en`), `maxImageBytes`, `maxDocBytes` (the visitor's room cap:
+`MAX_DOC_BYTES`, `ANON_MAX_DOC_BYTES` for an anonymous visitor; the editor says the canvas is
+full before an image would pass it, fv8 U1), `dev` (never `true` in production: it enables a
+local identity and the `?as=` / `?room=` / `?artifact=` query parameters).
 
 ## 3. Frame: the artifact, isolated
 
@@ -507,9 +509,20 @@ that is gone or expired.
   `4429`; message size 4 MiB (anon 1 MiB) → `4413`; room size 5 MiB (anon 1.25 MiB), **content
   plus ledger** → `4413` (all of them lowered at start to what the memory budget holds, see
   "Loaded rooms" below; the ledger an update will add is counted ahead, `ledgerBound` §11),
-  where a delete that splits live items counts 24 bytes per split on
-  top of its size (fv5 L-2: deleting every other character grew a room 8x with "deletes only";
-  an update that only removes whole items always passes); room connections 50 (anon rooms 10)
+  where every **cut** an update makes in an item counts `SPLIT_COST_BYTES` (32) on top of its
+  size: an insert whose origin or right origin names a clock inside an item, a struct the room
+  has re-sent with such an origin (Yjs resolves it before it skips the struct), a delete range
+  that starts or ends inside a live item, in the room's items or the update's own (fv5 L-2:
+  deleting every other character grew a room 8x with "deletes only"; fv8 P1: inserting a point
+  between every two points of two strokes, 3.97 MB, was stored at 7.5 MiB against an estimate of
+  4.28; an update that only removes whole items always passes); an update with more than
+  `MAX_SPLITS_PER_MESSAGE` (5 000) cuts, or whose cuts and placement Yjs would need more than
+  `MAX_APPLY_MS` (50 ms) for by the server's estimate → `4413` for that connection (fv8 P2: Yjs
+  copies an item for every cut, and scans every item between a new item's origin and its right
+  origin: the 3.97 MB update held the event loop 53-65 s, 2 000 forged items with far right
+  origins 20 s; the guard counts both, §11); the apply of an update is charged to the CPU
+  budgets below **before** it runs, by its estimate, and one they cannot cover → `1013` `busy`
+  (an estimate under 1 ms is charged after, as any message); room connections 50 (anon rooms 10)
   → `1013`; connections per logged-in user 8 and per anonymous visitor 2, **over all rooms** →
   `1013`; joins per user 30/min burst 20, per anonymous visitor cookie 10/min burst 6, per room
   for anonymous joins **without** a visitor cookie 60/min burst 30 (a refusal sets the cookie,
@@ -538,16 +551,19 @@ that is gone or expired.
   total back under it.
   **Loaded rooms** (fv6 H-1, fv7 F1, §11): every loaded room's estimated cost is charged to the
   principal whose join loaded it, and what each accepted update adds to the room to the principal
-  that sent it, in full (never split with the others connected: readers pay nothing); a charge
-  stays while the room stays loaded, also after its principal left, and each save replaces the
-  estimates of the updates since the previous one by what the room measures. A join that would
+  that sent it, in full (never split with the others connected: readers pay nothing); what a
+  principal wrote stays charged to it while the room stays loaded, also after it left, while
+  its load charge moves to the principals still connected, as far as their shares hold it (fv8
+  U2); each save replaces the estimates of the updates since the previous one by what the room
+  measures. A join that would
   load a room past **85%** of the room memory budget (derived from the V8 heap limit,
   `ROOM_MEMORY_BUDGET_BYTES`), and an update that would grow the loaded rooms past **80%** of it,
   → `1013` (`busy`): the 5% between them is always left for loads; rooms with no connection are
   evicted first. A load or a growing update that would charge its principal past a **third** of
   the budget (`ROOM_MEMORY_PRINCIPAL_SHARE`; an anonymous visitor a quarter of that, 1/12), or
   all anonymous visitors together past a **third** (`ROOM_MEMORY_ANON_SHARE`) → `1013`; a stored
-  room whose cost alone passes the joiner's whole share → `4413` `too-large`. At most 4 rooms
+  room whose cost alone passes the joiner's whole share loads, charged that share (fv8 P1), and
+  only one whose cost passes 85% of the whole budget → `4413` `too-large`. At most 4 rooms
   load at once. Joins to rooms already loaded are never refused for memory. Every penalty is per
   connection or per principal: an update that would grow the room past the sender's cap is
   refused and only that connection is closed; the room stays open for everyone else. An update
@@ -589,10 +605,18 @@ that is gone or expired.
   what the principals are charged for as `canvas_room_memory_charged_bytes`).
   **Accounting.** Each room's cost is charged: at load, to the principal whose join loaded it;
   then every accepted update, to the principal that sent it, by what it added to the room's
-  estimate (content, and the ledger the stamper wrote for it), in full. The charges of a room
-  stay while it is loaded, whoever keeps it loaded — a principal that leaves keeps paying for what
-  it loaded and wrote until the room is evicted — and are never moved to the principals that
-  only read. Every save measures the room: the principals that wrote since the previous save
+  estimate (content, and the ledger the stamper wrote for it), in full. What a principal wrote
+  stays charged to it while the room is loaded, whoever keeps it loaded — a writer that leaves
+  keeps paying for its growth until the room is evicted — and is never moved to the principals
+  that only read. The **load** charge is different (fv8 U2): when the last connection of the
+  principal paying it leaves while others keep the room open, it moves to the principals still
+  connected, split evenly, each at most what its share still holds (an anonymous visitor's also
+  within the anonymous share); what nobody can take stays where it was and moves at a later
+  leave. Before, a user who opened a big room and left it to colleagues kept paying for it and
+  could not open a second one (`1013` until the room was evicted). A principal that sits in a
+  room someone else loaded therefore takes over that room's load cost when the loader leaves;
+  it frees it by leaving (the room is then evicted, or handed on). Every save measures the
+  room: the principals that wrote since the previous save
   share what the room really changed by since then, in proportion to the estimates of their own
   updates (an over-estimate, or a delete, is given back to them; nobody else's charge moves).
   So the charges of a room always add up to its cost, and the loaded rooms cost what the
@@ -614,15 +638,21 @@ that is gone or expired.
   the image caps to 70% of the message caps, and logs a `memory sizing:` warning for each; it
   also warns when the budget is smaller than one full room. The defaults fit the chart's 2 GiB
   (a share of 290 MiB holds a full 5 MiB room, 220 MiB); at 1 GiB the caps go down to ~1.5 MiB.
-  A stored room whose cost alone passes the joiner's share (stored under a larger cap) is refused
-  `4413` `too-large`: it can never load for that principal. A `pub/` room written by signed-in
-  users past ~1.6 MiB costs more than an anonymous visitor's share: it opens for anonymous
-  visitors only while someone keeps it loaded.
+  A stored room whose cost alone passes the joiner's share (stored under a larger cap, or before
+  fv8 counted every cut) loads, its loader charged one share at most, and the server logs a
+  warning (`stored room costs more than a share`): the rest of its cost is charged to nobody, the
+  size cap refuses it any growth, and deletes shrink it. Before (fv8 P1) it was refused `4413`
+  to everyone, for good: one update the server itself accepted made a shared room unloadable for
+  its owner. Only a room whose cost passes 85% of the whole budget (stored by a deployment with
+  more memory) is refused `4413` `too-large`. A `pub/` room written by signed-in users past
+  ~1.6 MiB costs more than an anonymous visitor's share: an anonymous visitor who loads it holds
+  its whole share while it is loaded.
   **Known limits.** The shares are per principal: several signed-in accounts acting together
   hold a third each. Writers of the same room within one save period share its measured growth
   by their estimates, so a writer whose updates are over-estimated less than a co-writer's pays a
-  little of the co-writer's part (never more than its own estimates). A principal that loaded or
-  wrote a room keeps paying for it while others keep it loaded. The estimate is between saves an
+  little of the co-writer's part (never more than its own estimates; fv8 P4, Low: a deleter's
+  credit for a big delete goes to the co-writers of that period in proportion). A principal that
+  wrote a room keeps paying for its growth while others keep it loaded. The estimate is between saves an
   upper bound (every accepted update counts in full until the next save measures the room
   again). A growing update is checked with the ledger the stamper will write for it counted
   ahead: per shape it writes or deletes one attribution entry and one history line (at most 300
@@ -632,7 +662,27 @@ that is gone or expired.
   so such an update was under-counted and one big image in a new room over-counted). An update
   that only deletes is never refused; what its ledger adds (the attribution and history of the
   shapes it deleted) is charged to the deleter once applied and can take it past its share, and
-  the loaded rooms past the thresholds, until the next save measures the room.
+  the loaded rooms past the thresholds, until the next save measures the room (fv8 P3, Low: a
+  delete-only update overshoots its principal's charge by ~12% at most, until that save).
+  **Cuts and placement** (fv8 P1/P2). Yjs cuts an item wherever an update names a clock inside
+  it (an origin, a right origin, a delete range's ends), copying the item's content (the whole
+  points list of a stroke) and moving the client's structs after it; and it places every new
+  item by scanning what lies between its origin and its right origin (a map value with no origin
+  first walks back the history of its key). The guard counts every cut once per boundary
+  (`UpdateCheck.splits`) and bounds their work (`splitWork`: a fixed part per cut, the content
+  copied, the structs moved), and bounds the placement scans (`scanWork`: the room items between
+  each new item's anchors, plus the update's own items anchored there unless the item only
+  continues a run); both are turned into time with costs measured on x86-64
+  (`SPLIT_WORK_NS`, `SCAN_WORK_NS`, `APPLY_NS_PER_BYTE` in config.ts, from
+  `server/test/fv8/split-cpu-cal.ts`, `split-growth.ts`, `scan-probe.ts`: up to 4.5 ns per element
+  copied, 9 us per cut, 190 ns per item scanned, 65 ns per byte integrated). An update over
+  `MAX_SPLITS_PER_MESSAGE` or `MAX_APPLY_MS` is refused before anything is resolved (the 3.97 MB
+  update is refused in ~175 ms of guard, most of it decoding); the largest one accepted applies
+  in under ~50 ms on x86. What one cut adds to the stored room was measured for every kind
+  (`split-growth.ts`): 6-9 bytes with short ids, 22 with 5-byte client ids and clocks; it counts
+  32 (`SPLIT_COST_BYTES`), and the guard fuzzer checks on every accepted update that the content
+  grew by at most its size plus 32 per cut. The guard itself stays O(update) and is charged after
+  the message (a 4 MiB message of new shapes costs it ~0.9 s on x86, before fv8 too).
 
 - A client that relays someone else's structs (e.g. a tab reconnecting after a server CRASH that
   lost unsaved edits of other people) delivers them in its own step 2: the stamper attributes

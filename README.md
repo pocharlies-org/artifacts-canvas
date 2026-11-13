@@ -140,7 +140,10 @@ canvas restart, a client-id claim after a restart, the oauth2-proxy catch-all, a
 filling the document, a client-chosen anonymous id, dozens of paused sockets on a room near the size cap, a
 keystroke while reconnecting after a restart, users and anonymous visitors opening and filling more big rooms
 than the memory holds, one user filling rooms while anonymous visitors or signed-in co-viewers sit in them and
-then leave, with a second user opening a new artifact afterwards); and finally the core's own
+then leave, with a second user opening a new artifact afterwards, one update of 200 000 cuts and
+one of 2 000 far-placed items refused while honest edits elsewhere keep p95 < 100 ms, a room stored
+past every share opening for its owner, screenshots pasted through the editor until it says the
+canvas is full, a user opening a second big room after leaving the first to a colleague); and finally the core's own
 `deploy/compose/e2e.sh`, which must still pass with the plugin enabled. The canvas container runs under the
 chart's default memory limit (2 GiB, `--max-old-space-size=1536`; the server derives its loaded-room budget
 from that heap limit and logs it at start, see "Memory" in [`chart/values.yaml`](chart/values.yaml)). To run
@@ -245,14 +248,16 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `JOIN_RATE_PER_MIN` / `JOIN_BURST` | `30` / `20` | Joins per signed-in user → `4429`. Anonymous: `ANON_JOIN_RATE_PER_MIN` / `ANON_JOIN_BURST` (`10` / `6`) per visitor, and `ANON_ROOM_JOIN_RATE_PER_MIN` / `ANON_ROOM_JOIN_BURST` (`60` / `30`) per room. |
 | `CPU_MS_PER_SEC` / `CPU_BURST_MS` | `250` / `5000` | Server CPU time a connection's messages may use → `4429`. Anonymous: `ANON_CPU_MS_PER_SEC` / `ANON_CPU_BURST_MS` (`60` / `1000`). |
 | `ROOM_MEMORY_BUDGET_BYTES` | derived | Loaded-room memory budget (fv6 H-1, fv7 F1). Default: V8 `heap_size_limit` − 192 MiB − `WS_OUTGOING_BUDGET_BYTES` − 60 × `MAX_MESSAGE_BYTES` (872 MiB under the chart's 1536 MiB heap); a room costs `ROOM_COST_FACTOR` (44) × content + ledger + 32 KiB. A join that would load a room past 85% of it, or an update that would grow the loaded rooms past 80% → `1013`; joins to loaded rooms are never refused for memory. |
-| `ROOM_MEMORY_PRINCIPAL_SHARE` / `ROOM_MEMORY_ANON_SHARE` | `1/3` / `1/3` | What one principal may be charged for — the rooms its joins loaded and everything it wrote, in full, while those rooms stay loaded (an anonymous visitor: a quarter of it) — and what all anonymous visitors together may. Their sum must stay ≤ 0.8. |
+| `ROOM_MEMORY_PRINCIPAL_SHARE` / `ROOM_MEMORY_ANON_SHARE` | `1/3` / `1/3` | What one principal may be charged for — the rooms its joins loaded (until it leaves them to others, who take the load cost within their shares) and everything it wrote, in full, while those rooms stay loaded (an anonymous visitor: a quarter of it) — and what all anonymous visitors together may. Their sum must stay ≤ 0.8. A stored room that costs more than a share loads, charged one share. |
 | `ANON_MINT_RATE_PER_MIN` / `ANON_MINT_BURST` | `120` / `60` | New anonymous visitors (cookies) minted by the wrapper page, and as many by cookieless WebSocket joins; per client IP `ANON_IP_MINT_RATE_PER_MIN` / `ANON_IP_MINT_BURST` (`10` / `10`) when `CLIENT_IP_HOPS` is set. |
 | `CLIENT_IP_HOPS` | `-1` (chart: `1`) | Where the client IP comes from: `-1` unknown, `0` the TCP peer, `n` the n-th `X-Forwarded-For` entry from the right (one per trusted proxy that appends; never more). |
 | `SAVE_CPU_MS_PER_SEC` / `SAVE_CPU_BURST_MS` | `50` / `1000` | Server CPU the debounced saves of all rooms may use; a due save waits while it is used up (flushes never wait). |
 | `WS_STALL_MS` | `3000` | A peer holding > 256 KiB that drains < `WS_JOIN_MIN_BYTES_PER_SEC` this long is stalled: dropped first when the outgoing budget is short. |
 | `ATTRIBUTION_RETENTION_DAYS` | `30` | Attribution entries of shapes deleted longer ago than this are pruned from the ledger. |
 | `MAX_MESSAGE_BYTES` / `ANON_MAX_MESSAGE_BYTES` | `4 MiB` / `1 MiB` | Message size limit → `4413`. Never above the room caps (lowered with them). |
-| `MAX_IMAGE_BYTES` / `ANON_MAX_IMAGE_BYTES` | `2 MiB` / `512 KiB` | Announced to the client as its paste cap; at most 70% of the message cap (a data URL is 4/3 of the image). |
+| `MAX_IMAGE_BYTES` / `ANON_MAX_IMAGE_BYTES` | `2 MiB` / `512 KiB` | Announced to the client as its paste cap; at most 70% of the message cap (a data URL is 4/3 of the image). The editor stores pasted images at most 1600 px, as WebP (PNG or the original only when smaller), and says the canvas is full before an image would pass the room cap. |
+| `MAX_SPLITS_PER_MESSAGE` | `5000` | Cuts of items one update may make (every insert or delete inside an item: a struct of its own in the stored room, and a copy of the item for Yjs) → `4413` for the sender (fv8 P1/P2). |
+| `MAX_APPLY_MS` | `50` | Yjs time the cuts and placement scans of one update may take by the server's estimate (costs measured on x86) → `4413`; the whole apply is charged to the CPU budgets before it runs, and one they cannot cover → `1013` (fv8 P2). |
 | `ALLOWED_ORIGINS` | origin of `ARTIFACT_BASE_URL` | Comma-separated browser origins (`scheme://host[:port]`) allowed to open the WebSocket. A missing, `null` or foreign `Origin` is closed `4403` (cross-site WebSocket hijacking guard). |
 | `METRICS_PORT` / `METRICS_HOST` | `9091` / `0.0.0.0` | Internal Prometheus listener (`/metrics` only; `0` disables it). The public listener answers `404` for `/metrics`. |
 | `ANON_COOKIE_SECRET` | (random per process) | Signs the anonymous-visitor cookie: the server assigns the *Anónimo NNNN* pseudonym (`?anon=` is only a hint for the number shown) and the anonymous attribution id `anon:<visitor id>` is derived from the cookie's nonce. Chart: `anon.cookieSecretRef` (a Secret reference, never a value); required with more than one replica, since every pod must verify the same cookie. |
