@@ -30,6 +30,7 @@ describe('fv8 U1: images and the canvas-full notice', () => {
     // the anonymous cap
     expect(wouldOverfill(1_200_000, 100_000, 1280 * 1024)).toBe(true);
     expect(wouldOverfill(600_000, 100_000, 1280 * 1024)).toBe(false);
+    expect(roomMargin(1280 * 1024)).toBe(Math.round(1280 * 1024 * 0.01) + 8192);
   });
 
   it('the room size is measured like the server measures it: content + ledger, encoded', () => {

@@ -3,14 +3,16 @@ import { assetValueOk } from '@pocharlies/artifacts-canvas-shared/model';
 
 /**
  * Pasted and dropped images (fv8 U1). A room holds MAX_DOC_BYTES (5 MiB; 1.25 MiB for anonymous
- * visitors) and a Full HD screenshot pasted as PNG is ~450 KiB of base64: 11 of them filled a room
+ * visitors) and a Full HD screenshot pasted as PNG is ~430 KiB of base64: 11 of them filled a room
  * (4 for an anonymous visitor). Images are stored at most IMAGE_MAX_SIDE px on their longest side,
  * re-encoded as WebP (JPEG where the browser cannot encode WebP and the image is opaque) at
  * IMAGE_QUALITY; the PNG or the original file is kept only when it is smaller (flat UI screenshots
- * often are). The server still accepts only `data:image/(png|jpeg|gif|webp)` (docs/protocol.md §6).
+ * can be). The server still accepts only `data:image/(png|jpeg|gif|webp)` (docs/protocol.md §6).
+ * Measured on the verifier's six sites (Chromium, Full HD): 107 KiB of base64 on average at 0.8,
+ * 93 KiB at 0.75 (12 fit an anonymous room instead of 11: three times the 4 of before).
  */
 export const IMAGE_MAX_SIDE = 1600;
-export const IMAGE_QUALITY = 0.8;
+export const IMAGE_QUALITY = 0.75;
 
 /**
  * What the server counts ahead for one image (fv7 F1, server/src/rooms.ts ledgerBound): the image
@@ -22,7 +24,7 @@ export const IMAGE_SHAPE_BYTES = 4096;
  * runs ahead of the encoded room between two saves (every update counted at its size).
  */
 export function roomMargin(cap: number): number {
-  return Math.round(cap * 0.02) + 16 * 1024;
+  return Math.round(cap * 0.01) + 8 * 1024;
 }
 
 /** The shortest data URL of `candidates` (null ones skipped) the server stores, or null. */

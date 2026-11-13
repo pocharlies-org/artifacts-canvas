@@ -69,7 +69,7 @@ The fv8 findings P1, P2, U1 and U2 are fixed:
   room keep p95 < 100 ms during either attack and nobody else is dropped.
 - [x] **U1 — Screenshots filled a room fast (Medium).** Pasted and dropped images were stored as
   they came (PNG): 11 Full HD screenshots filled a 5 MiB room, 4 an anonymous visitor's. The
-  editor now stores them at most 1600 px on their longest side, as WebP at quality 0.8 (JPEG for
+  editor now stores them at most 1600 px on their longest side, as WebP at quality 0.75 (JPEG for
   an opaque image where the browser cannot encode WebP), keeping the PNG or the original file
   only when it is smaller (an animated GIF that fits stays as it is); the server still accepts
   only `data:image/(png|jpeg|gif|webp)`. The wrapper tells the editor the visitor's room cap, and
