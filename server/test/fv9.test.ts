@@ -24,7 +24,7 @@ import { monitorEventLoopDelay } from 'node:perf_hooks';
 import * as Y from 'yjs';
 import * as encoding from 'lib0/encoding';
 import { checkClientUpdate, applyGuarded } from '@pocharlies/artifacts-canvas-shared/stamper';
-import { loadConfig } from '../src/config.js';
+import { loadConfig, oldSpaceFlag } from '../src/config.js';
 import { createApp, type App } from '../src/app.js';
 import { MemoryCanvasObjectStore } from '../src/store.js';
 import { createLogger } from '../src/logging.js';
@@ -348,7 +348,7 @@ describe('fv9 F: the anonymous pool pays the full cost of the rooms its visitors
     for (const k of pubs) core.rules.set(k, allowAnon());
     const victimRoom = 'u/victim/index.html';
     share(victimRoom, 'vic');
-    // the chart's sizing: 2 GiB pod, --max-old-space-size=1536 -> 872 MiB of loaded rooms
+    // the verifier's sizing (2 GiB pod before fv9: 872 MiB of loaded rooms)
     const app = await startApp({ ROOM_MEMORY_BUDGET_BYTES: String(872 * MiB) });
     const visitors: TestClient[] = [];
     for (const k of pubs) visitors.push(await join(app, k));
@@ -422,7 +422,9 @@ describe('fv9 isolation: a message that makes its room\'s worker misbehave costs
   }
 
   for (const hook of ['busy', 'alloc', 'throw'] as const) {
-    it(`${hook}: the worker is terminated (${hook === 'busy' ? 'watchdog' : hook === 'alloc' ? 'out of heap' : 'error'}), the sender closed 4413 and struck, the room rebuilt byte for byte; honest users keep editing; the event loop never stalls 200 ms`, async () => {
+    // --max-old-space-size (NODE_OPTIONS) overrides every worker's heap limit: the worker would
+    // allocate up to the whole heap before it ends (the server warns at start; protocol §12)
+    it.skipIf(hook === 'alloc' && oldSpaceFlag())(`${hook}: the worker is terminated (${hook === 'busy' ? 'watchdog' : hook === 'alloc' ? 'out of heap' : 'error'}), the sender closed 4413 and struck, the room rebuilt byte for byte; honest users keep editing; the event loop never stalls 200 ms`, async () => {
       // a small heap for the room's worker, so that allocating without bound ends it quickly
       const env = hook === 'alloc' ? { ...HOOKS, ROOM_MEMORY_BUDGET_BYTES: String(96 * MiB), MAX_MESSAGE_BYTES: String(256 * 1024), WORKER_MESSAGE_TIMEOUT_MS: '20000' } : { ...HOOKS, SAVE_DEBOUNCE_MS: '1000000' };
       const app = await startApp(env);

@@ -150,10 +150,10 @@ container never restarts, anonymous visitors unable to fill the memory with stor
 `CANVAS_WORKER_TEST_HOOKS=true` for `docker compose up` and `SYSTEM_WORKER_TEST_HOOKS=1` for the suite — a room
 worker that loops forever or allocates without bound replaced while the canvas lives on); and finally the core's own
 `deploy/compose/e2e.sh`, which must still pass with the plugin enabled. The canvas container runs under the
-chart's default memory limit (2304 MiB, `--max-old-space-size=1728`; the server derives its loaded-room budget
+chart's default memory limit (2304 MiB, `HEAP_LIMIT_MB=1776`; the server derives its loaded-room budget
 from that heap limit and logs it at start, see "Memory" in [`chart/values.yaml`](chart/values.yaml)). To run
-the stack at another size, set both `CANVAS_MEM_LIMIT` and `CANVAS_MAX_OLD_SPACE_MB` for `docker compose up`
-(e.g. `1g` and `768`); the fv7 spec reads the sizes from the server and runs at any of them
+the stack at another size, set both `CANVAS_MEM_LIMIT` and `CANVAS_HEAP_LIMIT_MB` for `docker compose up`
+(e.g. `1g` and `816`); the fv7 spec reads the sizes from the server and runs at any of them
 (`npx playwright test -c e2e-system/playwright.config.ts adversarial-fv7`), the fv5 and fv6 specs expect
 the default 2304 MiB.
 
@@ -252,7 +252,7 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `SYNC_BYTES_PER_SEC` / `SYNC_BURST_BYTES` | `1 MiB` / `4 MiB` | Bytes of sync step-2 answers after the first one of a connection → `4429`; a later step 1 with an empty state vector closes `4429` at once. Anonymous: `ANON_SYNC_BYTES_PER_SEC` / `ANON_SYNC_BURST_BYTES` (`256 KiB` / `1 MiB`). |
 | `JOIN_RATE_PER_MIN` / `JOIN_BURST` | `30` / `20` | Joins per signed-in user → `4429`. Anonymous: `ANON_JOIN_RATE_PER_MIN` / `ANON_JOIN_BURST` (`10` / `6`) per visitor, and `ANON_ROOM_JOIN_RATE_PER_MIN` / `ANON_ROOM_JOIN_BURST` (`60` / `30`) per room. |
 | `CPU_MS_PER_SEC` / `CPU_BURST_MS` | `250` / `5000` | Server CPU time a connection's messages may use → `4429`. Anonymous: `ANON_CPU_MS_PER_SEC` / `ANON_CPU_BURST_MS` (`60` / `1000`). |
-| `ROOM_MEMORY_BUDGET_BYTES` | derived | Loaded-room memory budget (fv6 H-1, fv7 F1). Default: V8 `heap_size_limit` − 192 MiB − `WS_OUTGOING_BUDGET_BYTES` − 60 × `MAX_MESSAGE_BYTES` × `WORKER_APPLY_CONCURRENCY` (1 088 MiB under the chart's 1728 MiB heap); a room costs `ROOM_COST_FACTOR` (44) × content + ledger + `ROOM_BASE_COST_BYTES` (16 MiB: its worker thread, fv9). A join that would load a room past 85% of it, or an update that would grow the loaded rooms past 80% → `1013`; joins to loaded rooms are never refused for memory. |
+| `ROOM_MEMORY_BUDGET_BYTES` | derived | Loaded-room memory budget (fv6 H-1, fv7 F1). Default: `HEAP_LIMIT_MB` (else V8's `heap_size_limit`) − 192 MiB − `WS_OUTGOING_BUDGET_BYTES` − 60 × `MAX_MESSAGE_BYTES` × `WORKER_APPLY_CONCURRENCY` (1 088 MiB with the chart's 1776); a room costs `ROOM_COST_FACTOR` (44) × content + ledger + `ROOM_BASE_COST_BYTES` (16 MiB: its worker thread, fv9). A join that would load a room past 85% of it, or an update that would grow the loaded rooms past 80% → `1013`; joins to loaded rooms are never refused for memory. |
 | `ROOM_MEMORY_PRINCIPAL_SHARE` / `ROOM_MEMORY_ANON_SHARE` | `1/3` / `1/3` | What one principal may be charged for — the rooms its joins loaded (until it leaves them to others, who take the load cost within their shares) and everything it wrote, in full, while those rooms stay loaded (an anonymous visitor: a quarter of it) — and what all anonymous visitors together may. Their sum must stay ≤ 0.8. A stored room that costs more than a share loads, charged one share. |
 | `ANON_MINT_RATE_PER_MIN` / `ANON_MINT_BURST` | `120` / `60` | New anonymous visitors (cookies) minted by the wrapper page, and as many by cookieless WebSocket joins; per client IP `ANON_IP_MINT_RATE_PER_MIN` / `ANON_IP_MINT_BURST` (`10` / `10`) when `CLIENT_IP_HOPS` is set. |
 | `CLIENT_IP_HOPS` | `-1` (chart: `1`) | Where the client IP comes from: `-1` unknown, `0` the TCP peer, `n` the n-th `X-Forwarded-For` entry from the right (one per trusted proxy that appends; never more). |
@@ -268,6 +268,7 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `WORKER_OP_TIMEOUT_MS`, `WORKER_OP_NS_PER_BYTE` | `10000`, `2000` | Watchdog of an operation on a whole room (load, join encodings, save, a rebuild's replay). |
 | `WORKER_APPLY_CONCURRENCY` | `1` | Client messages processed at once over all rooms (the memory budget reserves one message per slot). |
 | `WORKER_STRIKES`, `WORKER_STRIKE_WINDOW_MS`, `WORKER_STRIKE_COOLDOWN_MS`, `WORKER_ANON_POOL_STRIKES` | `3`, `600000`, `600000`, `10` | Strikes within the window put a principal (anonymous: also its IP, and all anonymous visitors after the pool's count) in a cooldown: joins and writes `1013`. |
+| `HEAP_LIMIT_MB` | V8's heap limit | The heap the process may use, all threads together: the loaded-room budget is derived from it. Use it, not `--max-old-space-size`: that V8 flag applies to every thread and overrides each room worker's own heap limit (fv9; the server warns at start when it is set). |
 | `ROOM_BASE_COST_BYTES` | `16777216` | Resident cost of an empty loaded room, its worker thread included (measured 15.7 MiB in the image). |
 | `ALLOWED_ORIGINS` | origin of `ARTIFACT_BASE_URL` | Comma-separated browser origins (`scheme://host[:port]`) allowed to open the WebSocket. A missing, `null` or foreign `Origin` is closed `4403` (cross-site WebSocket hijacking guard). |
 | `METRICS_PORT` / `METRICS_HOST` | `9091` / `0.0.0.0` | Internal Prometheus listener (`/metrics` only; `0` disables it). The public listener answers `404` for `/metrics`. |

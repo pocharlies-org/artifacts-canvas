@@ -1,7 +1,7 @@
 /**
  * FULL-SYSTEM regressions of the seventh independent verification (fv7 F1), against the live
- * compose stack, whose canvas container runs under the chart's memory limit (compose.yml: 2g and
- * --max-old-space-size=1536 by default; CANVAS_MEM_LIMIT / CANVAS_MAX_OLD_SPACE_MB run it at 1 GiB
+ * compose stack, whose canvas container runs under the chart's memory limit (compose.yml: 2304m and
+ * HEAP_LIMIT_MB=1776 by default since fv9; CANVAS_MEM_LIMIT / CANVAS_HEAP_LIMIT_MB run it at 1 GiB
  * too). The sizes come from the server itself (its startup log and metrics), so the same spec
  * runs at any memory setting.
  *   DOS     one signed-in user fills pub/ rooms while anonymous visitors sit in each of them,

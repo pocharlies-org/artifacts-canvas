@@ -69,6 +69,7 @@ export function createApp(deps: AppDeps): App {
               budgetMiB: mib(cfg.roomMemoryBudgetBytes),
               source: cfg.roomMemoryBudgetSource,
               heapLimitMiB: mib(v8.getHeapStatistics().heap_size_limit),
+              heapLimitSource: cfg.heapLimitSource,
               costFactor: cfg.roomCostFactor,
               loadsUpToMiB: mib(cfg.roomMemoryBudgetBytes * LOAD_FRACTION),
               growthUpToMiB: mib(cfg.roomMemoryBudgetBytes * GROWTH_FRACTION),

@@ -112,7 +112,7 @@ export class Metrics {
   });
   readonly heapLimit = new Gauge({
     name: 'canvas_heap_size_limit_bytes',
-    help: 'V8 heap size limit (follows --max-old-space-size)',
+    help: 'V8 heap size limit of the main thread (the room workers have their own)',
     registers: [this.registry],
   });
   private heapPeak = 0;

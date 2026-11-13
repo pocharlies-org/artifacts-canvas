@@ -185,7 +185,7 @@ limits:
   # Attribution of shapes deleted longer ago than this is pruned from the ledger.
   attributionRetentionDays: 30
   # Loaded-room memory budget in bytes (see "Memory" below). 0 = derived by the server from the
-  # V8 heap limit, so it follows nodeMaxOldSpaceMb; set it only to go lower.
+  # heap limit, so it follows heapLimitMb; set it only to go lower.
   roomMemoryBudgetBytes: 0
   # What one logged-in principal may be charged for (the rooms it loaded and everything it wrote,
   # in full, while those rooms stay loaded): a third of the budget; an anonymous visitor a quarter
@@ -254,12 +254,10 @@ networkPolicy:
 deployment:
   replicas: 1
 
-# Memory. The server keeps the rooms it has loaded under a budget it derives from the V8 heap
-# limit, so it is right for whatever nodeMaxOldSpaceMb is (server/src/config.ts, protocol §11):
+# Memory. The server keeps the rooms it has loaded under a budget it derives from the heap the
+# process may use (heapLimitMb, rendered as HEAP_LIMIT_MB; server/src/config.ts, protocol §11):
 #
-#   heap limit   = nodeMaxOldSpaceMb + V8's young generation   (1728 -> 1776 MiB in the image,
-#                                                               node:22-alpine)
-#   room budget  = heap limit
+#   room budget  = heapLimitMb
 #                  - 192 MiB                          (Node runtime, libraries, the HTTP side)
 #                  - limits.wsOutgoingBudgetBytes     (bytes held for slow peers)
 #                  - 60 x limits.maxMessageBytes      (one max-size message being guarded and
@@ -268,14 +266,16 @@ deployment:
 #                                                      16 MiB: the room's worker thread, fv9,
 #                                                      measured 15.7 MiB in the image)
 #
-# fv9: the rooms are no longer in the main thread's heap but in their workers' (nodeMaxOldSpaceMb
-# sizes the whole process: the main thread uses a few hundred MiB of it at most). Each worker's
-# heap limit is one user share (a room at the size cap fits it), or the stored room's cost when
-# that is more, plus 60 x maxMessageBytes: whatever a message makes Yjs allocate past that ends
-# the worker (ERR_WORKER_OUT_OF_MEMORY), never the process. With one apply slot, the process holds
-# at most: the loaded rooms (85% of the budget) + one worker's message headroom (a share +
-# 60 x maxMessageBytes) + the runtime and the outgoing budget: 925 + 603 + 192 + 256 = 1976 MiB
-# with the defaults, under the 2304 MiB limit.
+# fv9: the rooms live in their workers' heaps, not the main thread's. Each worker's heap limit is
+# one user share (a room at the size cap fits it), or the stored room's cost when that is more,
+# plus 60 x maxMessageBytes: whatever a message makes Yjs allocate past that ends the worker
+# (ERR_WORKER_OUT_OF_MEMORY), never the process. The chart no longer passes --max-old-space-size:
+# that V8 flag applies to every thread and overrides each worker's limit (measured: a worker
+# limited to 47 MiB ran out at 1 728 MiB); the server warns at start when it is set. The main
+# thread's own heap is sized by V8 from the container's memory (1 200 MiB under 2304Mi, Node 22).
+# With one apply slot the process holds at most: the loaded rooms (85% of the budget) + one
+# worker's message headroom (a share + 60 x maxMessageBytes) + the runtime and the outgoing budget:
+# 925 + 603 + 192 + 256 = 1976 MiB with the defaults, under the 2304 MiB limit.
 #
 # Each loaded room's cost is charged to the principal whose join loaded it, and what every update
 # adds to the principal that wrote it, in full (readers pay nothing; a charge stays while the room
@@ -295,18 +295,15 @@ deployment:
 # canvas_room_memory_budget_bytes and the shares as canvas_room_memory_share_bytes): a share of
 # 363 MiB holds one full 5 MiB room (236 MiB with its worker) and an anonymous visitor's 91 MiB
 # one full 1.25 MiB anonymous room; loads up to 925 MiB, growth up to 870 MiB. fv9 raised the
-# default from 1536 / 2Gi: with a worker per room, 1536 would lower the anonymous cap to 1.07 MiB.
-# At 1Gi (nodeMaxOldSpaceMb 768) the caps are lowered, with a warning for each.
+# defaults from a 1560 MiB heap under 2Gi: with a worker per room, that would lower the anonymous
+# cap to 1.07 MiB. At 1Gi (heapLimitMb 816) the caps are lowered, with a warning for each.
 #
-# Everything the formula subtracts adds up to the heap limit; what lives outside the V8 heap
-# (socket buffers, encoded frames, native code, the workers' stacks) needs the rest:
-#
-#   limits.memory >= nodeMaxOldSpaceMb / 0.75          (1728 / 0.75 = 2304 MiB)
+#   limits.memory >= heapLimitMb x 1.3                 (1776 x 1.3 = 2309 MiB ~ 2304Mi)
 #
 # Change both together: the budget follows. CPU: the main thread and one room worker can be busy
 # at once (a worker on a message, up to its watchdog); with less than 2 CPUs the worker's time is
 # taken from the main thread's.
-nodeMaxOldSpaceMb: 1728
+heapLimitMb: 1776
 resources:
   requests:
     cpu: 100m

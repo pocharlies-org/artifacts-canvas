@@ -208,6 +208,8 @@ export interface Config {
   roomMemoryBudgetBytes: number;
   /** where the budget came from: `env` (ROOM_MEMORY_BUDGET_BYTES) or `heap` (derived) */
   roomMemoryBudgetSource: 'env' | 'heap';
+  /** where the heap limit of the budget came from: `env` (HEAP_LIMIT_MB) or `v8` (the main thread's) */
+  heapLimitSource: 'env' | 'v8';
   roomCostFactor: number;
   /** Resident cost of an empty loaded room, its worker thread included (ROOM_BASE_COST_BYTES). */
   roomBaseCostBytes: number;
@@ -285,6 +287,12 @@ function int(env: NodeJS.ProcessEnv, name: string, def: number): number {
   if (!Number.isInteger(n) || n < 0 || n > 65535) throw new Error(`${name} must be an integer 0..65535, got "${v}"`);
   return n;
 }
+/** Is V8's --max-old-space-size given to this process (it then overrides every worker's heap limit)? */
+export function oldSpaceFlag(env: NodeJS.ProcessEnv = process.env): boolean {
+  const re = /--max[-_]old[-_]space[-_]size/;
+  return re.test(env.NODE_OPTIONS ?? '') || process.execArgv.some((a) => re.test(a));
+}
+
 /** `scheme://host[:port]` only (what browsers send in Origin); throws otherwise. */
 export function normalizeOrigin(raw: string): string {
   let u: URL;
@@ -417,6 +425,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     anonIpMintBurst: num(env, 'ANON_IP_MINT_BURST', 10),
     roomMemoryBudgetBytes: 0, // set below (depends on other limits)
     roomMemoryBudgetSource: 'heap',
+    heapLimitSource: 'v8',
     roomCostFactor: num(env, 'ROOM_COST_FACTOR', ROOM_COST_FACTOR),
     roomBaseCostBytes: num(env, 'ROOM_BASE_COST_BYTES', ROOM_BASE_COST_BYTES),
     roomMemoryPrincipalShare: frac(env, 'ROOM_MEMORY_PRINCIPAL_SHARE', 1 / 3),
@@ -460,7 +469,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error(`ROOM_MEMORY_PRINCIPAL_SHARE + ROOM_MEMORY_ANON_SHARE must be <= ${GROWTH_FRACTION}`);
   }
   const envBudget = env.ROOM_MEMORY_BUDGET_BYTES !== undefined && env.ROOM_MEMORY_BUDGET_BYTES !== '' ? num(env, 'ROOM_MEMORY_BUDGET_BYTES', 0) : null;
-  deriveRoomLimits(cfg, v8.getHeapStatistics().heap_size_limit, envBudget);
+  // fv9: the heap the whole process may use (main thread and room workers) is HEAP_LIMIT_MB, not
+  // --max-old-space-size: that V8 flag applies to every thread and overrides the room workers' own
+  // heap limits (resourceLimits), so a worker could grow to the whole heap (measured: a worker
+  // limited to 47 MiB ran out of memory at 1 728 MiB under --max-old-space-size=1728)
+  const heapLimit = env.HEAP_LIMIT_MB !== undefined && env.HEAP_LIMIT_MB !== '' ? num(env, 'HEAP_LIMIT_MB', 0) * 1024 * 1024 : v8.getHeapStatistics().heap_size_limit;
+  cfg.heapLimitSource = env.HEAP_LIMIT_MB ? 'env' : 'v8';
+  deriveRoomLimits(cfg, heapLimit, envBudget);
+  if (oldSpaceFlag(env)) {
+    cfg.memoryWarnings.unshift(
+      '--max-old-space-size is set (NODE_OPTIONS or the command line): it applies to every thread and overrides the heap limit of each room worker, so a message could make one worker grow to the whole heap; size the process with HEAP_LIMIT_MB instead',
+    );
+  }
   return cfg;
 }
 
@@ -541,8 +561,9 @@ const IMAGE_PER_MESSAGE = 0.7;
  *
  *   heap_size_limit - RUNTIME_RESERVE_BYTES - WS_OUTGOING_BUDGET_BYTES - 60 x MAX_MESSAGE_BYTES
  *
- * heap_size_limit follows --max-old-space-size (the chart's nodeMaxOldSpaceMb), so the budget is
- * right for any memory setting. The outgoing buffers live outside the heap: counting them here
+ * The heap limit is HEAP_LIMIT_MB (the chart's heapLimitMb) or, without it, the main thread's
+ * heap_size_limit (V8 sizes it from the container's memory), so the budget is right for any memory
+ * setting. fv9: not --max-old-space-size, which would override every room worker's own limit. The outgoing buffers live outside the heap: counting them here
  * leaves the container limit the room it needs for them (chart values.yaml, "Memory").
  */
 export function roomMemoryBudget(heapLimit: number, cfg: Pick<Config, 'wsOutgoingBudgetBytes' | 'maxMessageBytes'> & { workerApplyConcurrency?: number }): number {

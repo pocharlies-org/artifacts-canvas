@@ -364,17 +364,22 @@ describe('persistence: two objects, both expire together', () => {
   it('saves content + ledger with the ttl tag, reloads both, deletes both on expiry; the sweep sees a lone ledger', async () => {
     const store = new MemoryCanvasObjectStore();
     const m = manager(store);
-    const r = await m.getOrCreate('runs/x.html', 7);
-    r.doc.transact(() => r.doc.getMap('shapes').set('s', new Y.Map()), 'load'); // no stamping (no conn)
-    r.ledger.transact(() => r.ledger.getMap('users').set('u', { name: 'U', anonymous: false }));
-    r.markDirty();
-    await r.flush();
     const ck = canvasObjectKey(cfg.canvasPrefix, 'runs/x.html');
     const lk = canvasLedgerKey(cfg.canvasPrefix, 'runs/x.html');
+    // fv9: the documents live in the room's worker; the room starts from stored objects (untagged)
+    const content = materializeContent(new Y.Doc());
+    content.getMap('shapes').set('s', new Y.Map());
+    const led = materializeLedger(new Y.Doc());
+    led.getMap('users').set('u', { name: 'U', anonymous: false });
+    store.objects.set(ck, { body: Y.encodeStateAsUpdate(content) });
+    store.objects.set(lk, { body: Y.encodeStateAsUpdate(led) });
+    const r = await m.getOrCreate('runs/x.html', 7);
+    r.markDirty();
+    await r.flush();
     expect(store.objects.get(ck)?.tagging).toBe('ttl=7');
     expect(store.objects.get(lk)?.tagging).toBe('ttl=7');
     m.rooms.clear();
-    const again = await manager(store).getOrCreate('runs/x.html', 7);
+    const again = await (await manager(store).getOrCreate('runs/x.html', 7)).inspect();
     expect(again.ledger.getMap('users').get('u')).toMatchObject({ name: 'U' });
     expect(again.doc.getMap('shapes').has('s')).toBe(true);
     await manager(store).expireRoom('runs/x.html', 'expired');
@@ -420,7 +425,7 @@ describe('room loading races (found on the full system: duplicated history after
     release();
     const [a, b] = await Promise.all([first, second]);
     expect(a).toBe(b);
-    expect(b.ledger.getArray('history').length).toBe(1);
+    expect((await b.inspect()).ledger.getArray('history').length).toBe(1);
   });
 
   it('a failed load leaves no empty room behind; the next join loads again', async () => {
@@ -480,7 +485,7 @@ describe('migration of a stored single-document canvas', () => {
     const metrics = new Metrics();
     const mk = () => new RoomManager({ cfg, store, authz: {} as AuthzClient, log: createLogger('silent'), metrics });
     const r = await mk().getOrCreate('runs/old.html', null);
-    expect(r.ledger.getMap('attribution').get('s1')).toMatchObject({ createdBy: 'user:alice' });
+    expect((await r.inspect()).ledger.getMap('attribution').get('s1')).toMatchObject({ createdBy: 'user:alice' });
     await r.flush();
     expect(store.objects.has(lk)).toBe(true);
     const saved = new Y.Doc();
@@ -489,7 +494,7 @@ describe('migration of a stored single-document canvas', () => {
     expect(saved.getArray('history').length).toBe(0);
     expect(saved.getMap('shapes').has('s1')).toBe(true);
     const again = await mk().getOrCreate('runs/old.html', null);
-    expect(again.ledger.getMap('attribution').get('s1')).toMatchObject({ createdBy: 'user:alice' });
+    expect((await again.inspect()).ledger.getMap('attribution').get('s1')).toMatchObject({ createdBy: 'user:alice' });
     expect((await metrics.registry.getSingleMetric('canvas_legacy_migrations_total')!.get()).values[0].value).toBe(1);
   });
 });

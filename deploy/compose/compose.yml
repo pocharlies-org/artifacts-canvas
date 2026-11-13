@@ -44,9 +44,10 @@ services:
       AUTHZ_RECHECK_SECONDS: "3"
       SAVE_DEBOUNCE_MS: "300"
       LOG_LEVEL: info
-      # the chart's memory sizing (chart/values.yaml: nodeMaxOldSpaceMb, resources.limits);
-      # CANVAS_MAX_OLD_SPACE_MB + CANVAS_MEM_LIMIT run the stack at another size, e.g. 768 + 1g
-      NODE_OPTIONS: --max-old-space-size=${CANVAS_MAX_OLD_SPACE_MB:-1728}
+      # the chart's memory sizing (chart/values.yaml: heapLimitMb, resources.limits);
+      # CANVAS_HEAP_LIMIT_MB + CANVAS_MEM_LIMIT run the stack at another size, e.g. 816 + 1g.
+      # Not --max-old-space-size: it would override every room worker's heap limit (fv9)
+      HEAP_LIMIT_MB: ${CANVAS_HEAP_LIMIT_MB:-1776}
       # test only (e2e-system/adversarial-fv9.spec.ts, SYSTEM_WORKER_TEST_HOOKS=1): a client update
       # carrying `canvas-test-hook:<busy|alloc|throw>` makes its room's worker misbehave
       WORKER_TEST_HOOKS: ${CANVAS_WORKER_TEST_HOOKS:-false}

@@ -622,9 +622,10 @@ that is gone or expired.
   21.6x, create/delete 10.1x, strokes 4.2x — the worst plus 10%. Guarding and applying one
   message needs up to 51-53x its size of heap (`server/test/fv7/guardcost.ts`):
   `MESSAGE_COST_FACTOR` 60. The server keeps the estimate of the loaded rooms under a budget
-  derived from the V8 heap limit (`heap_size_limit` − 192 MiB − `WS_OUTGOING_BUDGET_BYTES` − 60 x
-  `MAX_MESSAGE_BYTES`, at least 64 MiB; `ROOM_MEMORY_BUDGET_BYTES` overrides it), so it follows
-  `--max-old-space-size` (1 088 MiB with the chart's 1728 under its 2304Mi limit, logged at start and
+  derived from the heap the process may use (`HEAP_LIMIT_MB`, else V8's `heap_size_limit`, − 192
+  MiB − `WS_OUTGOING_BUDGET_BYTES` − 60 x `MAX_MESSAGE_BYTES`, at least 64 MiB;
+  `ROOM_MEMORY_BUDGET_BYTES` overrides it; fv9: not `--max-old-space-size`, which overrides every
+  room worker's heap limit, §12) (1 088 MiB with the chart's 1776 under its 2304Mi limit, logged at start and
   exported as `canvas_room_memory_budget_bytes`; the shares as `canvas_room_memory_share_bytes`,
   what the principals are charged for as `canvas_room_memory_charged_bytes`).
   **Accounting.** Each room's cost is charged: at load, to the principal whose join loaded it;
@@ -773,7 +774,11 @@ bounded by isolation:
   room at the size cap fits it), or the stored room's cost when that is more, plus
   `MESSAGE_COST_FACTOR` x `MAX_MESSAGE_BYTES` (one message being guarded and applied); young
   generation 16 MiB. Whatever a message makes Yjs allocate past that ends the worker
-  (`ERR_WORKER_OUT_OF_MEMORY`), never the process. One client message is processed at a time
+  (`ERR_WORKER_OUT_OF_MEMORY`), never the process. The process must not run with
+  `--max-old-space-size`: that V8 flag applies to every thread and overrides each worker's limit
+  (measured: a worker limited to 47 MiB ran out of memory at 1 728 MiB under
+  `--max-old-space-size=1728`); the heap the budget is derived from is `HEAP_LIMIT_MB`, and the
+  server warns at start when the flag is set. One client message is processed at a time
   over all rooms (`WORKER_APPLY_CONCURRENCY`; a message holds its slot for its guard and apply),
   so at most one worker is past its room's size at a time: the process holds the loaded rooms
   (≤ 85% of the budget) plus one worker's headroom plus the main thread (chart `values.yaml`,
