@@ -211,12 +211,18 @@ limits:
 # strikeCooldownMs (1013); anonymous visitors also count per client IP (when clientIpHops says
 # where it is) and all together (anonPoolStrikes). applyConcurrency client messages are processed
 # at once over all rooms (the memory formula below reserves one message per slot).
+# inflightBytes: client messages received and waiting for their room and an apply slot, over all
+# connections (Node buffers, outside every V8 heap; part of the memory formula below). Over it a
+# message bigger than limits.cpuShedMinBytes is refused (1013, the client resends it); a connection,
+# and a principal over all its connections, is no longer read (TCP backpressure) while it has two
+# messages of the largest size in flight (1 MiB at least).
 worker:
   messageTimeoutMs: 1000
   timeoutNsPerByte: 1000
   opTimeoutMs: 10000
   opNsPerByte: 2000
   applyConcurrency: 1
+  inflightBytes: 67108864 # 64 MiB
   strikes: 3
   strikeWindowMs: 600000
   strikeCooldownMs: 600000
@@ -233,6 +239,16 @@ service:
 metrics:
   enabled: true
   port: 9091
+
+# --- Alerts (optional PrometheusRule; needs the Prometheus Operator CRDs) ---
+# Each of these on a deployment means an honest user may have been hit or a room broke: a principal
+# put in a strike cooldown, a room worker over its watchdog, a room that could not be rebuilt (or
+# was rebuilt different), messages refused for the in-flight cap, writes refused because saves fail.
+# `matchers` selects this release's series (the scrape's labels).
+alerts:
+  enabled: false
+  labels: {}
+  matchers: 'namespace="{{ .Release.Namespace }}"'
 
 # --- NetworkPolicy ---
 # Ingress to the canvas pods: the http port only from the ingress controller's namespace and
@@ -274,8 +290,16 @@ deployment:
 # limited to 47 MiB ran out at 1 728 MiB); the server warns at start when it is set. The main
 # thread's own heap is sized by V8 from the container's memory (1 200 MiB under 2304Mi, Node 22).
 # With one apply slot the process holds at most: the loaded rooms (85% of the budget) + one
-# worker's message headroom (a share + 60 x maxMessageBytes) + the runtime and the outgoing budget:
-# 925 + 603 + 192 + 256 = 1976 MiB with the defaults, under the 2304 MiB limit.
+# worker's message headroom (a share + 60 x maxMessageBytes) + the runtime and the outgoing budget
+# + the messages waiting (worker.inflightBytes): 925 + 603 + 192 + 256 + 64 = 2040 MiB with the
+# defaults, under the 2304 MiB limit. In general (share = roomMemoryPrincipalShare, all in MiB):
+#
+#   (0.85 + share) x heapLimitMb - (share - 0.15) x (192 + wsOutgoingBudget + 60 x maxMessage)
+#     + worker.inflightBytes
+#
+# and the chart refuses to render when resources.limits.memory is less than that (without the
+# message term) plus 64 MiB: a heapLimitMb raised without the memory limit (or the reverse) would
+# let the budget admit more rooms than the container holds (OOMKilled under load, not 1013).
 #
 # Each loaded room's cost is charged to the principal whose join loaded it, and what every update
 # adds to the principal that wrote it, in full (readers pay nothing; a charge stays while the room
@@ -298,11 +322,15 @@ deployment:
 # defaults from a 1560 MiB heap under 2Gi: with a worker per room, that would lower the anonymous
 # cap to 1.07 MiB. At 1Gi (heapLimitMb 816) the caps are lowered, with a warning for each.
 #
-#   limits.memory >= heapLimitMb x 1.3                 (1776 x 1.3 = 2309 MiB ~ 2304Mi)
+#   limits.memory >= 1.1833 x heapLimitMb - 82 + 64 (in flight) + 64 (margin) MiB
+#                                                     (1776 -> 2148 MiB <= 2304Mi; 816 -> 1012 <= 1Gi)
 #
-# Change both together: the budget follows. CPU: the main thread and one room worker can be busy
+# Change both together: the budget follows. The server refuses to start under
+# --max-old-space-size (NODE_OPTIONS or the command line): it would override every room worker's
+# heap limit. CPU: the main thread and one room worker can be busy
 # at once (a worker on a message, up to its watchdog); with less than 2 CPUs the worker's time is
-# taken from the main thread's.
+# taken from the main thread's. Request at least 500m in production: the 1 s watchdog of an honest
+# message should not be decided by the node's contention.
 heapLimitMb: 1776
 resources:
   requests:

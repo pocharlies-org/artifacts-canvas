@@ -1,0 +1,48 @@
+{{- if .Values.alerts.enabled }}
+{{- $m := tpl .Values.alerts.matchers . }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "artifacts-canvas.fullname" . }}
+  labels:
+    {{- include "artifacts-canvas.labels" . | nindent 4 }}
+    {{- with .Values.alerts.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: artifacts-canvas
+      rules:
+        - alert: CanvasStrikeCooldown
+          expr: increase(canvas_strikes_total{outcome="cooldown",{{ $m }}}[15m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: A principal was put in a strike cooldown (joins and writes refused for WORKER_STRIKE_COOLDOWN_MS).
+            description: With anonymous drawing off this is a signed-in user; check the canvas log ("strikes") for who and why.
+        - alert: CanvasWorkerTimeouts
+          expr: increase(canvas_worker_faults_total{kind="timeout",{{ $m }}}[1d]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: A room worker missed its watchdog in the last day (its room was rebuilt, the sender struck).
+            description: An honest message should never miss it; contention on the node (requests.cpu) or a new costly path.
+        - alert: CanvasRoomRebuildFailed
+          expr: increase(canvas_worker_recoveries_total{outcome=~"failed|differs",{{ $m }}}[15m]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: A room could not be rebuilt after a worker fault (closed for everyone, its log dropped), or was rebuilt different.
+        - alert: CanvasInflightRefusals
+          expr: increase(canvas_ws_rejected_total{reason="inflight",{{ $m }}}[15m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: Messages were refused because the messages waiting to be processed passed WORKER_INFLIGHT_BYTES.
+        - alert: CanvasWriteAheadLogFull
+          expr: increase(canvas_wal_full_total{{ "{" }}{{ $m }}{{ "}" }}[15m]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: Writes are refused because a room's saves keep failing (object storage) and its write-ahead log is full.
+{{- end }}

@@ -7,6 +7,7 @@ metadata:
 spec:
   # Rooms are in-memory: replicas > 1 needs sticky routing per artifact key (or a shared
   # backend) or two pods would serve divergent documents for the same artifact.
+  {{- include "artifacts-canvas.validateMemory" . }}
   {{- if and (gt (int .Values.deployment.replicas) 1) (not .Values.anon.cookieSecretRef.name) }}
   {{- fail "anon.cookieSecretRef.name is required when deployment.replicas > 1 (every pod must sign and verify the same anonymous-visitor cookie)" }}
   {{- end }}

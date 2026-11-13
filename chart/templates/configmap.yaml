@@ -90,6 +90,7 @@ data:
   WORKER_OP_TIMEOUT_MS: {{ int64 .Values.worker.opTimeoutMs | quote }}
   WORKER_OP_NS_PER_BYTE: {{ int64 .Values.worker.opNsPerByte | quote }}
   WORKER_APPLY_CONCURRENCY: {{ int64 .Values.worker.applyConcurrency | quote }}
+  WORKER_INFLIGHT_BYTES: {{ int64 .Values.worker.inflightBytes | quote }}
   WORKER_STRIKES: {{ int64 .Values.worker.strikes | quote }}
   WORKER_STRIKE_WINDOW_MS: {{ int64 .Values.worker.strikeWindowMs | quote }}
   WORKER_STRIKE_COOLDOWN_MS: {{ int64 .Values.worker.strikeCooldownMs | quote }}

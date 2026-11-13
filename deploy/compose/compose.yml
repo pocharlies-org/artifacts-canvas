@@ -51,6 +51,9 @@ services:
       # test only (e2e-system/adversarial-fv9.spec.ts, SYSTEM_WORKER_TEST_HOOKS=1): a client update
       # carrying `canvas-test-hook:<busy|alloc|throw>` makes its room's worker misbehave
       WORKER_TEST_HOOKS: ${CANVAS_WORKER_TEST_HOOKS:-false}
+      # the image runs with NODE_ENV=production, where the server refuses the hooks unless this says
+      # it is a test stack (the chart never renders either)
+      WORKER_TEST_HOOKS_IN_PRODUCTION: ${CANVAS_WORKER_TEST_HOOKS:-false}
     # the chart's default memory limit, so the full-system suite runs under it
     mem_limit: ${CANVAS_MEM_LIMIT:-2304m}
     memswap_limit: ${CANVAS_MEM_LIMIT:-2304m}
