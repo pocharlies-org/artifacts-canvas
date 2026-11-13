@@ -18,7 +18,7 @@ import WebSocket from 'ws';
 import * as Y from 'yjs';
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
-import { BASE, container, editorReady, newContext, openWithLogin, publish, type UserName } from './lib';
+import { BASE, container, newContext, openWithLogin, publish, type UserName } from './lib';
 import { alternating, chain, deleteRanges, formatting, lastId, mergePairs, mergeRun } from '../server/test/fv9/craft';
 
 test.describe.configure({ mode: 'serial' });
@@ -141,7 +141,8 @@ async function cookieOf(browser: Parameters<typeof newContext>[0], user: UserNam
   ctxs.push(ctx);
   const page = await ctx.newPage();
   expect(await openWithLogin(page, room.canvas, user)).toBe(200);
-  await editorReady(page);
+  // the session cookie is set once the login chain is through (no need for the editor's socket:
+  // user3 may be cooling down after an earlier run of this spec, WORKER_STRIKE_COOLDOWN_MS)
   const cookie = (await ctx.cookies()).map((c) => `${c.name}=${c.value}`).join('; ');
   await page.close();
   cookies.set(user, cookie);
@@ -192,9 +193,18 @@ async function attack(name: string, o: { honest: Raw; victim: Raw; attacker: Raw
   const fresh = new Raw(o.joinUrl, o.joinCookie);
   expect(await fresh.ready()).toBe(true);
   await sleep(1500);
+  // the joiner integrates the room's frames on its own time: wait until it holds what the victim holds
+  const t1 = Date.now();
+  while (view(fresh.doc) !== view(o.victim.doc) && Date.now() - t1 < 20_000) await sleep(250);
   const same = view(fresh.doc) === view(o.victim.doc);
+  if (!same) {
+    const fv = fresh.doc.getMap('shapes');
+    const vv = o.victim.doc.getMap('shapes');
+    const differ = [...vv.keys()].filter((k) => JSON.stringify((fv.get(k) as Y.Map<unknown> | undefined)?.toJSON()) !== JSON.stringify((vv.get(k) as Y.Map<unknown>).toJSON()));
+    log(`${name} differs`, { onlyVictim: [...vv.keys()].filter((k) => !fv.has(k)), onlyFresh: [...fv.keys()].filter((k) => !vv.has(k)), differ, lens: differ.slice(0, 3).map((k) => [JSON.stringify((fv.get(k) as Y.Map<unknown> | undefined)?.toJSON() ?? null).length, JSON.stringify((vv.get(k) as Y.Map<unknown>).toJSON()).length]) });
+  }
   const attributed = [...o.victim.doc.getMap('shapes').keys()].filter((k) => k.startsWith(name)).every((k) => !!fresh.ledger.getMap('attribution').get(k));
-  const out = { bytes: o.update.byteLength, code, closedMs, rtt, restarts: restarts() - r0, oomKilled: oomKilled(), victimClose: o.victim.closeCode, honestClose: o.honest.closeCode, freshEqualsVictim: same, attributed, workerFaults: (canvasLogs(since).match(/room worker fault/g) ?? []).length, strikes: strikes() - k0 };
+  const out = { bytes: o.update.byteLength, code, closedMs, rtt, restarts: restarts() - r0, oomKilled: oomKilled(), victimClose: o.victim.closeCode, honestClose: o.honest.closeCode, freshEqualsVictim: same, attributed, workerFaults: (canvasLogs(since).match(/room worker fault/g) ?? []).length, faultKinds: [...canvasLogs(since).matchAll(/"kind":"(\w+)","err":"room worker/g)].map((m) => m[1]), strikes: strikes() - k0 };
   log(name, out);
   expect(code).toBe(o.want);
   expect(rtt.max).toBeLessThan(200);
@@ -363,6 +373,8 @@ test('fv9 unknown paths live (SYSTEM_WORKER_TEST_HOOKS=1): a worker that loops f
     d.getMap('meta').set('k', `canvas-test-hook:${hook}`);
     out[hook] = await attack(`hook-${hook}`, { honest, victim, attacker: a, update: Y.encodeStateAsUpdate(d), joinUrl: wsUrl(room.canvas), joinCookie: c2, want: 4413, strikes: 1 });
     expect((out[hook] as { workerFaults: number }).workerFaults).toBe(1);
+    // busy: the watchdog; alloc: the worker's heap limit (or the watchdog, whichever comes first)
+    expect((out[hook] as { faultKinds: string[] }).faultKinds[0]).toMatch(hook === 'busy' ? /^timeout$/ : /^(oom|timeout)$/);
   }
   log('unknown paths', out);
 });

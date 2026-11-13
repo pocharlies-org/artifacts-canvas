@@ -22,8 +22,9 @@ const HOOKS: [string, () => void][] = [
     }
   }],
   ['canvas-test-hook:alloc', () => {
+    // 8 MiB of the old generation per step: as fast as the heap fills
     const hold: unknown[] = [];
-    for (;;) hold.push(new Array(1 << 16).fill(hold.length));
+    for (;;) hold.push(new Array(1 << 20).fill(hold.length + 0.5));
   }],
   ['canvas-test-hook:throw', () => {
     throw new Error('test hook');
