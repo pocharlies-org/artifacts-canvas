@@ -495,8 +495,10 @@ test('U2: a user who opened a big room and left it to a colleague opens a second
   const carl = await login(browser, R2.canvas, 'user2');
   await carl.page.close();
   await sleep(4000);
-  // two stored rooms whose loads together pass a share: 72% and 33% of it (images, in messages
-  // of at most a fifth of the message cap)
+  // two stored rooms whose loads together pass a share: 58% and 50% of it in content, 62% and
+  // 54% with their workers (fv9; it was 72% and 33%: with the share of the 2304 MiB chart, 72% is
+  // more than a room at the size cap holds) (images, in messages of at most a fifth of the
+  // message cap)
   const shareBytes = cfg.userShareMiB * MiB;
   const fill = async (url: string, fraction: number) => {
     const w = new Raw(url, ana.cookie);
@@ -516,8 +518,8 @@ test('U2: a user who opened a big room and left it to a colleague opens a second
     expect(w.closeCode).toBeNull();
     w.ws.close();
   };
-  await fill(wsUrl(R1.canvas), 0.72);
-  await fill(wsUrl(R2.canvas), 0.33);
+  await fill(wsUrl(R1.canvas), 0.58);
+  await fill(wsUrl(R2.canvas), 0.5);
   await sleep(8000); // saved and evicted
   // ana opens R1 (her join loads it), carl joins, ana leaves; ana opens R2
   const a1 = new Raw(wsUrl(R1.canvas), ana.cookie);

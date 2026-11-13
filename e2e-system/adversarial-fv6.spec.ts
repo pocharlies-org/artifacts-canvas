@@ -152,6 +152,14 @@ async function cookieOf(browser: Parameters<typeof newContext>[0], url: string, 
   await page.close();
   return cookie;
 }
+/** ms from `who` deleting shape `id` until `reader` no longer has it (a delete never grows the room) */
+async function deleteRtt(who: Raw, reader: Raw, id: string): Promise<number> {
+  const t = Date.now();
+  expect(who.doc.getMap('shapes').has(id)).toBe(true);
+  who.doc.getMap('shapes').delete(id);
+  await waitFor(() => !reader.doc.getMap('shapes').has(id), 20_000, `delete ${id} relayed`);
+  return Date.now() - t;
+}
 /** ms from an edit of `who` until `reader` has it (both raw peers in the same room) */
 async function editRtt(who: Raw, reader: Raw, id: string): Promise<number> {
   const t = Date.now();
@@ -264,10 +272,13 @@ test('Q4b: three ACL members fill two rooms each: each is stopped at its share, 
   expect(total).toBeGreaterThanOrEqual(1);
   expect([held[4].closeCode, held[5].closeCode]).toContain(1013);
   expect(metric('canvas_room_memory_bytes')).toBeLessThanOrEqual(0.8 * metric('canvas_room_memory_budget_bytes') * 1.01);
-  // joins to the loaded rooms are never refused for memory: user3 joins user1's room and edits
+  // joins to the loaded rooms are never refused for memory: user3 joins user1's room and edits.
+  // fv9: the loaded rooms may pass the 80% growth threshold through loads alone (each one is a
+  // worker, 16 MiB, and loads go on to 85%), and an edit that adds anything is then refused 1013 by
+  // design: the visitor's edit is a delete, which never grows the room and always passes
   const visitor = new Raw(wsUrl(pubs[0].canvas), cookies[2]);
   expect(await visitor.ready(60_000)).toBe(true);
-  const rtt = await editRtt(visitor, held[0], `v${run}`);
+  const rtt = await deleteRtt(visitor, held[0], 'b0s0');
   peak = Math.max(peak, mem());
   const s1 = state();
   log('Q4b', { full, filled, closes: held.map((h) => h.closeCode), keepersOpen: keepers.filter((k) => k.closeCode === null).length, refusedPrincipal: principal, refusedTotal: total, visitorRttMs: rtt, peakMiB: peak, before: s0, after: s1 });
