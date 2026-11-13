@@ -524,6 +524,16 @@ export function inflightConnBytes(maxMessageBytes: number): number {
 }
 
 /**
+ * What a client message counts in flight at least (review S6): a tiny update is a few payload
+ * bytes but several hundred bytes to ~1 KiB of live objects while it waits (the frame, its views,
+ * the job and its promises), so counted by its bytes alone many of them from many principals never
+ * reached a cap and queued without a bound. With the floor, WORKER_INFLIGHT_BYTES (64 MiB) bounds
+ * the queue to ~65 000 messages, plus what each connection had already read when it was paused
+ * (protocol §12), and a connection's cap (8 MiB) to ~8 000; an honest tab has a handful in flight.
+ */
+export const INFLIGHT_MIN_COST = 1024;
+
+/**
  * Measured resident cost of a loaded room per encoded byte (content + ledger), V8 heap and
  * buffers together, with its join frames encoded (Node 22 on x86-64, `--expose-gc`, rooms built
  * through the real guard and stamper and loaded through Room.load: server/test/fv7/ratio.ts).

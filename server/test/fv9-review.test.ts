@@ -12,11 +12,13 @@
  *   F-4  a rebuild asks every tab for a step 1 but did not refill its resync budget.
  *   F-5  --max-old-space-size was only warned about (it overrides every worker's heap limit).
  *   F-6  while saves kept failing the write-ahead log grew without a bound.
+ *   S6   tiny messages from many principals counted a few bytes each and never reached the cap:
+ *        every message now counts at least INFLIGHT_MIN_COST (1 KiB).
  * And the bump discipline: the cost constants are tied to the Yjs versions they were measured on.
  * The full-system variant of M-1 (RSS of the canvas under the chart's limit) is
  * e2e-system/adversarial-inflight.spec.ts; the process-level measurement server/test/inflight/flood.ts.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,7 +28,8 @@ import { CALIBRATED_WITH, inflightConnBytes, loadConfig } from '../src/config.js
 import { createApp, type App } from '../src/app.js';
 import { MemoryCanvasObjectStore } from '../src/store.js';
 import { createLogger } from '../src/logging.js';
-import { WAL_MAX_DOCS, type Conn } from '../src/room.js';
+import { Room, WAL_MAX_DOCS, type Conn } from '../src/room.js';
+import { WsServer } from '../src/ws.js';
 import { startFakeCore, allowUser, type FakeCore } from './helpers/fakecore.js';
 import { TEST_ORIGIN, TestClient, waitFor } from './helpers/yclient.js';
 import { testCore } from './helpers/core.js';
@@ -196,6 +199,76 @@ describe('M-1: client messages in flight are bounded', () => {
       if (!released) release();
     }
   }, 90_000);
+
+  it('many principals sending tiny updates (a worker that never answers): every message counts at least 1 KiB in flight, so the server\'s cap bounds how many messages wait, not only their bytes; the counters return to 0 once processed', async () => {
+    // review S6: counted by payload bytes only, a 4-byte update cost ~7 counted bytes and several hundred
+    // bytes of live objects; 12 accounts x 8 connections could queue without a bound, the cap never reached
+    const cap = 4 * MiB;
+    const KiB = 1024;
+    const app = await startApp({ HEAP_LIMIT_MB: '1776', WORKER_INFLIGHT_BYTES: String(cap) });
+    const accounts = 12;
+    const perAccount = 8; // MAX_CONNS_PER_USER
+    const rounds = 200; // per connection, under MSG_BURST (240): nobody is rate limited
+    expect(rounds).toBeLessThan(loadConfig({ ...BASE_ENV }).msgBurst);
+    const keys: string[] = [];
+    const clients: TestClient[] = [];
+    for (let a = 0; a < accounts; a++) {
+      const key = `u/s6-${a}/index.html`;
+      keys.push(key);
+      share(key, `w${a}`);
+      for (let i = 0; i < perAccount; i++) clients.push(await join(app, key, `sid=w${a}`));
+    }
+    const n = clients.length;
+    expect(clients.every((c) => c.closeCode === null)).toBe(true);
+    await waitFor(() => app.manager.inflightBytes === 0, 10_000, 'joins processed');
+    const conns = keys.flatMap((k, a) => serverConn(app, k, `w${a}@corp`));
+    expect(conns.length).toBe(n);
+    // the queued jobs: every update admitted calls Room.update, and none finishes while the slot is held
+    const jobs = vi.spyOn(Room.prototype, 'update');
+    // the server's own state (its principals' counters), read through the instance that admits
+    const admit = vi.spyOn(WsServer.prototype as unknown as { admitInflight: (...a: unknown[]) => unknown }, 'admitInflight');
+    const release = await app.manager.applySlots.acquire();
+    let released = false;
+    try {
+      // a valid update of 4 bytes (no struct, an empty delete set entry): the guard accepts it, no strike
+      const msg = syncMsg(new Uint8Array([0, 1, 0, 0]));
+      expect(msg.byteLength).toBeLessThan(16);
+      // one message per connection per read, as a paced sender (the rate limit allows 120/s per connection)
+      for (let r = 0; r < rounds; r++) {
+        for (const c of clients) c.sendRaw(msg);
+        await sleep(2);
+      }
+      await sleep(500);
+      const queued = jobs.mock.calls.length;
+      const gauge = (await app.metrics.inflightBytes.get()).values[0]?.value ?? 0;
+      const paused = conns.filter((c) => c.paused && !c.closing);
+      console.log('[S6 tiny updates]', JSON.stringify({ connections: n, sent: n * rounds, queued, bound: cap / KiB + 2 * n, inflightKiB: +(gauge / KiB).toFixed(1), capKiB: cap / KiB, paused: paused.length }));
+      expect(clients.every((c) => c.closeCode === null)).toBe(true);
+      expect(gauge).toBe(app.manager.inflightBytes);
+      // a small message is always taken (an honest edit is never refused): past the cap, one or two per connection
+      expect(gauge).toBeLessThanOrEqual(cap + 2 * n * KiB);
+      expect(await metric(app, 'wsRejected', 'reason', 'inflight')).toBe(0);
+      // the cap is reached: every connection that kept sending is no longer read (TCP backpressure)
+      expect(paused.length).toBe(n);
+      expect(await metric(app, 'wsPaused', 'why', 'server')).toBe(n);
+      expect(queued).toBeLessThanOrEqual(cap / KiB + 2 * n);
+      release();
+      released = true;
+      // everything is processed, the paused connections are read again and their rest processed too
+      await waitFor(() => jobs.mock.calls.length === n * rounds && app.manager.inflightBytes === 0, 90_000, 'every message processed');
+      expect(clients.every((c) => c.closeCode === null)).toBe(true);
+      expect(conns.every((c) => c.inflight === 0 && !c.paused)).toBe(true);
+      const ws = admit.mock.contexts[0] as unknown as { principals: Map<string, { inflight: number }> };
+      const ps = [...ws.principals.entries()].filter(([k]) => /^u:w\d+@corp$/.test(k));
+      expect(ps.length).toBe(accounts);
+      expect(ps.every(([, p]) => p.inflight === 0)).toBe(true);
+      expect((await app.metrics.inflightBytes.get()).values[0]?.value).toBe(0);
+    } finally {
+      if (!released) release();
+      jobs.mockRestore();
+      admit.mockRestore();
+    }
+  }, 150_000);
 
   it('a reconnecting tab\'s step 2 of a full room and an image paste in flight together stay under the connection\'s cap (honest traffic is never paused)', () => {
     // the size cap is 5 MiB at the chart's sizing, a message 4 MiB: an honest tab has one step 2 and

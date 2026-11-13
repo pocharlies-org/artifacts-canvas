@@ -23,7 +23,11 @@ measurement: `server/test/inflight/flood.ts`; probe: `server/test/fv9/delete-bat
   (344 MiB of buffers, RSS +508 MiB, still +500 after) and eight connections of 25 messages 660 MiB
   (682 MiB of buffers, RSS +882 MiB); after, 9.9 MiB in flight at most from one connection and
   33 MiB from eight (buffers 31 and 90 MiB, the rest of each flood waiting in the client), RSS back
-  under its baseline once done, and the honest pair in another room relayed every edit.
+  under its baseline once done, and the honest pair in another room relayed every edit. Every
+  message also counts at least 1 KiB in flight (`INFLIGHT_MIN_COST`): a tiny update is a few bytes
+  but holds up to ~1 KiB while it waits, and by bytes alone 12 accounts x 8 connections sending
+  4-byte updates queued 19 200 messages (131 KiB counted, no connection paused), where now the cap
+  stops them at 4 192 (4 MiB cap, every connection paused; `fv9-review.test.ts`).
 - [x] **F-1 — An honest bulk delete was struck (Medium).** A co-writer filled a shared board with
   10 400 shapes from one session; an honest user who selected half and pressed Delete was refused
   `4413` (the delete is estimated over `MAX_APPLY_MS`) **and struck**: three tries were a 10-minute

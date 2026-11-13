@@ -13,7 +13,7 @@ import { artifactState } from './expiry.js';
 import { TokenBucket, clientIp } from './limits.js';
 import { composeIdentity, sanitizeAwarenessUpdate } from './identity.js';
 import { AnonIssuer, assignNum } from './anon.js';
-import { applyEstimateMs, inflightConnBytes, normalizeOrigin } from './config.js';
+import { INFLIGHT_MIN_COST, applyEstimateMs, inflightConnBytes, normalizeOrigin } from './config.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
 import { ledgerBound, type RoomManager } from './rooms.js';
 import { BusyError, Room, RoomGone, bufferCap, limitBuffered, sendConn, sendWs, sentBytes, underBufferCap, type Conn } from './room.js';
@@ -368,12 +368,14 @@ export class WsServer {
   }
 
   /**
-   * Count a client message of `bytes` in flight (see above). Returns the release to call once it
-   * was processed, or null when it was refused (the connection is closed 1013).
+   * Count a client message of `bytes` in flight (see above), at INFLIGHT_MIN_COST at least (review
+   * S6: what a tiny message holds is not its bytes). Returns the release to call once it was
+   * processed, or null when it was refused (the connection is closed 1013).
    */
   private admitInflight(conn: Conn, bytes: number): (() => void) | null {
     const { cfg, manager, metrics, log } = this.deps;
-    const over = manager.inflightBytes + bytes > cfg.workerInflightBytes;
+    const cost = Math.max(bytes, INFLIGHT_MIN_COST);
+    const over = manager.inflightBytes + cost > cfg.workerInflightBytes;
     if (over && bytes > cfg.cpuShedMinBytes) {
       log.warn({ room: conn.artifactKey, user: conn.identity.id, bytes, inflight: manager.inflightBytes }, 'ws refused: messages in flight over WORKER_INFLIGHT_BYTES');
       metrics.wsRejected.inc({ reason: 'inflight' });
@@ -382,20 +384,20 @@ export class WsServer {
       return null;
     }
     const p = this.principalOf(conn.principal, conn.identity.anonymous);
-    conn.inflight += bytes;
-    p.inflight += bytes;
-    manager.inflightBytes += bytes;
+    conn.inflight += cost;
+    p.inflight += cost;
+    manager.inflightBytes += cost;
     metrics.inflightBytes.set(manager.inflightBytes);
     const cap = this.inflightCap(conn);
-    const why = conn.inflight >= cap ? 'connection' : p.inflight >= cap ? 'principal' : over && conn.inflight > bytes ? 'server' : null;
+    const why = conn.inflight >= cap ? 'connection' : p.inflight >= cap ? 'principal' : over && conn.inflight > cost ? 'server' : null;
     if (why) this.pause(conn, why);
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      conn.inflight -= bytes;
-      p.inflight -= bytes;
-      manager.inflightBytes -= bytes;
+      conn.inflight -= cost;
+      p.inflight -= cost;
+      manager.inflightBytes -= cost;
       metrics.inflightBytes.set(manager.inflightBytes);
       if (this.paused.size) this.resumePaused();
     };

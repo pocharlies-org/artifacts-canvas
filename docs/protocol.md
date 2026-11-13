@@ -534,8 +534,9 @@ that is gone or expired.
   nobody else is closed. One client message is processed at a time over all rooms
   (`WORKER_APPLY_CONCURRENCY` 1, the memory formula reserves one).
 - **Messages in flight** (§12): a client message (sync step 1, step 2, update) counts from its
-  receipt until its room's worker processed it. A connection, and a principal over all its
-  connections, with two messages of the largest size in flight (1 MiB at least: 8 MiB, anonymous
+  receipt until its room's worker processed it, at its size and at least 1 KiB. A connection,
+  and a principal over all its connections, with two messages of the largest size in flight
+  (1 MiB at least: 8 MiB, anonymous
   2 MiB) is no longer read until they are processed (TCP backpressure); a message bigger than
   `CPU_SHED_MIN_BYTES` (16 KiB) that would take everything in flight past
   `WORKER_INFLIGHT_BYTES` (64 MiB) → `1013` `busy` (metric `canvas_ws_rejected_total{reason="inflight"}`);
@@ -815,7 +816,9 @@ bounded by isolation:
   client could make it hold; once messages queued, nothing did (one writer at link speed could
   make it hold hundreds of MiB of Node buffers, outside every V8 heap, and the pod was
   OOM-killed). So every sync step 1, step 2 and update counts from its receipt until it was
-  processed (or dropped): a connection, and a principal over all its connections, with
+  processed (or dropped), at its size and at least 1 KiB (`INFLIGHT_MIN_COST`: a tiny update holds
+  up to that while it waits, so many of them reach the caps too): a connection, and a principal
+  over all its connections, with
   `max(2 x MAX_MESSAGE_BYTES, 1 MiB)` in flight is no longer read (`ws.pause()`) until that falls
   under (metric `canvas_ws_paused_total{why="connection"|"principal"}`); a message bigger than
   `CPU_SHED_MIN_BYTES` that would take the total past `WORKER_INFLIGHT_BYTES` (64 MiB) is refused
@@ -823,9 +826,11 @@ bounded by isolation:
   principals together; a smaller one is taken (an honest edit is never refused for it) and its
   connection, if it has more in flight, is not read until the total is under the cap
   (`why="server"`). What is held is `canvas_ws_inflight_bytes`. A connection that stays unread
-  for two `WS_PING_INTERVAL_MS` rounds (its pongs are not read either) is dropped as idle. Beyond the cap, the bound is one
-  message per connection being read when it was paused (the `ws` receiver's frame, at most its
-  `maxPayload`, as on any connection).
+  for two `WS_PING_INTERVAL_MS` rounds (its pongs are not read either) is dropped as idle. Beyond the cap, the bound is what
+  each connection was being read when it was paused: the frame being received (at most `maxPayload`,
+  as on any connection) or, for small messages, the rest of the chunk already read (the `ws`
+  receiver emits every message of a chunk), at most `MSG_BURST` messages before the rate limit
+  closes it.
 - **Watchdog.** Every request to a worker has a hard timeout. A client message (guard and
   apply together, one deadline): `WORKER_MESSAGE_TIMEOUT_MS` (1 000; an honest update missed 250
   under CPU contention, and a fresh worker's first message runs unoptimised code) +
