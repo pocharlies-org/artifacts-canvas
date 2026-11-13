@@ -105,6 +105,11 @@ data:
   {{- if .Values.limits.artifactPrefixes }}
   ARTIFACT_PREFIXES: {{ join "," .Values.limits.artifactPrefixes | quote }}
   {{- end }}
+  # --- anonymous drawing: always rendered, so the server's own default (on) never applies ---
+  {{- if not (kindIs "bool" .Values.anon.enabled) }}
+  {{- fail "anon.enabled must be true or false" }}
+  {{- end }}
+  ANON_ENABLED: {{ ternary "true" "false" .Values.anon.enabled | quote }}
   {{- if .Values.limits.anonAllowedPrefixes }}
   ANON_ALLOWED_PREFIXES: {{ join "," .Values.limits.anonAllowedPrefixes | quote }}
   {{- end }}

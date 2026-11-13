@@ -44,6 +44,9 @@ services:
       AUTHZ_RECHECK_SECONDS: "3"
       SAVE_DEBOUNCE_MS: "300"
       LOG_LEVEL: info
+      # the test stack draws anonymously on pub/ (e2e-system: system.spec, the anonymous
+      # adversarial specs); CANVAS_ANON_ENABLED=false runs it as the chart's default does
+      ANON_ENABLED: ${CANVAS_ANON_ENABLED:-true}
       # the chart's memory sizing (chart/values.yaml: heapLimitMb, resources.limits);
       # CANVAS_HEAP_LIMIT_MB + CANVAS_MEM_LIMIT run the stack at another size, e.g. 816 + 1g.
       # Not --max-old-space-size: it would override every room worker's heap limit (fv9)

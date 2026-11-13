@@ -47,6 +47,12 @@ jobs:
           fails helm template chart/ -f chart/ci/ci-values.yaml --set resources.limits.memory=2Gi
           fails helm template chart/ -f chart/ci/ci-values.yaml --set resources.limits.memory=2304X
           helm template chart/ -f chart/ci/ci-values.yaml | grep -q 'WORKER_INFLIGHT_BYTES: "67108864"'
+          # anonymous drawing: off unless anon.enabled says so, and always rendered (the server's own
+          # default is on); a value that is not a boolean fails the render
+          helm template chart/ -f chart/ci/ci-values.yaml | grep -q 'ANON_ENABLED: "false"'
+          helm template chart/ -f chart/ci/ci-values.yaml --set anon.enabled=true | grep -q 'ANON_ENABLED: "true"'
+          fails helm template chart/ -f chart/ci/ci-values.yaml --set-string anon.enabled=false
+          fails helm template chart/ -f chart/ci/ci-values.yaml --set anon.enabled=null
           # the worker test hooks are never rendered, alerts or not
           if helm template chart/ -f chart/ci/ci-values.yaml --set alerts.enabled=true | grep -q WORKER_TEST_HOOKS; then exit 1; fi
           helm template chart/ -f chart/ci/ci-values.yaml --set alerts.enabled=true | grep -q 'kind: PrometheusRule'

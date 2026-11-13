@@ -1,5 +1,12 @@
 # Known issues
 
+Anonymous drawing is a switch: `ANON_ENABLED`, rendered by the chart from `anon.enabled`, whose
+default is `false` (protocol §1). The entries rated "if anonymous drawing is on" apply once it is
+turned on; with it off, a visitor without a session is refused before the core is asked and no
+anonymous principal exists. `ANON_ALLOWED_PREFIXES` cannot turn it off (an empty value is the
+default `pub/`); before the switch, a list that parsed to no prefix (`,`) accepted anonymous visitors
+on every key the core opened to them, and now accepts them nowhere.
+
 ## Review of the fv9 branch (security and QA)
 
 The security review and the independent QA verification of the room-isolation branch found one
@@ -41,7 +48,7 @@ measurement: `server/test/inflight/flood.ts`; probe: `server/test/fv9/delete-bat
   anonymous drawing is on; Low while it is off).** See "The anonymous strike pool" below: 10
   updates of 257 client blocks (43 KB in all) are 10 guard refusals, each a strike of the
   anonymous pool, and every anonymous join and write is refused `1013` for the cooldown. Signed-in
-  users are never affected. **Fix before enabling anonymous drawing**, together with the real
+  users are never affected. **Fix before enabling anonymous drawing** (`anon.enabled`), together with the real
   `CLIENT_IP_HOPS` of the deployment's proxy path (with more than one appending proxy, the per-IP
   key is the previous proxy's address, and its threshold is lower than the pool's).
   Suggested fix: no pool strike for guard refusals (they cost the server only the guard, charged);

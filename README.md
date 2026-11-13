@@ -216,6 +216,7 @@ The canvas is a core plugin (design §8): the core answers *who may see this art
    | `core.namespace` | `sso` | `namespaces.sso` (the gate) |
    | `metrics.port` / `networkPolicy.metricsNamespaces` | `9091` / `[monitoring]` | internal Prometheus port, not in any route |
    | `anon.cookieSecretRef.name` / `.key` | `""` / `anon-cookie-secret` | an operator-created Secret holding `ANON_COOKIE_SECRET` (≥ 32 random bytes); required when `deployment.replicas` > 1, recommended always (without it anonymous cookies and ids reset on every restart) |
+   | `anon.enabled` | `false` | anonymous drawing, rendered as `ANON_ENABLED` (always, so the server's own default never applies). Off: a visitor without a session is sent to `core.loginUrl` by the wrapper page and closed `4403` by the WebSocket, before the gate is asked, whatever `limits.anonAllowedPrefixes` holds; the core's anonymous `pub/` reads are not affected. A value that is not a boolean fails the render |
 
    The chart ships the Deployment, Service (`http` 8080, `metrics` 9091), ConfigMap, ServiceAccount and a
    NetworkPolicy: `http` only from the ingress controller's namespace and the core's namespace, `metrics`
@@ -251,7 +252,8 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `READYZ_CACHE_MS` | `5000` | `/readyz` caches the `HeadBucket` result. |
 | `EXPIRED_REASONS` / `GONE_REASONS` | `expired` / `object-missing` | Gate reasons classified as expired/gone. |
 | `ARTIFACT_PREFIXES` | (all) | Optional allowlist of artifact key prefixes the canvas serves. |
-| `ANON_ALLOWED_PREFIXES` | `pub/` | Prefixes where anonymous access is accepted. |
+| `ANON_ENABLED` | `true` (chart: `false`) | Anonymous drawing. `false`: a visitor who brings no credential (no `Authorization`, no cookie but the canvas's own `canvas_anon`) is refused before the core is asked (wrapper `302` to `LOGIN_URL`, else `403`; frame `403`; WebSocket `4403`), and so is any anonymous answer of the core; no visitor cookie is minted. Any value but `true`/`1` is off. Unset, the server keeps its earlier behaviour (on); the chart always renders it, from `anon.enabled`. |
+| `ANON_ALLOWED_PREFIXES` | `pub/` | Prefixes where anonymous access is accepted while `ANON_ENABLED` is on. An empty value is the default (`pub/`), and a list with no prefix in it (`,`) accepts anonymous nowhere: neither turns anonymous drawing off, `ANON_ENABLED` does. |
 | `MAX_CONNS_PER_ROOM` / `MAX_CONNS_PER_ROOM_ANON` / `MAX_CONNS_PER_ANON_VISITOR` | `50` / `10` / `2` | Room capacity (anon gets the stricter set); over capacity closes `1013`. |
 | `MSG_RATE_PER_SEC` / `MSG_BURST` | `120` / `240` | Per-connection message rate → `4429`. |
 | `ANON_MSG_RATE_PER_SEC` / `ANON_MSG_BURST` | `30` / `60` | Same for anonymous. |

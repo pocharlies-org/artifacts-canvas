@@ -280,8 +280,10 @@ export class HttpApp {
       void manager.expireRoom(key, 'expired');
       return { ok: false, status: 410 };
     }
-    // `unauthenticated` is the gate's answer for a visitor with no session (docs/plugins.md §1).
-    if (!res.allowed) return { ok: false, status: 403, login: res.reason === 'unauthenticated' && !isBearer(authorization) };
+    // `unauthenticated` is the gate's answer for a visitor with no session (docs/plugins.md §1);
+    // `anon_disabled` (authz.ts) the canvas's own for an anonymous visitor while anonymous drawing
+    // is off: logging in is the way in for both.
+    if (!res.allowed) return { ok: false, status: 403, login: (res.reason === 'unauthenticated' || res.reason === 'anon_disabled') && !isBearer(authorization) };
     return { ok: true, res };
   }
 

@@ -37,6 +37,17 @@ the gate answers `unauthenticated` (no session; not a bearer caller), the **wrap
 `302` to `LOGIN_URL` with `{rd}` = the URL-encoded original path, so a visitor who opens a
 canvas link first logs in and comes back. Frame and ws never redirect.
 
+With anonymous drawing off (`ANON_ENABLED=false`, the chart's `anon.enabled: false` default) the
+canvas has no anonymous visitors at all. A request that brings no credential (no `Authorization`,
+and no cookie other than the canvas's own `canvas_anon`) is refused **before the core is asked**:
+the core decides only on those headers (§7), so its answer could only be anonymous. The refusal
+looks like the gate's `unauthenticated`: the wrapper answers `302` to `LOGIN_URL` (else `403`), the
+frame `403`, the ws closes `4403`. A request with some cookie is asked as usual, and an anonymous
+answer (`user.anonymous: true`, e.g. a session cookie the core no longer accepts on a `pub/` key)
+is refused the same way. No visitor cookie is minted and no anonymous principal exists; signed-in
+visitors are not affected, and neither are the core's own anonymous reads of `pub/` artifacts.
+`ANON_ALLOWED_PREFIXES` does not express "off": it applies only while anonymous drawing is on.
+
 ### 1.1 Wrapper CSP (sent by the server)
 
 ```
@@ -173,7 +184,8 @@ interface Identity {
   attribution id is `anon:<visitor id>`, an HMAC of the cookie's nonce, so a later visitor
   who gets a freed number shows the same label but never writes as — or is credited with —
   the earlier visitor's shapes and history. Logged-in connections ignore both. Anonymous
-  connections are accepted only for keys inside `ANON_ALLOWED_PREFIXES` (default `pub/`);
+  connections are accepted only while `ANON_ENABLED` is on (§1: off, they are closed `4403` and
+  never get a cookie) and only for keys inside `ANON_ALLOWED_PREFIXES` (default `pub/`);
   anything else is denied with reason `anon_outside_pub` (§7).
 - Close codes (RFC 6455 private range; the client does not reconnect on 44xx): `4403`
   forbidden (authz denied, revoked, or a forbidden write, §5), `4404` artifact gone, `4410`
@@ -446,8 +458,10 @@ Body: `{allowed, reason, user:{id,name,anonymous}, artifact:{key,expires,ttl}}`.
   identity the server sends in IDENTITY and writes into awareness comes **only** from this
   answer.
 - `user.anonymous: true` (the gate sends `id: null`, `name: "anonymous"`) is accepted only
-  for keys inside `ANON_ALLOWED_PREFIXES` (default `pub/`); anything else is denied with
-  reason `anon_outside_pub`. The server composes the anonymous identity itself (§4:
+  while `ANON_ENABLED` is on (else it is denied with reason `anon_disabled`, and a visitor
+  without credentials is denied with it before the gate is asked, §1) and only for keys inside
+  `ANON_ALLOWED_PREFIXES` (default `pub/`; a list with no prefix accepts none); anything else
+  is denied with reason `anon_outside_pub`. The server composes the anonymous identity itself (§4:
   `anon:<visitor id>` bound to its signed cookie, label `Anónimo NNNN` server-assigned,
   `?anon=` only a hint for the number).
 - `artifact.ttl` is an **integer number of days** (or null); valid values (0–999) are copied

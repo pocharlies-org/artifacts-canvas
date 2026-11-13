@@ -255,7 +255,17 @@ export interface Config {
    * authority). When set, the key must start with one of these prefixes.
    */
   artifactPrefixes: string[];
-  /** Defense in depth: anonymous connections are only ever accepted for these key prefixes. */
+  /**
+   * Anonymous drawing on or off (ANON_ENABLED; the chart renders it from `anon.enabled`, default
+   * false). Off: a visitor who brings no credential is refused before the core is asked, and an
+   * anonymous answer of the core is refused too, whatever ANON_ALLOWED_PREFIXES holds. Unset, the
+   * server's own default is on (what it did before the switch; the compose stack and the tests).
+   */
+  anonEnabled: boolean;
+  /**
+   * Defense in depth: anonymous connections are only ever accepted for these key prefixes (with
+   * anonEnabled). A list that parses to nothing (`,`) accepts anonymous nowhere.
+   */
   anonAllowedPrefixes: string[];
   /** authz `reason` values that mean the artifact is expired. */
   expiredReasons: Set<string>;
@@ -455,6 +465,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxImageBytes: num(env, 'MAX_IMAGE_BYTES', 2 * 1024 * 1024),
     anonMaxImageBytes: num(env, 'ANON_MAX_IMAGE_BYTES', 512 * 1024),
     artifactPrefixes: list(env, 'ARTIFACT_PREFIXES', []),
+    anonEnabled: bool(env, 'ANON_ENABLED', true),
     anonAllowedPrefixes: list(env, 'ANON_ALLOWED_PREFIXES', ['pub/']),
     // Reason vocabulary of the core gate (gate/gate.py, docs/plugins.md §1): `expired` when the
     // ACL expiry has passed, `object-missing` when the artifact object is gone (HEAD failed).

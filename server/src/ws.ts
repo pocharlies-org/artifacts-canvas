@@ -148,7 +148,9 @@ export class WsServer {
     // is refused before the core is asked (each refused attempt cost an authz round trip: q2's
     // attackers made 670 a second). Only anonymous joins spend a visitor's join budget, so a
     // browser that logged in meanwhile is refused only while that budget refills (seconds).
-    if (!authorization) {
+    // With anonymous drawing off there are no anonymous principals: authz.ts refuses a visitor
+    // without credentials before the core is asked (4403 below), and any anonymous answer.
+    if (!authorization && this.deps.cfg.anonEnabled) {
       const v = this.anon.parse(cookie);
       if (v) {
         const p = `a:${v.nonce}`;

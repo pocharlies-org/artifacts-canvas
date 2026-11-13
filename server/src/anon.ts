@@ -107,6 +107,25 @@ export class AnonIssuer {
   }
 }
 
+/**
+ * Does a request carry anything the core could identify a visitor by? The core decides only on
+ * the Cookie and Authorization headers it is sent (authz.ts), and the canvas's own visitor cookie
+ * means nothing to it: without an Authorization header and without any other cookie, the core's
+ * answer can only be anonymous (or a deny). Used to refuse anonymous visitors without asking the
+ * core while anonymous drawing is off (ANON_ENABLED=false). Any other cookie counts, whatever its
+ * name: the session cookie's name is the core's business.
+ */
+export function bringsCredentials(cookieHeader: string, authorization: string): boolean {
+  if (authorization.trim() !== '') return true;
+  for (const part of cookieHeader.split(';')) {
+    const p = part.trim();
+    if (p === '') continue;
+    const eq = p.indexOf('=');
+    if ((eq < 0 ? p : p.slice(0, eq).trim()) !== ANON_COOKIE) return true;
+  }
+  return false;
+}
+
 export function validNum(v: string | null | undefined): string | null {
   return v && /^\d{4}$/.test(v) && Number(v) >= 1000 ? v : null;
 }

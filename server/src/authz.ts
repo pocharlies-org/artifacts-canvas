@@ -2,6 +2,7 @@ import type { Config } from './config.js';
 import type { Logger } from './logging.js';
 import type { Metrics } from './metrics.js';
 import type { AuthzArtifact, AuthzResult, Identity } from './types.js';
+import { bringsCredentials } from './anon.js';
 
 /**
  * Client for the core's plugin authorization API — the real contract of
@@ -38,6 +39,14 @@ export class AuthzClient {
    * `/artifacts/` prefix). `cookie` and `authorization` are the raw header values ('' if absent).
    */
   async authorize(cookie: string, artifactKey: string, authorization = ''): Promise<AuthzResult> {
+    // Anonymous drawing off (ANON_ENABLED=false): a visitor without any credential can only be
+    // anonymous, so it is refused here and the core is not asked (no round trip, no visitor
+    // cookie minted later). Not a decision of the core: no duration is observed.
+    if (!this.cfg.anonEnabled && !bringsCredentials(cookie, authorization)) {
+      this.metrics.authz.inc({ result: 'deny' });
+      this.metrics.authzDeny.inc({ reason: 'anon_disabled' });
+      return deny('anon_disabled');
+    }
     const started = performance.now();
     const done = (r: AuthzResult): AuthzResult => {
       this.metrics.authzDuration.observe((performance.now() - started) / 1000);
@@ -100,6 +109,10 @@ export class AuthzClient {
     if (typeof user.anonymous !== 'boolean') return done(deny('malformed'));
 
     if (user.anonymous) {
+      // Anonymous drawing off: the core may still open pub/ to anonymous visitors (reads of the
+      // artifact itself), and a visitor whose session cookie it does not accept is one of them.
+      // Refused whatever ANON_ALLOWED_PREFIXES holds.
+      if (!this.cfg.anonEnabled) return done(deny('anon_disabled'));
       // Defense in depth: the core only allows anonymous inside pub/ while its anonymous-pub
       // flag is on; a misconfigured core must not open every artifact.
       if (!anonAllowed(artifactKey, this.cfg.anonAllowedPrefixes)) {
@@ -147,7 +160,7 @@ function parseArtifact(v: unknown): AuthzArtifact | undefined {
   return { key, expires, ttl };
 }
 
+/** Is anonymous access accepted for this key? Only inside one of `prefixes`: an empty list accepts none. */
 export function anonAllowed(artifactKey: string, prefixes: string[]): boolean {
-  if (prefixes.length === 0) return true;
-  return prefixes.some((p) => artifactKey.startsWith(p));
+  return prefixes.some((p) => p !== '' && artifactKey.startsWith(p));
 }
