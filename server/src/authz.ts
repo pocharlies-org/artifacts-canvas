@@ -41,9 +41,8 @@ export class AuthzClient {
   async authorize(cookie: string, artifactKey: string, authorization = ''): Promise<AuthzResult> {
     // Anonymous drawing off (ANON_ENABLED=false): a visitor without any credential can only be
     // anonymous, so it is refused here and the core is not asked (no round trip, no visitor
-    // cookie minted later). Not a decision of the core: no duration is observed.
+    // cookie minted later). Counted as a denial, not as a call to the core (canvas_authz_total).
     if (!this.cfg.anonEnabled && !bringsCredentials(cookie, authorization)) {
-      this.metrics.authz.inc({ result: 'deny' });
       this.metrics.authzDeny.inc({ reason: 'anon_disabled' });
       return deny('anon_disabled');
     }

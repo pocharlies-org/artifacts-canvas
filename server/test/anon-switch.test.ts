@@ -68,6 +68,8 @@ describe('ANON_ENABLED: off means off, whatever ANON_ALLOWED_PREFIXES holds', ()
     }
     expect(core.calls).toHaveLength(0);
     expect(await denials(metrics, 'anon_disabled')).toBe(2);
+    // nothing was asked: canvas_authz_total counts calls to the core
+    expect((await metrics.authz.get()).values.reduce((a, v) => a + v.value, 0)).toBe(0);
 
     // a cookie the core does not accept as a session: it answers anonymous, still refused
     const stale = await authz.authorize('sid=expired', 'pub/doc.html');
