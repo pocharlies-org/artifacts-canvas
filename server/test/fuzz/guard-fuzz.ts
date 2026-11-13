@@ -12,20 +12,22 @@
  * random delete sets (zero-length ranges included) — and runs the server path of ws.ts:
  * guard, then applyGuarded on a copy of the room, with the attacker as transaction origin.
  *
- * Oracle, for every update the guard accepts:
+ * Oracle, for every update the guard accepts (fv8: also the size the server counts for it):
  *   - the ledger holds only the stamper's own structs (no client struct ever enters it);
  *   - every pre-existing attribution entry keeps createdBy/createdAt, every other user's
  *     `users` entry is unchanged, the history keeps every earlier line, and every new line
  *     and attribution change is by the attacker (what the stamper derives from its edit);
  *   - the apply neither throws nor leaves pending state, the content still encodes, no root
- *     outside shapes/assets/meta changed, and no shape/asset/meta value became invalid.
+ *     outside shapes/assets/meta changed, and no shape/asset/meta value became invalid;
+ *   - an update that grows the room grows the encoded content by at most its size plus
+ *     SPLIT_COST_BYTES per cut the guard counted (fv8 P1: inserts that cut items were not).
  * Any violation is a finding (printed with the update hex). Exit code 1 if there is one.
  *
  *   npx tsx server/test/fuzz/guard-fuzz.ts [iterations=1000000] [seed=1]
  */
 import * as Y from 'yjs';
 import * as encoding from 'lib0/encoding';
-import { applyGuarded, attachStamper, checkClientUpdate, shapeValueProblem } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { SPLIT_COST_BYTES, applyGuarded, attachStamper, checkClientUpdate, encodeIntegratedState, shapeValueProblem } from '@pocharlies/artifacts-canvas-shared/stamper';
 import { materializeContent, materializeLedger } from '@pocharlies/artifacts-canvas-shared/ledger';
 import { assetValueOk, metaValueOk } from '@pocharlies/artifacts-canvas-shared/model';
 
@@ -204,6 +206,9 @@ function contentProblems(before: Room, after: Room): string[] {
   }
   return out;
 }
+
+/** Bytes an update may grow the encoded content by beyond its own size and its cuts (headers). */
+const SIZE_SLACK = 16;
 
 export function runFuzz(iterations: number, seed0 = 1): FuzzResult {
   // mulberry32 (the verifier's float LCG lost precision above 2^53 and cycled after a few
@@ -431,8 +436,10 @@ export function runFuzz(iterations: number, seed0 = 1): FuzzResult {
     }
     if (trace) process.stderr.write(`#${i} ${Buffer.from(u).toString('hex')}\n`);
     let verdict: string | null;
+    let check: ReturnType<typeof checkClientUpdate> | null = null;
     try {
-      verdict = checkClientUpdate(room.content, u, { serverClient: S, mayWriteClient: (c) => c !== L }).bad;
+      check = checkClientUpdate(room.content, u, { serverClient: S, mayWriteClient: (c) => c !== L });
+      verdict = check.bad;
     } catch {
       verdict = 'guard-throw';
     }
@@ -442,10 +449,18 @@ export function runFuzz(iterations: number, seed0 = 1): FuzzResult {
     }
     res.accepted++;
     const scratch = copyRoom(room, clock);
+    const sizeBefore = encodeIntegratedState(scratch.content).byteLength;
     const out = applyGuarded(scratch.content, u, 'mallory');
     const problems: string[] = [];
     if (out.threw) problems.push('apply-throws:' + out.threw.slice(0, 50));
     if (out.droppedPending) problems.push('pending-after-apply');
+    // fv8 P1: what the server counts for an update that grows the room (its size, plus
+    // SPLIT_COST_BYTES per cut the guard counted) covers what the encoded content really grew by,
+    // up to SIZE_SLACK bytes of block headers (measured: at most 3; every save measures exactly)
+    if (check?.grows && !out.threw) {
+      const growth = encodeIntegratedState(scratch.content).byteLength - sizeBefore;
+      if (growth > u.byteLength + check.splits * SPLIT_COST_BYTES + SIZE_SLACK) problems.push(`size-estimate:${growth}>${u.byteLength}+${check.splits}x${SPLIT_COST_BYTES}`);
+    }
     problems.push(...ledgerProblems(ledgerBefore, scratch), ...contentProblems(room, scratch));
     if (viewOf(scratch.ledger).hex === ledgerBefore.hex) res.ledgerUntouched++;
     else res.ledgerStamped++;
