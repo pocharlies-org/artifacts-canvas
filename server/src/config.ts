@@ -164,7 +164,10 @@ export interface Config {
    * operation on the whole room (load, join encodings, saves, the replay of a recovery)
    * WORKER_OP_TIMEOUT_MS plus WORKER_OP_NS_PER_BYTE per byte of the room. Past it the worker is
    * terminated, the room rebuilt in a fresh one from its saved state and write-ahead log, and the
-   * sender of the message closed (4413) with a strike.
+   * sender of the message closed (4413) with a strike. 1000 ms by default: the main thread does
+   * not wait on it either way, and an honest message must never miss it — under CPU contention
+   * (two honest fuzzers on one host) one honest update missed 250 ms, and the first message of a
+   * fresh worker runs unoptimised code.
    */
   workerMessageTimeoutMs: number;
   workerTimeoutNsPerByte: number;
@@ -408,7 +411,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxSplitsPerMessage: num(env, 'MAX_SPLITS_PER_MESSAGE', 5000),
     maxApplyMs: num(env, 'MAX_APPLY_MS', 1000),
     maxClientsPerUpdate: num(env, 'MAX_CLIENTS_PER_UPDATE', 256),
-    workerMessageTimeoutMs: num(env, 'WORKER_MESSAGE_TIMEOUT_MS', 250),
+    workerMessageTimeoutMs: num(env, 'WORKER_MESSAGE_TIMEOUT_MS', 1000),
     workerTimeoutNsPerByte: num(env, 'WORKER_TIMEOUT_NS_PER_BYTE', 1000),
     workerOpTimeoutMs: num(env, 'WORKER_OP_TIMEOUT_MS', 10_000),
     workerOpNsPerByte: num(env, 'WORKER_OP_NS_PER_BYTE', 2000),

@@ -511,7 +511,7 @@ that is gone or expired.
   client never formats, and formatting items made Yjs copy the attribute map per character).
 - **Isolation** (§12): the documents, the guard and the apply of every room run in a worker
   thread of the room's own, with a heap limit; the main thread waits for each answer with a
-  watchdog (`WORKER_MESSAGE_TIMEOUT_MS` 250 + `WORKER_TIMEOUT_NS_PER_BYTE` 1 000 per byte of
+  watchdog (`WORKER_MESSAGE_TIMEOUT_MS` 1 000 + `WORKER_TIMEOUT_NS_PER_BYTE` 1 000 per byte of
   the message, the apply up to twice its estimate on top). A message that makes its room's
   worker miss the watchdog, run out of heap or crash closes its sender `4413` (notice
   `too-large`) with a **strike**; `WORKER_STRIKES` (3) within `WORKER_STRIKE_WINDOW_MS` (10 min)
@@ -784,8 +784,9 @@ bounded by isolation:
   (≤ 85% of the budget) plus one worker's headroom plus the main thread (chart `values.yaml`,
   "Memory").
 - **Watchdog.** Every request to a worker has a hard timeout. A client message (guard and
-  apply together, one deadline): `WORKER_MESSAGE_TIMEOUT_MS` (250) + `WORKER_TIMEOUT_NS_PER_BYTE`
-  (1 000) per byte of the message, its apply up to `WORKER_MESSAGE_TIMEOUT_MS` + twice the
+  apply together, one deadline): `WORKER_MESSAGE_TIMEOUT_MS` (1 000; an honest update missed 250
+  under CPU contention, and a fresh worker's first message runs unoptimised code) +
+  `WORKER_TIMEOUT_NS_PER_BYTE` (1 000) per byte of the message, its apply up to `WORKER_MESSAGE_TIMEOUT_MS` + twice the
   guard's estimate (an upper bound of every path Yjs is known to take); a step 1 the same plus
   `WORKER_OP_NS_PER_BYTE` per byte of the room; an operation on the whole room (load, join
   encodings, saves, a recovery's load and replay) `WORKER_OP_TIMEOUT_MS` (10 s) +

@@ -212,7 +212,7 @@ limits:
 # where it is) and all together (anonPoolStrikes). applyConcurrency client messages are processed
 # at once over all rooms (the memory formula below reserves one message per slot).
 worker:
-  messageTimeoutMs: 250
+  messageTimeoutMs: 1000
   timeoutNsPerByte: 1000
   opTimeoutMs: 10000
   opNsPerByte: 2000

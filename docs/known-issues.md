@@ -15,7 +15,7 @@ leaves open:
 - [ ] **One client message is processed at a time over all rooms (Low, design).** The apply slot
   (`WORKER_APPLY_CONCURRENCY` 1) bounds the memory of the messages in flight to one worker's
   headroom, as one main thread did before; a message holds it for its guard and apply, so other
-  rooms' updates wait behind it (up to its watchdog: 250 ms + 1 us per byte, its apply up to twice
+  rooms' updates wait behind it (up to its watchdog: 1 s + 1 us per byte, its apply up to twice
   its estimate, `MAX_APPLY_MS` 1 000 ms at most). Honest edits take well under a millisecond; an
   attacker's messages are bounded by the CPU budgets and the strikes. The main thread never
   waits (pings, joins, awareness, broadcasts go on).
@@ -87,8 +87,11 @@ one GitHub issue.
   the fork reaches it during q5 (~4.5 GB RSS, `FATAL ERROR: Reached heap limit ... JavaScript heap
   out of memory`, vitest reports `Worker exited unexpectedly` and `npm test` fails although 222
   of 223 tests passed); the same happens at the fv7 head (5a1ab8c), so fv8 did not cause it. An
-  M-series Mac (Node 26, ~3.9 GB RSS) and GitHub's runners pass. Workaround:
-  `NODE_OPTIONS=--max-old-space-size=8192 npm test` (the forks inherit it).
+  M-series Mac (Node 26, ~3.9 GB RSS) and GitHub's runners pass. Still so after fv9 (the rooms
+  moved to their workers; q5's buffers are the main thread's). Workaround on such a host: run
+  `server/test/fv6.test.ts` alone with `NODE_OPTIONS=--max-old-space-size=8192` (the forks
+  inherit it), and the rest without it: that flag also overrides every room worker's heap limit,
+  so the fv9 out-of-heap test skips itself under it.
   Suggested fix: split the file per finding (each file gets a fresh fork), release the rooms and
   test clients of each test, and lower q5's outgoing budget.
 
