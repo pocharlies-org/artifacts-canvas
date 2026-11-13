@@ -208,5 +208,18 @@ export class Metrics {
   constructor() {
     collectDefaultMetrics({ register: this.registry });
     this.heapLimit.set(v8.getHeapStatistics().heap_size_limit);
+    // Review S7: the series the alerts read (chart/templates/prometheusrule.yaml) and the optional
+    // signals exist at 0 from the start. A labelled series is otherwise created at its first
+    // increment, already at 1, and increase() over it is 0: the first event after every start,
+    // the one these alerts are for, would not fire.
+    this.strikes.inc({ outcome: 'cooldown' }, 0);
+    this.workerFaults.inc({ kind: 'timeout' }, 0);
+    this.workerRecoveries.inc({ outcome: 'failed' }, 0);
+    this.workerRecoveries.inc({ outcome: 'differs' }, 0);
+    this.wsRejected.inc({ reason: 'inflight' }, 0);
+    this.wsRejected.inc({ reason: 'delete_too_costly' }, 0);
+    this.saves.inc({ outcome: 'error' }, 0);
+    this.wsPaused.inc({ why: 'connection' }, 0);
+    this.wsPaused.inc({ why: 'principal' }, 0);
   }
 }

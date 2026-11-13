@@ -218,7 +218,8 @@ The canvas is a core plugin (design §8): the core answers *who may see this art
    The chart ships the Deployment, Service (`http` 8080, `metrics` 9091), ConfigMap, ServiceAccount and a
    NetworkPolicy: `http` only from the ingress controller's namespace and the core's namespace, `metrics`
    only from `networkPolicy.metricsNamespaces`; with `alerts.enabled` also a PrometheusRule (strike
-   cooldowns, worker timeouts, failed rebuilds, in-flight refusals, writes refused while saves fail).
+   cooldowns, worker timeouts, failed rebuilds, in-flight refusals, writes refused while saves fail;
+   their series are exposed at 0 from the start, so the first event after a restart fires).
    It refuses to render a `resources.limits.memory` that cannot hold its `heapLimitMb` (see "Memory"
    in `values.yaml`: change both together).
 

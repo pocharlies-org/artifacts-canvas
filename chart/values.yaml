@@ -244,6 +244,7 @@ metrics:
 # Each of these on a deployment means an honest user may have been hit or a room broke: a principal
 # put in a strike cooldown, a room worker over its watchdog, a room that could not be rebuilt (or
 # was rebuilt different), messages refused for the in-flight cap, writes refused because saves fail.
+# The server exposes each of these series at 0 from its start, so increase() sees the first event.
 # `matchers` selects this release's series (the scrape's labels).
 alerts:
   enabled: false

@@ -14,6 +14,8 @@
  *   F-6  while saves kept failing the write-ahead log grew without a bound.
  *   S6   tiny messages from many principals counted a few bytes each and never reached the cap:
  *        every message now counts at least INFLIGHT_MIN_COST (1 KiB).
+ *   S7   the series the chart's alerts read were born at their first event (increase() missed it):
+ *        now exposed at 0 from the start.
  * And the bump discipline: the cost constants are tied to the Yjs versions they were measured on.
  * The full-system variant of M-1 (RSS of the canvas under the chart's limit) is
  * e2e-system/adversarial-inflight.spec.ts; the process-level measurement server/test/inflight/flood.ts.
@@ -476,5 +478,42 @@ describe('bump discipline: the cost constants are tied to the Yjs versions they 
       expect(installed.length, name).toBeGreaterThan(0);
       expect(new Set(installed), `${name}: re-run the fv8/fv9 adversarial suites before updating CALIBRATED_WITH`).toEqual(new Set([version]));
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+describe('alert series exposed at 0 (review S7)', () => {
+  it('a fresh server\'s /metrics has every series the chart\'s alerts (and the optional signals) read, at 0: increase() over a series born at 1 is 0, so the first event after a start would not fire', async () => {
+    const app = await startApp({ METRICS_PORT: String(++portSeq), METRICS_HOST: '127.0.0.1' });
+    const mport = (app.metricsServer!.address() as { port: number }).port;
+    const body = await (await fetch(`http://127.0.0.1:${mport}/metrics`)).text();
+    const lines = new Set(body.split('\n'));
+    // every series the chart's PrometheusRule reads (an `=~"a|b"` matcher is each of a and b)
+    const rule = fs.readFileSync(path.join(here, '..', '..', 'chart', 'templates', 'prometheusrule.yaml'), 'utf8');
+    const alerted: string[] = [];
+    for (const [, name, selector] of rule.matchAll(/expr: increase\((canvas_[a-z_]+)(.*?)\[\w+\]\)/g)) {
+      const matchers = [...selector.matchAll(/(\w+)=~?"([^"]*)"/g)];
+      expect(matchers.length, name).toBeLessThanOrEqual(1);
+      if (!matchers.length) alerted.push(name);
+      else for (const v of matchers[0][2].split('|')) alerted.push(`${name}{${matchers[0][1]}="${v}"}`);
+    }
+    expect(alerted).toEqual([
+      'canvas_strikes_total{outcome="cooldown"}',
+      'canvas_worker_faults_total{kind="timeout"}',
+      'canvas_worker_recoveries_total{outcome="failed"}',
+      'canvas_worker_recoveries_total{outcome="differs"}',
+      'canvas_ws_rejected_total{reason="inflight"}',
+      'canvas_wal_full_total',
+    ]);
+    // the optional signals (early storage errors, an accepted flood, refused deletes)
+    const optional = [
+      'canvas_saves_total{outcome="error"}',
+      'canvas_ws_paused_total{why="connection"}',
+      'canvas_ws_paused_total{why="principal"}',
+      'canvas_ws_rejected_total{reason="delete_too_costly"}',
+    ];
+    const missing = [...alerted, ...optional].filter((s) => !lines.has(`${s} 0`));
+    expect(missing).toEqual([]);
+    expect(lines.has('canvas_strikes_total{outcome="cooldown"} 0')).toBe(true);
   });
 });
