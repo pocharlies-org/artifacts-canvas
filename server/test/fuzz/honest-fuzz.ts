@@ -22,7 +22,11 @@
  * delivered every tab equals the room. `updates` counts the client sync messages that carried
  * document changes (update / step 2) the server processed.
  *
- *   npx tsx server/test/fuzz/honest-fuzz.ts [runs=200] [seed=1] [steps=400] [mode=both|client|ywebsocket]
+ * fv9: the room runs in its worker thread; with a restart rate, the worker is also replaced at
+ * random steps (the room rebuilt from storage and its write-ahead log, every tab asked for what
+ * the room lacks), and the oracle is the same: no tab closed, every tab equal to the room.
+ *
+ *   npx tsx server/test/fuzz/honest-fuzz.ts [runs=200] [seed=1] [steps=400] [mode=both|client|ywebsocket] [restartRate=0]
  */
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
@@ -56,6 +60,8 @@ export interface HonestResult {
   diverged: number;
   /** server step-1 requests answering a pending update (server-side resync, fv5 M-2) */
   resyncs: number;
+  /** forced worker restarts (fv9: the room rebuilt from storage and its log mid-session) */
+  restarts: number;
   refusals: Record<string, { n: number; example: string }>;
   ops: Record<string, number>;
   ms: number;
@@ -153,10 +159,10 @@ const canon = (v: unknown): unknown =>
 const view = (d: Y.Doc) => JSON.stringify(canon({ shapes: d.getMap('shapes').toJSON(), assets: d.getMap('assets').toJSON(), meta: d.getMap('meta').toJSON() }));
 const tick = () => new Promise<void>((r) => setImmediate(r));
 
-export async function runHonestFuzz(runs: number, seed: number, steps = 400, mode: HonestMode = 'client'): Promise<HonestResult> {
+export async function runHonestFuzz(runs: number, seed: number, steps = 400, mode: HonestMode = 'client', restartRate = 0): Promise<HonestResult> {
   const rnd = lcg(seed * 2654435761 + (mode === 'client' ? 1 : 2));
   const pick = <T>(a: readonly T[]): T => a[Math.floor(rnd() * a.length)];
-  const res: HonestResult = { seed, mode, runs: 0, steps: 0, updates: 0, reconnects: 0, refused: 0, diverged: 0, resyncs: 0, refusals: {}, ops: {}, ms: 0 };
+  const res: HonestResult = { seed, mode, runs: 0, steps: 0, updates: 0, reconnects: 0, refused: 0, diverged: 0, resyncs: 0, restarts: 0, refusals: {}, ops: {}, ms: 0 };
   const t0 = Date.now();
   const cfg = loadConfig({
     GATE_AUTHZ_URL: 'http://core.invalid/authz', ARTIFACT_BASE_URL: 'http://core.invalid/a', S3_BUCKET: 'canvas-fuzz',
@@ -188,15 +194,10 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
       if (initial) l.push(initial);
       d.on('update', (u: Uint8Array) => l.push(u));
     };
-    let loggedRoom: unknown = null;
-    const watchRoom = () => {
-      const room = manager.get(KEY);
-      if (room && room !== loggedRoom) {
-        loggedRoom = room;
-        logDoc(`room${logs.size}`, room.doc, Y.encodeStateAsUpdate(room.doc));
-      }
-    };
+    // fv9: the room's documents live in its worker; a dump has the room's final state only
+    const watchRoom = () => undefined;
     let runRefused = false;
+    let roomDoc: Y.Doc | null = null;
     const nTabs = 2 + Math.floor(rnd() * 2);
     const principals = ['ana@corp', 'bob@corp', 'ana@corp']; // the third tab is Ana's second tab
     const tabs: Tab[] = [];
@@ -222,11 +223,11 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
           const dir = process.env.HONEST_DUMP;
           if (dir && link.last) {
             // the update the server refused, the room before it, the trace
-            const room = manager.get(KEY);
+            const room = roomDoc;
             fs.mkdirSync(dir, { recursive: true });
             const tag = `${mode}-${seed}-${r}`;
             fs.writeFileSync(path.join(dir, `${tag}.msg`), link.last);
-            if (room) fs.writeFileSync(path.join(dir, `${tag}.room`), Y.encodeStateAsUpdate(room.doc));
+            if (room) fs.writeFileSync(path.join(dir, `${tag}.room`), Y.encodeStateAsUpdate(room));
             fs.writeFileSync(path.join(dir, `${tag}.trace`), trace.join('\n'));
           }
         }
@@ -316,9 +317,17 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
      * tab already deleted offline), so room + every tab's own text bounds every state the room
      * can reach. The room is the live one, or the last one loaded (evicted rooms keep their doc).
      */
-    let roomDoc: Y.Doc | null = null;
+    /** the room's documents as its worker holds them (fv9), refreshed before every step */
+    const refreshRoom = async () => {
+      const room = manager.get(KEY);
+      if (!room) return;
+      try {
+        roomDoc = (await room.inspect()).doc;
+      } catch {
+        /* the room is going (evicted, rebuilt): keep the last copy */
+      }
+    };
     const roomText = (id: string) => {
-      roomDoc = manager.get(KEY)?.doc ?? roomDoc;
       return (((roomDoc?.getMap('shapes').get(id) as Y.Map<unknown> | undefined)?.get('text') as Y.Text | undefined)?.length ?? 0);
     };
     const textBudget = (_t: Tab, id: string) => {
@@ -464,7 +473,19 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
       res.steps++;
       const t = pick(tabs);
       const x = rnd();
-      if (x < 0.36) doOp(t);
+      if (restartRate > 0 && rnd() < restartRate) {
+        // fv9: the room's worker is replaced mid-session (as after a fault, nobody struck)
+        const room = manager.get(KEY);
+        if (room) {
+          trace.push('restart');
+          res.restarts++;
+          void room.restart().catch(() => undefined);
+        }
+      }
+      if (x < 0.36) {
+        await refreshRoom();
+        doOp(t);
+      }
       else if (x < 0.6) toServer(t);
       else if (x < 0.86) {
         if (!toClient(t)) serverClosed(t);
@@ -499,13 +520,16 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
         return tabs.every((t) => t.link && t.link.server && conns.some((c) => c.ws === (t.link!.server as unknown) && !c.joining) && t.provider.synced && !t.link.c2s.length && !t.link.s2c.length);
       };
       if (!moved && settled()) {
+        // fv9: the room's worker answered everything it was sent
+        await manager.get(KEY)?.settled();
         await new Promise((r) => setTimeout(r, 2));
-        if (settled()) break;
+        if (settled() && tabs.every((t) => !t.link?.s2c.length)) break;
       }
       if (!moved) await new Promise((r) => setTimeout(r, 1));
     }
     if (!runRefused) {
-      const room = manager.get(KEY);
+      const live = manager.get(KEY);
+      const room = live ? { ...live, doc: (await live.inspect()).doc, conns: live.conns } : undefined;
       const want = room ? view(room.doc) : '';
       if (process.env.HONEST_DEBUG) {
         const shapes = [...(room?.doc.getMap('shapes').values() ?? [])] as Y.Map<unknown>[];
@@ -561,10 +585,11 @@ if (isMain) {
   const seed = Number(process.argv[3] ?? 1);
   const steps = Number(process.argv[4] ?? 400);
   const which = (process.argv[5] ?? 'both') as HonestMode | 'both';
+  const restartRate = Number(process.argv[6] ?? 0);
   const modes: HonestMode[] = which === 'both' ? ['client', 'ywebsocket'] : [which];
   let bad = 0;
   for (const m of modes) {
-    const r = await runHonestFuzz(runs, seed, steps, m);
+    const r = await runHonestFuzz(runs, seed, steps, m, restartRate);
     console.log(JSON.stringify(r, null, 1));
     bad += r.refused + r.diverged;
   }

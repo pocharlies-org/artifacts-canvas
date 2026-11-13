@@ -20,7 +20,7 @@ import { createLogger } from '../src/logging.js';
 import { clientIp } from '../src/ws.js';
 import { TAIL_MAX_MESSAGES, limitBuffered } from '../src/room.js';
 import { startFakeCore, allowUser, allowAnon, type FakeCore } from './helpers/fakecore.js';
-import { TEST_ORIGIN, TestClient, expectClose, waitFor } from './helpers/yclient.js';
+import { TEST_ORIGIN, TestClient, expectClose, waitFor, roomDocs, roomOrStored } from './helpers/yclient.js';
 import { checkClientUpdate, deleteSetCanonical, applyGuarded, shapeValueProblem } from '@pocharlies/artifacts-canvas-shared/stamper';
 import { materializeContent } from '@pocharlies/artifacts-canvas-shared/ledger';
 import { MAX_POINTS, MAX_TEXT_LENGTH } from '@pocharlies/artifacts-canvas-shared/model';
@@ -103,9 +103,9 @@ async function fill(app: App, key: string, c: TestClient, n: number, batch = 200
       for (let j = i; j < Math.min(n, i + batch); j++) shapes.set(`f${j}`, shapeMap(geo(`f${j}`, j)));
     });
     const want = Math.min(n, i + batch);
-    await waitFor(() => (app.manager.get(key)?.doc.getMap('shapes').size ?? 0) >= want, 30_000, 'fill');
+    await waitFor(async () => ((await roomDocs(app, key))?.doc.getMap('shapes').size ?? 0) >= want, 30_000, 'fill');
   }
-  return Y.encodeStateAsUpdate(app.manager.get(key)!.doc).byteLength;
+  return Y.encodeStateAsUpdate((await roomDocs(app, key))!.doc).byteLength;
 }
 /** A raw socket (no Y.Doc in this process). `pause`: stop reading right after the upgrade. */
 async function raw(app: App, key: string, cookie?: string, pause = false, headers: Record<string, string> = {}) {
@@ -126,8 +126,8 @@ async function raw(app: App, key: string, cookie?: string, pause = false, header
 const serverConns = (app: App, key: string, user: string) =>
   [...(app.manager.get(key)?.conns.values() ?? [])].filter((c) => c.identity.id === user);
 /** Bytes of a join payload of `room` (ledger and content frames: snapshots + tails). */
-const frameBytes = (room: { ledgerFrames(): Uint8Array[]; contentFrames(): { frames: Uint8Array[] } }) =>
-  [...room.ledgerFrames(), ...room.contentFrames().frames].reduce((a, f) => a + f.byteLength, 0);
+const frameBytes = async (room: { ledgerFrames(): Promise<Uint8Array[]>; contentFrames(): Promise<{ frames: Uint8Array[] }> }) =>
+  [...(await room.ledgerFrames()), ...(await room.contentFrames()).frames].reduce((a, f) => a + f.byteLength, 0);
 async function rejected(app: App, reason: string): Promise<number> {
   const m = await app.metrics.wsRejected.get();
   return m.values.filter((v) => v.labels.reason === reason).reduce((a, v) => a + v.value, 0);
@@ -169,7 +169,7 @@ describe('fv5 H-1: slow readers cannot hold the server memory', () => {
     const roomBytes = await fill(app, key, ana, 12_000);
     expect(roomBytes).toBeGreaterThan(3_500_000);
     const room = app.manager.get(key)!;
-    const F = frameBytes(room);
+    const F = await frameBytes(room);
     const socks = [];
     for (let i = 0; i < 20; i++) socks.push(await raw(app, key, 'sid=eve', true).catch(() => null));
     await sleep(150);
@@ -184,12 +184,12 @@ describe('fv5 H-1: slow readers cannot hold the server memory', () => {
     const held = (await app.metrics.outgoingBytes.get()).values[0].value;
     expect(held).toBeLessThan(1.5 * F);
     // no pong for two ping rounds and nothing drained: dropped (before: kept forever)
-    await waitFor(() => serverConns(app, key, 'eve@corp').length === 0, 8000, 'paused sockets dropped');
+    await waitFor(async () => serverConns(app, key, 'eve@corp').length === 0, 8000, 'paused sockets dropped');
     expect(await rejected(app, 'idle')).toBe(8);
     ana.doc.getMap('meta').set('after', 1);
     const bob = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob.connect();
-    await waitFor(() => bob.doc.getMap('meta').get('after') === 1, 5000, 'bob synced');
+    await waitFor(async () => bob.doc.getMap('meta').get('after') === 1, 5000, 'bob synced');
     for (const s of socks) s?.ws.terminate();
     bob.close();
     ana.close();
@@ -202,7 +202,7 @@ describe('fv5 H-1: slow readers cannot hold the server memory', () => {
     const ana = new TestClient(`${base(app)}/${key}`);
     await ana.connect();
     const eve = await raw(app, key, 'sid=eve');
-    await waitFor(() => serverConns(app, key, 'eve@corp')[0]?.joining === false, 5000, 'eve joined');
+    await waitFor(async () => serverConns(app, key, 'eve@corp')[0]?.joining === false, 5000, 'eve joined');
     (eve.ws as unknown as { _socket: { pause(): void } })._socket.pause();
     const conn = serverConns(app, key, 'eve@corp')[0];
     // broadcasts until the kernel's socket buffers are full and the server queues for Eve
@@ -216,7 +216,7 @@ describe('fv5 H-1: slow readers cannot hold the server memory', () => {
     // next send checked the cap, so a paused socket in a quiet room was kept forever
     limitBuffered(conn.ws, 512 * 1024, () => undefined);
     const t0 = Date.now();
-    await waitFor(() => serverConns(app, key, 'eve@corp').length === 0, 5000, 'eve dropped by the timer');
+    await waitFor(async () => serverConns(app, key, 'eve@corp').length === 0, 5000, 'eve dropped by the timer');
     expect(Date.now() - t0).toBeLessThan(3000);
     expect(await rejected(app, 'slow_consumer')).toBeGreaterThanOrEqual(1);
     expect(serverConns(app, key, 'ana@corp').length).toBe(1);
@@ -239,14 +239,14 @@ describe('fv5 H-1: slow readers cannot hold the server memory', () => {
     await fill(app, key, ana, 40_000, 4000); // bigger than the kernel's socket buffers on any host
     expect(ana.closeCode).toBeNull();
     const room = app.manager.get(key)!;
-    const F = frameBytes(room);
+    const F = await frameBytes(room);
     cfg.wsOutgoingBudgetBytes = Math.round(1.2 * F);
     const eve = await raw(app, key, 'sid=eve', true); // holds her join payload unread
-    await waitFor(() => (serverConns(app, key, 'eve@corp')[0]?.ws.bufferedAmount ?? 0) > 1024 * 1024, 10_000, 'eve holds her join');
+    await waitFor(async () => (serverConns(app, key, 'eve@corp')[0]?.ws.bufferedAmount ?? 0) > 1024 * 1024, 10_000, 'eve holds her join');
     // new join frames: the next join needs them, more than the budget has left (fv6: a join
     // shares the snapshot until the updates since outgrow it, TAIL_MAX_MESSAGES)
     for (let v = 1; v <= TAIL_MAX_MESSAGES + 1; v++) ana.doc.getMap('meta').set('v', v);
-    await waitFor(() => room.doc.getMap('meta').get('v') === TAIL_MAX_MESSAGES + 1, 3000, 'edit');
+    await waitFor(async () => (await room.inspect()).doc.getMap('meta').get('v') === TAIL_MAX_MESSAGES + 1, 3000, 'edit');
     // The budget just above what eve holds. How much that is depends on the kernel: the join goes
     // out piece by piece, each once the previous one drained, so eve holds the first piece (the
     // 4 MB content) if her paused socket's buffers could not take it, or the ledger (15 MB) queued
@@ -263,13 +263,13 @@ describe('fv5 H-1: slow readers cannot hold the server memory', () => {
     expect(bob.notices.map((n) => n.kind)).toContain('busy');
     // while the budget is passed the sweep drops the peer holding most
     cfg.wsOutgoingBudgetBytes = 512 * 1024;
-    await waitFor(() => serverConns(app, key, 'eve@corp').length === 0, 5000, 'eve dropped');
+    await waitFor(async () => serverConns(app, key, 'eve@corp').length === 0, 5000, 'eve dropped');
     expect(await rejected(app, 'outgoing_budget')).toBe(2);
     // nothing held any more: the retry gets in and syncs (its own join stays within 1.2 F)
     cfg.wsOutgoingBudgetBytes = Math.round(1.2 * F);
     const bob2 = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob2.connect();
-    await waitFor(() => bob2.doc.getMap('shapes').size === 40_000, 30_000, 'bob synced');
+    await waitFor(async () => bob2.doc.getMap('shapes').size === 40_000, 30_000, 'bob synced');
     expect(bob2.closeCode).toBeNull();
     eve.ws.terminate();
     bob2.close();
@@ -319,10 +319,10 @@ describe('fv5 H-1: slow readers cannot hold the server memory', () => {
     users(key);
     const ana = new TestClient(`${base(app)}/${key}`);
     await ana.connect();
-    await waitFor(() => app.manager.get(key) !== undefined, 3000, 'room');
+    await waitFor(async () => app.manager.get(key) !== undefined, 3000, 'room');
     const room = app.manager.get(key)!;
     ana.close();
-    await waitFor(() => app.manager.get(key) === undefined, 3000, 'evicted');
+    await waitFor(async () => app.manager.get(key) === undefined, 3000, 'evicted');
     expect(room.disposed).toBe(true);
     expect((room.awareness as unknown as { _checkInterval: { _destroyed?: boolean } })._checkInterval._destroyed).toBe(true);
   });
@@ -430,15 +430,15 @@ describe('fv5 M-4: delete sets must be canonical (sorted, disjoint, one entry pe
     await ana.connect();
     ana.doc.transact(() => ana.doc.getMap('shapes').set('A1', shapeMap(geo('A1'))));
     const room = await (async () => {
-      await waitFor(() => app.manager.get(key)?.doc.getMap('shapes').has('A1') === true, 5000, 'A1');
+      await waitFor(async () => (await roomDocs(app, key))?.doc.getMap('shapes').has('A1') === true, 5000, 'A1');
       return app.manager.get(key)!;
     })();
     const eve = new TestClient(`${base(app)}/${key}`, 'sid=eve');
     await eve.connect();
-    await waitFor(() => eve.doc.getMap('shapes').has('A1'), 5000, 'eve synced');
+    await waitFor(async () => eve.doc.getMap('shapes').has('A1'), 5000, 'eve synced');
     // Eve writes from a second Yjs client of hers: two throwaway clocks (then deleted)
     const scratch = new Y.Doc();
-    Y.applyUpdate(scratch, Y.encodeStateAsUpdate(room.doc));
+    Y.applyUpdate(scratch, Y.encodeStateAsUpdate((await room.inspect()).doc));
     let upd: Uint8Array | null = null;
     scratch.on('update', (u: Uint8Array) => (upd = u));
     scratch.transact(() => {
@@ -448,7 +448,7 @@ describe('fv5 M-4: delete sets must be canonical (sorted, disjoint, one entry pe
     eve.sendRaw(syncMsg(2, upd!));
     scratch.transact(() => scratch.getMap('meta').delete('k'));
     eve.sendRaw(syncMsg(2, upd!));
-    await waitFor(() => Y.getState(room.doc.store, scratch.clientID) >= 2 && !room.doc.getMap('meta').has('k'), 5000, 'throwaways');
+    await waitFor(async () => Y.getState((await room.inspect()).doc.store, scratch.clientID) >= 2 && !(await room.inspect()).doc.getMap('meta').has('k'), 5000, 'throwaways');
     scratch.transact(() => (scratch.getMap('shapes').get('A1') as Y.Map<unknown>).set('type', 'geo'));
     const dec = Y.decodeUpdate(upd!);
     const N = (dec.structs as Y.Item[]).find((s) => s.content instanceof Y.ContentAny)!.id.clock;
@@ -456,11 +456,11 @@ describe('fv5 M-4: delete sets must be canonical (sorted, disjoint, one entry pe
     const unsorted = withDeleteSet(upd!, [...honestDs, [scratch.clientID, [[N, 1], [0, 1], [1, 1]]]]);
     const sorted = withDeleteSet(upd!, [...honestDs, [scratch.clientID, [[0, 1], [1, 1], [N, 1]]]]);
     // before: the unsorted one passed (null) while the same ranges sorted were refused
-    expect(checkClientUpdate(room.doc, unsorted).bad).toBe('malformed');
-    expect(checkClientUpdate(room.doc, sorted).bad).toBe('shapes-schema');
+    expect(checkClientUpdate((await room.inspect()).doc, unsorted).bad).toBe('malformed');
+    expect(checkClientUpdate((await room.inspect()).doc, sorted).bad).toBe('shapes-schema');
     eve.sendRaw(syncMsg(2, unsorted));
     await expectClose(eve, 4403);
-    const a1 = room.doc.getMap('shapes').get('A1') as Y.Map<unknown>;
+    const a1 = (await room.inspect()).doc.getMap('shapes').get('A1') as Y.Map<unknown>;
     expect(a1.get('type')).toBe('geo');
     await sleep(200);
     expect(readShape(ana.doc.getMap('shapes').get('A1'), 'A1')).not.toBeNull();
@@ -474,7 +474,7 @@ describe('fv5 M-4: delete sets must be canonical (sorted, disjoint, one entry pe
     const eve = new TestClient(`${base(app)}/${key}`, 'sid=eve');
     await eve.connect();
     noteWithText(eve.doc, 'n1', 'x'.repeat(9000));
-    await waitFor(() => (((app.manager.get(key)?.doc.getMap('shapes').get('n1') as Y.Map<unknown> | undefined)?.get('text') as Y.Text | undefined)?.length ?? 0) === 9000, 5000, 'note');
+    await waitFor(async () => ((((await roomDocs(app, key))?.doc.getMap('shapes').get('n1') as Y.Map<unknown> | undefined)?.get('text') as Y.Text | undefined)?.length ?? 0) === 9000, 5000, 'note');
     const room = app.manager.get(key)!;
     const scratch = new Y.Doc();
     scratch.clientID = eve.doc.clientID;
@@ -489,11 +489,13 @@ describe('fv5 M-4: delete sets must be canonical (sorted, disjoint, one entry pe
     });
     const [[client, ranges]] = [...Y.decodeUpdate(upd!).ds.clients];
     const forged = withDeleteSet(upd!, [[client, Array.from({ length: R }, () => [ranges[0].clock, 1] as [number, number])]]);
-    expect(checkClientUpdate(room.doc, upd!).bad).toBe('shapes-schema');
-    expect(checkClientUpdate(room.doc, forged).bad).toBe('malformed'); // before: null
+    expect(checkClientUpdate((await room.inspect()).doc, upd!).bad).toBe('shapes-schema');
+    expect(checkClientUpdate((await room.inspect()).doc, forged).bad).toBe('malformed'); // before: null
     eve.sendRaw(syncMsg(2, forged));
     await expectClose(eve, 4403);
-    expect(((room.doc.getMap('shapes').get('n1') as Y.Map<unknown>).get('text') as Y.Text).length).toBe(9000);
+    // eve was the room's only connection: the room was saved and evicted
+    await waitFor(async () => !app.manager.get(key), 5000, 'evicted');
+    expect((((await roomOrStored(app, store, key)).doc.getMap('shapes').get('n1') as Y.Map<unknown>).get('text') as Y.Text).length).toBe(9000);
   });
 
   it('p8: the guard-fuzz finding (seed 271828 #83865) is refused; the shape keeps its type', () => {
@@ -545,10 +547,10 @@ describe('fv5 L-2: deletes that split items count against the size cap', () => {
     anon.doc.transact(() => {
       for (let i = 0; i < NOTES; i++) noteWithText(anon.doc, `n${i}`, 'a'.repeat(10_000));
     });
-    await waitFor(() => app.manager.get(key)?.doc.getMap('shapes').size === NOTES, 10_000, 'filled');
+    await waitFor(async () => (await roomDocs(app, key))?.doc.getMap('shapes').size === NOTES, 10_000, 'filled');
     const room = app.manager.get(key)!;
     await sleep(300); // saved: the size estimate is exact again
-    const size0 = Y.encodeStateAsUpdate(room.doc).byteLength;
+    const size0 = Y.encodeStateAsUpdate((await room.inspect()).doc).byteLength;
     expect(size0).toBeLessThan(CAP);
     for (let b = 0; b < NOTES && anon.closeCode === null; b += 4) {
       anon.doc.transact(() => {
@@ -561,7 +563,7 @@ describe('fv5 L-2: deletes that split items count against the size cap', () => {
     }
     await expectClose(anon, 4413);
     await sleep(300);
-    const size1 = Y.encodeStateAsUpdate(room.doc).byteLength;
+    const size1 = Y.encodeStateAsUpdate((await room.inspect()).doc).byteLength;
     // before: 8x the starting size; the estimate (update + 24 B per split) stops it near the cap
     expect(size1).toBeLessThan(CAP * 1.5);
   }, 60_000);
@@ -611,10 +613,10 @@ describe('fv5 M-2: an honest reconnect is never refused', () => {
     };
     let provider = make();
     provider.on('connection-close', (e: { code: number } | null) => e && closes.push(e.code));
-    await waitFor(() => provider.synced, 5000, 'synced');
+    await waitFor(async () => provider.synced, 5000, 'synced');
     const id = cd.create({ type: 'note', x: 0, y: 0, w: 200, h: 200, text: 'online' } as never);
     cd.endGesture();
-    await waitFor(() => s1.manager.get(key)?.doc.getMap('shapes').has(id) === true, 3000, 'note');
+    await waitFor(async () => (await roomDocs(s1, key))?.doc.getMap('shapes').has(id) === true, 3000, 'note');
     await s1.manager.get(key)!.flush();
     // the server goes away; the tab edits offline (a new struct of its client id)
     provider.destroy();
@@ -635,9 +637,9 @@ describe('fv5 M-2: an honest reconnect is never refused', () => {
       }
       return orig(enc, dec, p, emitSynced, mt);
     };
-    await waitFor(() => injected > 0, 5000, 'keystroke injected');
+    await waitFor(async () => injected > 0, 5000, 'keystroke injected');
     const want = 'online typed offlineK';
-    await waitFor(() => (((s2.manager.get(key)?.doc.getMap('shapes').get(id) as Y.Map<unknown> | undefined)?.get('text') as Y.Text | undefined)?.toString() ?? '') === want, 5000, 'server has both edits');
+    await waitFor(async () => ((((await roomDocs(s2, key))?.doc.getMap('shapes').get(id) as Y.Map<unknown> | undefined)?.get('text') as Y.Text | undefined)?.toString() ?? '') === want, 5000, 'server has both edits');
     await sleep(300);
     expect(closes.filter((c) => c >= 4000)).toEqual([]);
     expect(provider.wsconnected).toBe(true);
@@ -679,15 +681,15 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
       ana0.doc.transact(() => {
         for (let i = 0; i < 2000; i++) ana0.doc.getMap('shapes').delete(`f${i}`);
       });
-      await waitFor(() => filler.manager.get(key)!.doc.getMap('shapes').size === 10_000, 10_000, 'deletes');
+      await waitFor(async () => (await roomDocs(filler, key))!.doc.getMap('shapes').size === 10_000, 10_000, 'deletes');
       ana0.close();
-      await waitFor(() => filler.manager.get(key) === undefined, 5000, 'flushed');
+      await waitFor(async () => filler.manager.get(key) === undefined, 5000, 'flushed');
       await filler.close();
     }
     const app = await startApp({ CPU_MS_PER_SEC: '10', CPU_BURST_MS: '100', SYNC_BYTES_PER_SEC: '100000000', SYNC_BURST_BYTES: '100000000' });
     const ana = new TestClient(`${base(app)}/${key}`);
     await ana.connect();
-    await waitFor(() => ana.doc.getMap('shapes').size === 10_000, 10_000, 'ana synced');
+    await waitFor(async () => ana.doc.getMap('shapes').size === 10_000, 10_000, 'ana synced');
     const key2 = 'u/p2-other/index.html';
     users(key2);
     const bob = new TestClient(`${base(app)}/${key2}`, 'sid=bob');
@@ -717,7 +719,7 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
     // the attack too slow, too low only makes it faster.
     core.rulesByCookie.set(`sid=frank|${key}`, allowUser('frank@corp', 'Frank'));
     const frank = await raw(app, key, 'sid=frank');
-    await waitFor(() => serverConns(app, key, 'frank@corp')[0]?.joining === false, 10_000, 'frank joined');
+    await waitFor(async () => serverConns(app, key, 'frank@corp')[0]?.joining === false, 10_000, 'frank joined');
     const fc = serverConns(app, key, 'frank@corp')[0];
     const level0 = fc.cpu.level();
     let answered = 0;
@@ -727,7 +729,7 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
       const tBurst = Date.now();
       for (let i = 0; i < 3; i++) frank.ws.send(step1);
       answered += 3;
-      await waitFor(() => fc.step1Answers >= answered, 10_000, 'frank answered');
+      await waitFor(async () => fc.step1Answers >= answered, 10_000, 'frank answered');
       cost = Math.min(cost, (before - fc.cpu.level() + (10 * (Date.now() - tBurst)) / 1000) / 3);
     }
     cost = Math.max(0.2, cost);
@@ -742,7 +744,7 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
       const s = performance.now();
       const want = Math.random();
       bob.doc.getMap('meta').set('p', want);
-      await waitFor(() => app.manager.get(key2)!.doc.getMap('meta').get('p') === want, 10_000, 'rtt');
+      await waitFor(async () => (await roomDocs(app, key2))!.doc.getMap('meta').get('p') === want, 10_000, 'rtt');
       rtts.push(performance.now() - s);
       await sleep(100);
     }
@@ -767,10 +769,10 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
     ana.doc.transact(() => {
       for (let i = 0; i < 3000; i++) ana.doc.getMap('shapes').set(`s${i}`, shapeMap(geo(`s${i}`, i)));
     });
-    await waitFor(() => app.manager.get(key)?.doc.getMap('shapes').size === 3000, 10_000, 'big write');
+    await waitFor(async () => (await roomDocs(app, key))?.doc.getMap('shapes').size === 3000, 10_000, 'big write');
     // a small edit still goes through
     ana.doc.getMap('meta').set('small', 1);
-    await waitFor(() => app.manager.get(key)!.doc.getMap('meta').get('small') === 1, 3000, 'small write');
+    await waitFor(async () => (await roomDocs(app, key))!.doc.getMap('meta').get('small') === 1, 3000, 'small write');
     // the next big one is shed: 1013 (y-websocket reconnects and resends what the room lacks)
     ana.doc.getMap('meta').set('big', 'q'.repeat(64 * 1024));
     expect(await ana.closed).toBe(1013);
@@ -790,7 +792,7 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
     a1.doc.transact(() => {
       for (let i = 0; i < 2000; i++) a1.doc.getMap('shapes').set(`s${i}`, shapeMap(geo(`s${i}`, i)));
     });
-    await waitFor(() => app.manager.get(key)?.doc.getMap('shapes').size === 2000, 10_000, 'anon write');
+    await waitFor(async () => (await roomDocs(app, key))?.doc.getMap('shapes').size === 2000, 10_000, 'anon write');
     // a fresh anonymous visitor (new cookie, fresh per-visitor budget) is shed all the same
     const a2 = new TestClient(`${base(app)}/${key}`);
     await a2.connect();
@@ -799,7 +801,7 @@ describe('fv5 M-5: CPU is budgeted per principal and server-wide', () => {
     const bob = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob.connect();
     bob.doc.getMap('meta').set('bob', 'q'.repeat(64 * 1024));
-    await waitFor(() => (app.manager.get(key)!.doc.getMap('meta').get('bob') as string | undefined)?.length === 64 * 1024, 3000, 'bob write');
+    await waitFor(async () => ((await roomDocs(app, key))!.doc.getMap('meta').get('bob') as string | undefined)?.length === 64 * 1024, 3000, 'bob write');
     expect(bob.closeCode).toBeNull();
     bob.close();
     a1.close();
@@ -824,7 +826,7 @@ describe('fv5 M-6: anonymous joins cannot lock other visitors out', () => {
         await new Promise<void>((r) => ws.on('close', (c) => (codes.push(c), r())));
       }
     })();
-    await waitFor(() => codes.includes(1013), 5000, 'room bucket drained');
+    await waitFor(async () => codes.includes(1013), 5000, 'room bucket drained');
     // honest visitors: the wrapper page gave them a cookie before the socket opened
     const results: (number | null)[] = [];
     for (let v = 0; v < 6; v++) {

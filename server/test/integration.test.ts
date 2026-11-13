@@ -6,11 +6,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadConfig, type Config } from '../src/config.js';
+import { RoomCore } from '../src/room-core.js';
 import { createApp, type App } from '../src/app.js';
 import { MemoryCanvasObjectStore } from '../src/store.js';
 import { canvasLedgerKey, canvasObjectKey } from '../src/paths.js';
 import { startFakeCore, allowUser, allowAnon, type FakeCore } from './helpers/fakecore.js';
-import { TEST_ORIGIN, TestClient, expectClose, waitFor } from './helpers/yclient.js';
+import { TEST_ORIGIN, TestClient, expectClose, waitFor, roomDocs } from './helpers/yclient.js';
 
 let core: FakeCore;
 let staticDir: string;
@@ -123,20 +124,20 @@ describe('real client protocol: two y-websocket clients through the server', () 
       shape.set('type', 'geo');
       c2.doc.getMap('shapes').set('s1', shape);
     });
-    await waitFor(() => c1.doc.getMap('shapes').has('s1'), 3000, 'shapes on c1');
+    await waitFor(async () => c1.doc.getMap('shapes').has('s1'), 3000, 'shapes on c1');
 
     // Attribution is stamped server-side with the verified identity (protocol §5).
-    await waitFor(() => c1.ledger.getMap('attribution').has('s1'), 3000, 'attribution on c1');
+    await waitFor(async () => c1.ledger.getMap('attribution').has('s1'), 3000, 'attribution on c1');
     const attr = c1.ledger.getMap('attribution').get('s1') as Record<string, unknown>;
     expect(attr.createdBy).toBe('ana@corp');
     // The users root records the participant.
     expect(c1.ledger.getMap('users').get('ana@corp')).toMatchObject({ name: 'Ana López' });
     // history has at least the create entry
-    await waitFor(() => c1.ledger.getArray('history').length > 0, 3000, 'history on c1');
+    await waitFor(async () => c1.ledger.getArray('history').length > 0, 3000, 'history on c1');
 
     // awareness user is the verified identity, not what the client claims
     c2.setAwareness({ cursor: { x: 5, y: 5 }, user: { id: 'evil', name: 'Evil' } });
-    await waitFor(() => {
+    await waitFor(async () => {
       const st = c1.awareness.getStates().get(c2.doc.clientID);
       return st?.user != null;
     }, 3000, 'awareness');
@@ -194,29 +195,29 @@ describe('stamper-root guard through the server (finding: origin-only items)', (
       const honest = new TestClient(url);
       await honest.connect();
       honest.doc.transact(() => honest.doc.getMap('shapes').set('s1', shape()));
-      await waitFor(() => honest.ledger.getArray('history').length === 1, 3000, 'server history line');
+      await waitFor(async () => honest.ledger.getArray('history').length === 1, 3000, 'server history line');
       const attacker = new TestClient(url);
       await attacker.connect();
-      await waitFor(() => attacker.ledger.getArray('history').length === 1, 3000, 'attacker synced');
+      await waitFor(async () => attacker.ledger.getArray('history').length === 1, 3000, 'attacker synced');
       // the attacker merges the (broadcast) ledger into its content document and appends after
       // the last history line: an origin-only item whose origin exists only in the ledger
       Y.applyUpdate(attacker.doc, Y.encodeStateAsUpdate(attacker.ledger), 'server');
-      const ledgerSv = Y.encodeStateVector(app.manager.get(key)!.ledger);
+      const ledgerSv = Y.encodeStateVector((await roomDocs(app, key))!.ledger);
       attacker.doc.getArray('history').push([{ t: 1, by: 'test@example.com', verb: 'delete', shapeId: 'zz', shapeType: 'geo' }]);
       await expectClose(attacker, 4403);
-      expect(Y.encodeStateVector(app.manager.get(key)!.ledger)).toEqual(ledgerSv);
+      expect(Y.encodeStateVector((await roomDocs(app, key))!.ledger)).toEqual(ledgerSv);
       await new Promise((r) => setTimeout(r, 150));
       expect(honest.ledger.getArray('history').toArray().map((e) => (e as { by: string }).by)).toEqual([honest.identity!.id]);
       // insert in the middle / overwrite an existing attribution entry: same answer
       const a2 = new TestClient(url);
       await a2.connect();
-      await waitFor(() => a2.ledger.getArray('history').length === 1, 3000, 'a2 synced');
+      await waitFor(async () => a2.ledger.getArray('history').length === 1, 3000, 'a2 synced');
       Y.applyUpdate(a2.doc, Y.encodeStateAsUpdate(a2.ledger), 'server');
       a2.doc.getArray('history').insert(0, [{ by: 'mallory' }]);
       await expectClose(a2, 4403);
       const a3 = new TestClient(url);
       await a3.connect();
-      await waitFor(() => a3.ledger.getMap('attribution').has('s1'), 3000, 'a3 synced');
+      await waitFor(async () => a3.ledger.getMap('attribution').has('s1'), 3000, 'a3 synced');
       Y.applyUpdate(a3.doc, Y.encodeStateAsUpdate(a3.ledger), 'server');
       a3.doc.getMap('attribution').set('s1', { createdBy: 'mallory', createdAt: 1, updatedBy: 'mallory', updatedAt: 1 });
       await expectClose(a3, 4403);
@@ -283,11 +284,11 @@ describe('authz enforcement', () => {
     const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/exp.html`);
     await c.connect();
     c.doc.transact(() => c.doc.getMap('shapes').set('s', shape()));
-    await waitFor(() => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/exp.html')));
+    await waitFor(async () => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/exp.html')));
     core.rules.set('runs/exp.html', { allowed: false, reason: 'expired' });
     await expectClose(c, 4410, 6000);
     expect(c.notices.some((n) => n.kind === 'expired')).toBe(true);
-    await waitFor(() => !store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/exp.html')));
+    await waitFor(async () => !store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/exp.html')));
   });
 
   it('gone artifact on connect: close 4404 and the object is deleted', async () => {
@@ -403,13 +404,13 @@ describe('persistence', () => {
     c1.doc.transact(() => {
       c1.doc.getMap('shapes').set('kept', shape({ type: 'geo', x: 1 }));
     });
-    await waitFor(() => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/persist.html')));
+    await waitFor(async () => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/persist.html')));
     await app1.close(); // flushes on shutdown
 
     const app2 = await startApp();
     const c2 = new TestClient(`ws://127.0.0.1:${(app2.server.address() as { port: number }).port}/_canvas/_/ws/runs/persist.html`);
     await c2.connect();
-    await waitFor(() => c2.doc.getMap('shapes').has('kept'));
+    await waitFor(async () => c2.doc.getMap('shapes').has('kept'));
     expect(c2.doc.getMap('shapes').get('kept')).toBeTruthy();
   });
 
@@ -419,7 +420,7 @@ describe('persistence', () => {
     const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/runs/ttl.html`);
     await c.connect();
     c.doc.transact(() => c.doc.getMap('shapes').set('s', shape()));
-    await waitFor(() => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/ttl.html')));
+    await waitFor(async () => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/ttl.html')));
     expect(store.objects.get(canvasObjectKey('_plugins/canvas', 'runs/ttl.html'))?.tagging).toBe('ttl=7');
   });
 
@@ -466,11 +467,11 @@ describe('abuse limits', () => {
     ana.doc.getMap('assets').set('ok', 'data:image/png;base64,' + 'B'.repeat(50_000)); // within the logged-in cap
     const watcher = new TestClient(url, 'ana');
     await watcher.connect();
-    await waitFor(() => watcher.doc.getMap('assets').has('ok'), 3000, 'ana write applied');
+    await waitFor(async () => watcher.doc.getMap('assets').has('ok'), 3000, 'ana write applied');
     // and a new anonymous visitor can still join (read) the room
     const anon2 = new TestClient(url);
     await anon2.connect();
-    await waitFor(() => anon2.doc.getMap('assets').has('ok'), 3000, 'anon2 synced');
+    await waitFor(async () => anon2.doc.getMap('assets').has('ok'), 3000, 'anon2 synced');
     expect(anon2.closeCode).toBeNull();
     for (const x of [ana, watcher, anon2]) x.close();
   });
@@ -648,8 +649,8 @@ describe('http routes', () => {
 
     // And the object lands under the canonical key, not the bucket-prefixed one.
     ws.doc.transact(() => ws.doc.getMap('shapes').set('s', shape()));
-    await waitFor(() => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/bucketed.html')));
-    await waitFor(() => store.objects.has(canvasLedgerKey('_plugins/canvas', 'runs/bucketed.html')));
+    await waitFor(async () => store.objects.has(canvasObjectKey('_plugins/canvas', 'runs/bucketed.html')));
+    await waitFor(async () => store.objects.has(canvasLedgerKey('_plugins/canvas', 'runs/bucketed.html')));
     expect([...store.objects.keys()].sort()).toEqual([
       canvasObjectKey('_plugins/canvas', 'runs/bucketed.html'),
       canvasLedgerKey('_plugins/canvas', 'runs/bucketed.html'),
@@ -723,11 +724,11 @@ describe('fv2 regressions through the server: the room never holds pending state
     const honest = new TestClient(url);
     await honest.connect();
     honest.doc.transact(() => honest.doc.getMap('shapes').set('h1', shape({ type: 'geo' })));
-    await waitFor(() => honest.ledger.getArray('history').length === 1, 3000, 'first history line');
+    await waitFor(async () => honest.ledger.getArray('history').length === 1, 3000, 'first history line');
     const attacker = async () => {
       const a = new TestClient(url, 'sid=bob');
       await a.connect();
-      await waitFor(() => a.ledger.getArray('history').length >= 1, 3000, 'attacker synced');
+      await waitFor(async () => a.ledger.getArray('history').length >= 1, 3000, 'attacker synced');
       return a;
     };
     return { app, url, honest, attacker };
@@ -741,19 +742,19 @@ describe('fv2 regressions through the server: the room never holds pending state
     // connection stays open: fv5 M-2, an honest reconnect can send one); never applied
     const step1Before = a1.step1Received;
     a1.sendRaw(syncUpdateMsg(gapShapeUpdate(4000000001)));
-    await waitFor(() => a1.step1Received > step1Before, 3000, 'resync request');
+    await waitFor(async () => a1.step1Received > step1Before, 3000, 'resync request');
     const room = app.manager.get(key)!;
-    expect(room.hasPending()).toBe(false);
-    expect(Y.getState(room.doc.store, 4000000001)).toBe(0);
+    expect((await room.hasPending())).toBe(false);
+    expect(Y.getState((await room.inspect()).doc.store, 4000000001)).toBe(0);
     const a2 = await attacker();
     const step1Before2 = a2.step1Received;
     a2.sendRaw(syncUpdateMsg(afterFutureStamp(a2, stamperClientOf(a2.ledger), 1)));
-    await waitFor(() => a2.step1Received > step1Before2, 3000, 'resync request');
-    expect(room.hasPending()).toBe(false);
+    await waitFor(async () => a2.step1Received > step1Before2, 3000, 'resync request');
+    expect((await room.hasPending())).toBe(false);
     a1.close();
     a2.close();
     honest.doc.transact(() => honest.doc.getMap('shapes').set('h2', shape({ type: 'geo' })));
-    await waitFor(() => honest.ledger.getArray('history').length === 2, 3000, 'second history line');
+    await waitFor(async () => honest.ledger.getArray('history').length === 2, 3000, 'second history line');
     const a3 = await attacker();
     a3.sendRaw(syncUpdateMsg(Y.encodeStateAsUpdate(new Y.Doc())));
     await new Promise((r) => setTimeout(r, 200));
@@ -782,23 +783,23 @@ describe('fv2 regressions through the server: the room never holds pending state
     for (const n of [0, 1, S, 1, N, 64]) encoding.writeVarUint(enc, n);
     const pendingDelete = syncUpdateMsg(encoding.toUint8Array(enc));
     a1.sendRaw(pendingDelete);
-    await waitFor(() => a1.step1Received >= 2, 3000, 'resync request');
+    await waitFor(async () => a1.step1Received >= 2, 3000, 'resync request');
     expect(a1.closeCode).toBeNull();
-    expect(app.manager.get(key)!.hasPending()).toBe(false);
+    expect((await app.manager.get(key)!.hasPending())).toBe(false);
     // the resync budget (20 requests per connection, +1 every 2 s) bounds a sender that keeps
     // answering the requests with nothing that integrates
     for (let i = 0; i < 30 && a1.closeCode === null; i++) {
       const n = a1.step1Received;
       a1.sendRaw(pendingDelete);
-      await waitFor(() => a1.step1Received > n || a1.closeCode !== null, 3000, 'resync request or close');
+      await waitFor(async () => a1.step1Received > n || a1.closeCode !== null, 3000, 'resync request or close');
     }
     await expectClose(a1, 4403);
-    expect(app.manager.get(key)!.hasPending()).toBe(false);
+    expect((await app.manager.get(key)!.hasPending())).toBe(false);
     honest.doc.transact(() => honest.doc.getMap('shapes').set('h2', shape({ type: 'geo' })));
-    await waitFor(() => honest.ledger.getArray('history').length === 2, 3000, 'second history line');
+    await waitFor(async () => honest.ledger.getArray('history').length === 2, 3000, 'second history line');
     const fresh = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/${key}`);
     await fresh.connect();
-    await waitFor(() => fresh.ledger.getArray('history').length === 2, 3000, 'fresh synced');
+    await waitFor(async () => fresh.ledger.getArray('history').length === 2, 3000, 'fresh synced');
     expect(historyShapeIds(fresh.ledger)).toEqual(['h1', 'h2']);
     expect(Object.keys(fresh.ledger.getMap('attribution').toJSON()).sort()).toEqual(['h1', 'h2']);
     fresh.close();
@@ -828,7 +829,7 @@ describe('fv2 regressions through the server: the room never holds pending state
     await expectClose(a2, 4403);
     honest.doc.transact(() => (honest.doc.getMap('shapes').get('h1') as Y.Map<unknown>).set('x', 5));
     const check = await attacker();
-    await waitFor(() => (check.doc.getMap('shapes').get('h1') as Y.Map<unknown> | undefined)?.get('x') === 5, 3000, 'honest edit applied');
+    await waitFor(async () => (check.doc.getMap('shapes').get('h1') as Y.Map<unknown> | undefined)?.get('x') === 5, 3000, 'honest edit applied');
     check.close();
     honest.close();
   });
@@ -852,8 +853,8 @@ describe('fv2 regressions through the server: the room never holds pending state
     }
     await new Promise((r) => setTimeout(r, 100));
     const room = app.manager.get(key)!;
-    expect([...room.doc.getMap('shapes').keys()]).toEqual(['h1']);
-    expect(Object.keys(room.ledger.getMap('attribution').toJSON())).toEqual(['h1']);
+    expect([...(await room.inspect()).doc.getMap('shapes').keys()]).toEqual(['h1']);
+    expect(Object.keys((await room.inspect()).ledger.getMap('attribution').toJSON())).toEqual(['h1']);
     honest.close();
   });
 
@@ -871,41 +872,41 @@ describe('fv2 regressions through the server: the room never holds pending state
     const app = await startApp();
     const c = new TestClient(`ws://127.0.0.1:${(app.server.address() as { port: number }).port}/_canvas/_/ws/${key}`);
     await c.connect();
-    await waitFor(() => c.doc.getMap('shapes').has('ok'), 3000, 'loaded');
-    expect(app.manager.get(key)!.hasPending()).toBe(false);
-    await waitFor(() => store.objects.get(objKey)!.body !== dirty, 3000, 'cleaned state saved');
+    await waitFor(async () => c.doc.getMap('shapes').has('ok'), 3000, 'loaded');
+    expect((await app.manager.get(key)!.hasPending())).toBe(false);
+    await waitFor(async () => store.objects.get(objKey)!.body !== dirty, 3000, 'cleaned state saved');
     const after = new Y.Doc();
     Y.applyUpdate(after, store.objects.get(objKey)!.body);
     expect(after.store.pendingStructs).toBeNull();
     expect([...after.getMap('shapes').keys()]).toEqual(['ok']);
     // and the client can write as usual
     c.doc.transact(() => c.doc.getMap('shapes').set('s2', shape({ type: 'geo' })));
-    await waitFor(() => c.ledger.getArray('history').length === 1, 3000, 'stamped');
+    await waitFor(async () => c.ledger.getArray('history').length === 1, 3000, 'stamped');
     c.close();
   });
 
   it('safety net: a room that somehow holds pending state drops it and never persists it', async () => {
-    const key = 'runs/fv2-net.html';
-    core.rules.set(key, allowUser('ana@corp', 'Ana'));
-    const app = await startApp();
-    const room = await app.manager.getOrCreate(key, null);
-    room.doc.transact(() => room.doc.getMap('shapes').set('ok', shape({ type: 'geo' })));
-    Y.applyUpdate(room.doc, gapShapeUpdate(4000000003)); // bypassing the guard on purpose
-    expect(room.hasPending()).toBe(true);
-    await room.flush(); // save drops it before encoding
-    const objKey = canvasObjectKey('_plugins/canvas', key);
+    // fv9: the documents live in the room's worker (RoomCore); the safety net is RoomCore.save,
+    // which every save of a Room runs in that worker
+    const core = new RoomCore({ attributionRetentionDays: 30, maxSplits: 5000, maxSplitWork: 1e7, maxScanWork: 2e5, maxClients: 256 });
+    core.doc.transact(() => core.doc.getMap('shapes').set('ok', shape({ type: 'geo' })));
+    Y.applyUpdate(core.doc, gapShapeUpdate(4000000003)); // bypassing the guard on purpose
+    expect(core.hasPending()).toBe(true);
+    const r1 = core.save(); // save drops it before encoding
+    expect(r1.droppedPending).toBe(true);
     const saved = new Y.Doc();
-    Y.applyUpdate(saved, store.objects.get(objKey)!.body);
+    Y.applyUpdate(saved, r1.content);
     expect(saved.store.pendingStructs).toBeNull();
-    expect(room.hasPending()).toBe(false);
-    Y.applyUpdate(room.doc, gapShapeUpdate(4000000004));
-    room.markDirty();
-    await room.flush();
-    expect(room.hasPending()).toBe(false);
+    expect([...saved.getMap('shapes').keys()]).toEqual(['ok']);
+    expect(core.hasPending()).toBe(false);
+    Y.applyUpdate(core.doc, gapShapeUpdate(4000000004));
+    const r2 = core.save();
+    expect(core.hasPending()).toBe(false);
     const saved2 = new Y.Doc();
-    Y.applyUpdate(saved2, store.objects.get(objKey)!.body);
+    Y.applyUpdate(saved2, r2.content);
     expect(saved2.store.pendingStructs).toBeNull();
   });
+
 });
 
 describe('fv2 finding 4: the anonymous attribution id is bound to the signed cookie, not to the ?anon= hint', () => {
@@ -918,21 +919,21 @@ describe('fv2 finding 4: the anonymous attribution id is bound to the signed coo
     await a.connect();
     expect(a.identity!.name).toBe('Anónimo 1234');
     a.doc.transact(() => a.doc.getMap('shapes').set('by-a', shape({ type: 'geo' })));
-    await waitFor(() => a.ledger.getMap('attribution').has('by-a'), 3000, 'a stamped');
+    await waitFor(async () => a.ledger.getMap('attribution').has('by-a'), 3000, 'a stamped');
     const idA = a.identity!.id;
     a.close();
     await a.closed;
     // the number is free again: a new visitor (no cookie) asks for it
     const b = new TestClient(`${url}?anon=1234`);
     await b.connect();
-    await waitFor(() => b.ledger.getMap('attribution').has('by-a'), 3000, 'b synced');
+    await waitFor(async () => b.ledger.getMap('attribution').has('by-a'), 3000, 'b synced');
     expect(b.identity!.name).toBe('Anónimo 1234');
     expect(b.identity!.id).not.toBe(idA);
     b.doc.transact(() => {
       (b.doc.getMap('shapes').get('by-a') as Y.Map<unknown>).set('x', 50);
       b.doc.getMap('shapes').set('by-b', shape({ type: 'geo' }));
     });
-    await waitFor(() => b.ledger.getMap('attribution').has('by-b'), 3000, 'b stamped');
+    await waitFor(async () => b.ledger.getMap('attribution').has('by-b'), 3000, 'b stamped');
     const attr = b.ledger.getMap('attribution').toJSON() as Record<string, { createdBy: string; updatedBy: string }>;
     expect(attr['by-a'].createdBy).toBe(idA);
     expect(attr['by-b'].createdBy).toBe(b.identity!.id);

@@ -5,29 +5,27 @@
  *   node --import tsx split-ratio.ts <variant> <baseN> <inserts>
  */
 import * as Y from 'yjs';
-import { Room, type Conn } from '../../src/room.js';
+import type { Conn } from '../../src/room.js';
+import { RoomCore } from '../../src/room-core.js';
 import { loadConfig } from '../../src/config.js';
-import { MemoryCanvasObjectStore } from '../../src/store.js';
-import { createLogger } from '../../src/logging.js';
-import { Metrics } from '../../src/metrics.js';
-import { SPLIT_COST_BYTES, applyGuarded, checkClientUpdate, encodeIntegratedState } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { SPLIT_COST_BYTES, encodeIntegratedState } from '@pocharlies/artifacts-canvas-shared/stamper';
 
 const variant = process.argv[2] ?? 'points-ro';
 const baseN = Number(process.argv[3] ?? 120000);
 const inserts = Number(process.argv[4] ?? 100000);
 const cfg = loadConfig({ GATE_AUTHZ_URL: 'http://x/a', ARTIFACT_BASE_URL: 'http://x', S3_BUCKET: 'b', LOG_LEVEL: 'silent', ALLOWED_ORIGINS: 'http://x', SAVE_DEBOUNCE_MS: '1000000' });
-const store = new MemoryCanvasObjectStore();
-const room = new Room('u/x/index.html', { cfg, store, log: createLogger('silent'), metrics: new Metrics(), onEmpty: () => {} });
+// fv9: what a room's worker runs, without the caps (this measures what uncapped cuts store)
+const room = new RoomCore({ attributionRetentionDays: 30, maxSplits: Infinity, maxSplitWork: Infinity, maxScanWork: Infinity, maxClients: Infinity });
+void cfg;
 const conn = { identity: { id: 'mallory@corp', name: 'M', anonymous: false, color: '#123456', readOnly: false }, principal: 'u:mallory@corp' } as unknown as Conn;
 const measured = () => encodeIntegratedState(room.doc).byteLength + encodeIntegratedState(room.ledger).byteLength;
 function push(a: Y.Doc) {
   const u = Y.encodeStateAsUpdate(a, Y.encodeStateVector(room.doc));
-  const chk = checkClientUpdate(room.doc, u, { serverClient: room.doc.clientID, mayWriteClient: (c: number) => room.mayWrite(c, conn.identity.id, conn) });
+  const chk = room.check(u, conn.identity.id, new Set());
   if (chk.bad) throw new Error('guard refused: ' + chk.bad);
   const before = measured();
-  const o = applyGuarded(room.doc, u, conn);
+  const o = room.apply(conn.identity);
   if (o.threw || o.droppedPending) throw new Error('apply ' + JSON.stringify(o));
-  room.claimWriters(chk.writers, conn.identity.id);
   return { bytes: u.byteLength, splits: chk.splits, grows: chk.grows, estimate: u.byteLength + chk.splits * SPLIT_COST_BYTES, growth: measured() - before };
 }
 const a = new Y.Doc();

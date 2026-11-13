@@ -1,27 +1,21 @@
 /**
  * fv7: real resident memory per encoded byte (content + ledger) of rooms built by an attacker
- * through the REAL guard + stamper (Room from server/src/room.ts), loaded back through Room.load
- * (the server's path), join frames encoded. Compares with ROOM_COST_FACTOR (config.ts).
+ * through the REAL guard + stamper (fv9: RoomCore, what a room's worker runs), loaded back through
+ * RoomCore.load (the worker's path), join frames encoded. Compares with ROOM_COST_FACTOR
+ * (config.ts); the worker's own base cost is server/test/fv9/worker-cost.mjs.
  *   node --expose-gc --import tsx ratio.ts <shape> <targetBytes> <copies>
  */
 import * as Y from 'yjs';
 import v8 from 'node:v8';
-import { Room, type Conn } from '../../src/room.js';
-import { loadConfig, ROOM_COST_FACTOR, ROOM_BASE_COST_BYTES } from '../../src/config.js';
-import { MemoryCanvasObjectStore } from '../../src/store.js';
-import { createLogger } from '../../src/logging.js';
-import { Metrics } from '../../src/metrics.js';
-import { applyGuarded, checkClientUpdate } from '@pocharlies/artifacts-canvas-shared/stamper';
+import { ROOM_COST_FACTOR, ROOM_BASE_COST_BYTES } from '../../src/config.js';
+import type { RoomCore } from '../../src/room-core.js';
+import { testCore } from '../helpers/core.js';
 
 const shape = process.argv[2] ?? 'alt-overwrite';
 const target = Number(process.argv[3] ?? 4 * 1024 * 1024);
 const copies = Number(process.argv[4] ?? 4);
-const cfg = loadConfig({ GATE_AUTHZ_URL: 'http://x/a', ARTIFACT_BASE_URL: 'http://x', S3_BUCKET: 'b', LOG_LEVEL: 'silent', ALLOWED_ORIGINS: 'http://x', SAVE_DEBOUNCE_MS: "1000000" });
-const log = createLogger('silent');
-const metrics = new Metrics();
-const store = new MemoryCanvasObjectStore();
-const mkRoom = (name: string) => new Room(name, { cfg, store, log, metrics, onEmpty: () => {} });
-const conn = { identity: { id: 'user:mallory', name: 'Mallory', anonymous: false, color: '#123456', readOnly: false }, principal: 'u:user:mallory' } as unknown as Conn;
+const mkRoom = () => testCore(1e9);
+const conn = { identity: { id: 'user:mallory', name: 'Mallory', anonymous: false, color: '#123456' } };
 
 function geoMap(id: string, i: number): Y.Map<unknown> {
   const m = new Y.Map<unknown>();
@@ -31,18 +25,18 @@ function geoMap(id: string, i: number): Y.Map<unknown> {
 }
 
 /** push the attacker doc's diff into the room through the guard, in pieces of <= 4 MiB */
-function push(room: Room, a: Y.Doc): number {
+function push(room: RoomCore, a: Y.Doc): number {
   const u = Y.encodeStateAsUpdate(a, Y.encodeStateVector(room.doc));
-  const chk = checkClientUpdate(room.doc, u, { serverClient: room.doc.clientID, mayWrite: (c: number) => room.mayWrite(c, conn.identity.id, conn) } as never);
+  const chk = room.check(u, conn.identity.id, new Set());
   if (chk.bad) throw new Error('guard refused: ' + chk.bad);
-  const o = applyGuarded(room.doc, u, conn);
+  const o = room.apply(conn.identity);
   if (o.threw || o.droppedPending) throw new Error('apply ' + JSON.stringify(o));
-  room.claimWriters(chk.writers, conn.identity.id);
+  room.take();
   return u.byteLength;
 }
 
 async function build(): Promise<{ content: Uint8Array; ledger: Uint8Array }> {
-  const room = mkRoom('pub/build/index.html');
+  const room = mkRoom();
   const a = new Y.Doc();
   let sent = 0;
   const bytes = () => sent;
@@ -113,11 +107,7 @@ async function build(): Promise<{ content: Uint8Array; ledger: Uint8Array }> {
       sent += push(room, a);
     }
   } else throw new Error('shape?');
-  room.markDirty();
-  await room.save();
-  const content = (await store.get(room.objectKey))!;
-  const ledger = (await store.get(room.ledgerKey))!;
-  room.dispose();
+  const { content, ledger } = room.save();
   console.log(JSON.stringify({ shape, sentUpdateBytes: sent, contentBytes: content.byteLength, ledgerBytes: ledger.byteLength }));
   return { content, ledger };
 }
@@ -127,18 +117,18 @@ const used = () => { gc(); gc(); const h = v8.getHeapStatistics(); const m = pro
 
 const { content, ledger } = await build();
 const enc = content.byteLength + ledger.byteLength;
-const rooms: Room[] = [];
-const holdStore = new MemoryCanvasObjectStore();
+const rooms: { core: RoomCore; frames: unknown }[] = [];
 const before = used();
-for (let c = 0; c < copies; c++) {
-  const r = new Room(`pub/r${c}/index.html`, { cfg, store: holdStore, log, metrics, onEmpty: () => {} });
-  await holdStore.put(r.ledgerKey, ledger.slice(), undefined);
-  await holdStore.put(r.objectKey, content.slice(), undefined);
-  rooms.push(r);
-}
 const mid = used();
-for (const r of rooms) { await r.load(); r.ledgerFrames(); r.contentFrames(); }
+for (let c = 0; c < copies; c++) {
+  const core = mkRoom();
+  core.load(ledger.slice(), content.slice(), false);
+  core.take();
+  // the join frames (fv9: held by the main thread, the room's documents by its worker)
+  rooms.push({ core, frames: core.frames(true, true, true) });
+}
 const after = used();
+void before;
 // the stored copies themselves are not part of a loaded room in the server (fetched, applied, dropped)
 const perRoomHeap = (after.heap - mid.heap) / copies;
 const perRoomExt = (after.ext - mid.ext) / copies;

@@ -20,7 +20,7 @@ import { MemoryCanvasObjectStore } from '../src/store.js';
 import { createLogger } from '../src/logging.js';
 import { canvasLedgerKey, canvasObjectKey } from '../src/paths.js';
 import { startFakeCore, allowUser, allowAnon, type FakeCore } from './helpers/fakecore.js';
-import { TEST_ORIGIN, TestClient, expectClose, waitFor } from './helpers/yclient.js';
+import { TEST_ORIGIN, TestClient, expectClose, waitFor, roomDocs } from './helpers/yclient.js';
 import { checkClientUpdate } from '@pocharlies/artifacts-canvas-shared/stamper';
 import { encodeLedger } from '@pocharlies/artifacts-canvas-shared/protocol';
 
@@ -73,8 +73,8 @@ const shape = (f: Record<string, unknown>) => {
   return m;
 };
 /** The ledger's exact bytes (state vector + full encoding) for "not a single byte changed". */
-const ledgerBytes = (app: App, key: string) => {
-  const l = app.manager.get(key)!.ledger;
+const ledgerBytes = async (app: App, key: string) => {
+  const l = (await roomDocs(app, key))!.ledger;
   return { sv: Buffer.from(Y.encodeStateVector(l)).toString('hex'), all: Buffer.from(Y.encodeStateAsUpdate(l)).toString('hex') };
 };
 
@@ -157,11 +157,11 @@ describe('fv3 HIGH: zero-length structs (Z1) cannot touch the ledger', () => {
     const ana = new TestClient(`${base(app)}/${key}`);
     await ana.connect();
     ana.doc.transact(() => ana.doc.getMap('shapes').set('s1', shape({ type: 'geo', geo: 'rectangle', x: 10, y: 10, w: 50, h: 50 })));
-    await waitFor(() => ana.ledger.getMap('attribution').has('s1'), 3000, 'stamped');
+    await waitFor(async () => ana.ledger.getMap('attribution').has('s1'), 3000, 'stamped');
     const bob = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob.connect();
-    await waitFor(() => bob.ledger.getMap('attribution').has('s1'), 3000, 'bob has the ledger');
-    const before = ledgerBytes(app, key);
+    await waitFor(async () => bob.ledger.getMap('attribution').has('s1'), 3000, 'bob has the ledger');
+    const before = await ledgerBytes(app, key);
     const attrItem = (bob.ledger.getMap('attribution') as unknown as { _map: Map<string, Y.Item> })._map.get('s1')!.id;
     const userItem = (bob.ledger.getMap('users') as unknown as { _map: Map<string, Y.Item> })._map.get('ana@corp')!.id;
     const shapeItem = (bob.doc.getMap('shapes') as unknown as { _map: Map<string, Y.Item> })._map.get('s1')!.id;
@@ -170,18 +170,18 @@ describe('fv3 HIGH: zero-length structs (Z1) cannot touch the ledger', () => {
     for (const targets of [[attrItem, userItem], [shapeItem]]) {
       const evil = new TestClient(`${base(app)}/${key}`, 'sid=bob');
       await evil.connect();
-      expect(checkClientUpdate(app.manager.get(key)!.doc, zeroLen(bob.doc.clientID, c0, targets)).bad).toBe('malformed');
+      expect(checkClientUpdate((await roomDocs(app, key))!.doc, zeroLen(bob.doc.clientID, c0, targets)).bad).toBe('malformed');
       evil.sendRaw(msg(zeroLen(evil.doc.clientID, Y.getState(evil.doc.store, evil.doc.clientID), targets)));
       await expectClose(evil, 4403);
     }
     await sleep(100);
-    expect(ledgerBytes(app, key)).toEqual(before);
+    expect(await ledgerBytes(app, key)).toEqual(before);
     expect(ana.ledger.getMap('attribution').get('s1')).toMatchObject({ createdBy: 'ana@corp' });
-    expect(app.manager.get(key)!.doc.getMap('shapes').has('s1')).toBe(true);
+    expect((await roomDocs(app, key))!.doc.getMap('shapes').has('s1')).toBe(true);
     // bob moving the shape is just an update: ana stays the creator
     bob.doc.transact(() => (bob.doc.getMap('shapes').get('s1') as Y.Map<unknown>).set('x', 11));
-    await waitFor(() => (app.manager.get(key)!.ledger.getMap('attribution').get('s1') as { updatedBy?: string })?.updatedBy === 'bob@corp', 3000, 'bob stamped');
-    expect(app.manager.get(key)!.ledger.getMap('attribution').get('s1')).toMatchObject({ createdBy: 'ana@corp', updatedBy: 'bob@corp' });
+    await waitFor(async () => ((await roomDocs(app, key))!.ledger.getMap('attribution').get('s1') as { updatedBy?: string })?.updatedBy === 'bob@corp', 3000, 'bob stamped');
+    expect((await roomDocs(app, key))!.ledger.getMap('attribution').get('s1')).toMatchObject({ createdBy: 'ana@corp', updatedBy: 'bob@corp' });
     // the room still encodes, saves and loads; a new joiner gets everything
     await app.manager.get(key)!.flush();
     const stored = new Y.Doc();
@@ -189,7 +189,7 @@ describe('fv3 HIGH: zero-length structs (Z1) cannot touch the ledger', () => {
     expect(stored.getMap('attribution').get('s1')).toMatchObject({ createdBy: 'ana@corp' });
     const carl = new TestClient(`${base(app)}/${key}`);
     await carl.connect();
-    await waitFor(() => carl.ledger.getMap('attribution').has('s1') && carl.doc.getMap('shapes').has('s1'), 3000, 'carl synced');
+    await waitFor(async () => carl.ledger.getMap('attribution').has('s1') && carl.doc.getMap('shapes').has('s1'), 3000, 'carl synced');
     expect(carl.identity).toBeTruthy();
     for (const c of [ana, bob, carl]) c.close();
   });
@@ -203,18 +203,18 @@ describe('fv3: no client byte ever reaches the ledger', () => {
     const ana = new TestClient(`${base(app)}/${key}`);
     await ana.connect();
     ana.doc.transact(() => ana.doc.getMap('shapes').set('s1', shape({ type: 'geo' })));
-    await waitFor(() => ana.ledger.getMap('attribution').has('s1'), 3000, 'stamped');
-    const before = ledgerBytes(app, key);
+    await waitFor(async () => ana.ledger.getMap('attribution').has('s1'), 3000, 'stamped');
+    const before = await ledgerBytes(app, key);
     const bob = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob.connect();
-    await waitFor(() => bob.ledger.getMap('attribution').has('s1'), 3000, 'bob synced');
+    await waitFor(async () => bob.ledger.getMap('attribution').has('s1'), 3000, 'bob synced');
     // the most "valid" forgery there is: a real update of bob's own copy of the ledger
     const sv = Y.encodeStateVector(bob.ledger);
     bob.ledger.getMap('attribution').set('s1', { createdBy: 'bob@corp', createdAt: 1, updatedBy: 'bob@corp', updatedAt: 1 });
     bob.sendRaw(encodeLedger(Y.encodeStateAsUpdate(bob.ledger, sv)));
     await expectClose(bob, 4403);
     await sleep(100);
-    expect(ledgerBytes(app, key)).toEqual(before);
+    expect(await ledgerBytes(app, key)).toEqual(before);
     expect(ana.ledger.getMap('attribution').get('s1')).toMatchObject({ createdBy: 'ana@corp' });
     ana.close();
   });
@@ -228,10 +228,10 @@ describe('fv3 P1: a throw while applying never leaves the room pending (room-wid
     const ana = new TestClient(`${base(app)}/${key}`);
     await ana.connect();
     ana.doc.transact(() => ana.doc.getMap('shapes').set('s1', shape({ type: 'geo', geo: 'rectangle' })));
-    await waitFor(() => ana.ledger.getArray('history').length === 1, 3000, 'stamped');
+    await waitFor(async () => ana.ledger.getArray('history').length === 1, 3000, 'stamped');
     const bob = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob.connect();
-    await waitFor(() => bob.ledger.getArray('history').length === 1, 3000, 'bob synced');
+    await waitFor(async () => bob.ledger.getArray('history').length === 1, 3000, 'bob synced');
     const S = ((bob.ledger.getArray('history') as unknown as { _start: Y.Item })._start).id.client;
     const NS = Y.getState(bob.ledger.store, S);
     const A = ana.doc.clientID;
@@ -254,22 +254,22 @@ describe('fv3 P1: a throw while applying never leaves the room pending (room-wid
       }
       return enc.toUint8Array();
     };
-    const roomDoc = app.manager.get(key)!.doc;
+    const roomDoc = (await roomDocs(app, key))!.doc;
     expect(checkClientUpdate(roomDoc, craft(true, true)).bad).not.toBeNull();
     expect(checkClientUpdate(roomDoc, craft(true, false)).bad).toBe('malformed'); // zero-length range
     expect(checkClientUpdate(roomDoc, craft(false, true)).bad).toBe('pending'); // known struct, missing origin
-    const before = ledgerBytes(app, key);
+    const before = await ledgerBytes(app, key);
     bob.sendRaw(msg(craft(true, true)));
     await expectClose(bob, 4403);
     const room = app.manager.get(key)!;
-    expect(room.hasPending()).toBe(false);
+    expect((await room.hasPending())).toBe(false);
     // ana keeps working
     ana.doc.transact(() => ana.doc.getMap('shapes').set('s2', shape({ type: 'geo', geo: 'rectangle' })));
-    await waitFor(() => room.doc.getMap('shapes').has('s2'), 3000, 'ana edit applied');
+    await waitFor(async () => (await room.inspect()).doc.getMap('shapes').has('s2'), 3000, 'ana edit applied');
     expect(ana.closeCode).toBeNull();
-    expect(room.hasPending()).toBe(false);
-    expect(ledgerBytes(app, key).sv).not.toEqual(before.sv); // only the stamper's line for s2
-    expect((room.ledger.getArray('history').toJSON() as { by: string; shapeId: string }[]).map((e) => `${e.by} ${e.shapeId}`)).toEqual(['ana@corp s1', 'ana@corp s2']);
+    expect((await room.hasPending())).toBe(false);
+    expect((await ledgerBytes(app, key)).sv).not.toEqual(before.sv); // only the stamper's line for s2
+    expect(((await room.inspect()).ledger.getArray('history').toJSON() as { by: string; shapeId: string }[]).map((e) => `${e.by} ${e.shapeId}`)).toEqual(['ana@corp s1', 'ana@corp s2']);
     ana.close();
   });
 });
@@ -282,10 +282,10 @@ describe('fv3 S1/S2/S3: content schema', () => {
     const ana = new TestClient(`${base(app)}/${key}`);
     await ana.connect();
     ana.doc.transact(() => ana.doc.getMap('shapes').set('v1', shape({ type: 'geo', geo: 'rectangle', x: 1, y: 1, w: 50, h: 50 })));
-    await waitFor(() => ana.ledger.getArray('history').length === 1, 3000, 'stamped');
+    await waitFor(async () => ana.ledger.getArray('history').length === 1, 3000, 'stamped');
     const bob = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob.connect();
-    await waitFor(() => bob.doc.getMap('shapes').has('v1'), 3000, 'bob synced');
+    await waitFor(async () => bob.doc.getMap('shapes').has('v1'), 3000, 'bob synced');
     const sv = Y.encodeStateVector(bob.doc);
     const evil = new Y.Doc();
     evil.clientID = 900001;
@@ -296,11 +296,11 @@ describe('fv3 S1/S2/S3: content schema', () => {
     const upd = structsOnly(Y.encodeStateAsUpdate(evil, sv)); // same structs, EMPTY delete set
     const kinds = Y.decodeUpdate(upd).structs.map((x) => (x as Y.Item).content?.constructor?.name);
     expect(kinds).toContain('ContentDeleted');
-    expect(checkClientUpdate(app.manager.get(key)!.doc, upd).bad).toBe('shapes-schema');
+    expect(checkClientUpdate((await roomDocs(app, key))!.doc, upd).bad).toBe('shapes-schema');
     bob.sendRaw(msg(upd));
     await expectClose(bob, 4403);
     expect((ana.doc.getMap('shapes').get('v1') as Y.Map<unknown>).get('type')).toBe('geo');
-    expect((app.manager.get(key)!.doc.getMap('shapes').get('v1') as Y.Map<unknown>).get('type')).toBe('geo');
+    expect(((await roomDocs(app, key))!.doc.getMap('shapes').get('v1') as Y.Map<unknown>).get('type')).toBe('geo');
     ana.close();
   });
 
@@ -345,12 +345,12 @@ describe('fv3 S1/S2/S3: content schema', () => {
       seed.doc.getMap('shapes').set('near', m);
       p.push(new Array(299_990).fill(1));
     });
-    await waitFor(() => !!app.manager.get(key)?.doc.getMap('shapes').has('near'), 5000, 'near cap stored');
+    await waitFor(async () => !!(await roomDocs(app, key))?.doc.getMap('shapes').has('near'), 5000, 'near cap stored');
     cases.push(['append past the cap', (s) => ((s.get('near') as Y.Map<unknown>).get('points') as Y.Array<number>).push(new Array(20).fill(2))]);
     for (const [name, fn] of cases) {
       const c = new TestClient(`${base(app)}/${key}`);
       await c.connect();
-      await waitFor(() => c.doc.getMap('shapes').has('near'), 5000, 'synced');
+      await waitFor(async () => c.doc.getMap('shapes').has('near'), 5000, 'synced');
       c.doc.transact(() => fn(c.doc.getMap('shapes')));
       await expectClose(c, 4403).catch((e) => {
         throw new Error(`${name}: ${e}`);
@@ -358,13 +358,13 @@ describe('fv3 S1/S2/S3: content schema', () => {
     }
     await sleep(100);
     const room = app.manager.get(key)!;
-    expect([...room.doc.getMap('shapes').keys()]).toEqual(['near']);
-    expect(((room.doc.getMap('shapes').get('near') as Y.Map<unknown>).get('points') as Y.Array<number>).length).toBe(299_990);
+    expect([...(await room.inspect()).doc.getMap('shapes').keys()]).toEqual(['near']);
+    expect((((await room.inspect()).doc.getMap('shapes').get('near') as Y.Map<unknown>).get('points') as Y.Array<number>).length).toBe(299_990);
     // legitimate shapes with every enum value still go through
     seed.doc.transact(() => {
       seed.doc.getMap('shapes').set('ok', shape({ type: 'note', color: 'light-blue', fill: 'pattern', dash: 'dotted', size: 'xl', font: 'mono', arrowheads: 'both', opacity: 0.5, text: 'ok' }));
     });
-    await waitFor(() => room.doc.getMap('shapes').has('ok'), 3000, 'good shape');
+    await waitFor(async () => (await room.inspect()).doc.getMap('shapes').has('ok'), 3000, 'good shape');
     expect(seed.closeCode).toBeNull();
     seed.close();
   });
@@ -377,16 +377,16 @@ describe('fv3 O: client-id ownership survives a room reload', () => {
     const app = await startApp();
     const victimDoc = new Y.Doc();
     const { prov } = provider(app, key, victimDoc);
-    await waitFor(() => prov.synced, 3000, 'victim synced');
+    await waitFor(async () => prov.synced, 3000, 'victim synced');
     victimDoc.transact(() => victimDoc.getMap('shapes').set('v1', shape({ type: 'geo', geo: 'rectangle' })));
-    await waitFor(() => !!app.manager.get(key)?.doc.getMap('shapes').has('v1'), 3000, 'v1 stored');
+    await waitFor(async () => !!(await roomDocs(app, key))?.doc.getMap('shapes').has('v1'), 3000, 'v1 stored');
     const V = victimDoc.clientID;
     prov.disconnect();
-    await waitFor(() => !app.manager.get(key), 3000, 'room unloaded');
+    await waitFor(async () => !app.manager.get(key), 3000, 'room unloaded');
     // the binding is persisted with the room (ledger object), so it is back after the reload
     const bob = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob.connect();
-    expect(app.manager.get(key)!.ledger.getMap('writers').get(String(V))).toBe('ana@corp');
+    expect((await roomDocs(app, key))!.ledger.getMap('writers').get(String(V))).toBe('ana@corp');
     const aw = new awarenessProtocol.Awareness(new Y.Doc());
     (aw as unknown as { clientID: number }).clientID = V;
     for (let i = 0; i < 3; i++) aw.setLocalState({ cursor: { x: i, y: i } });
@@ -399,11 +399,11 @@ describe('fv3 O: client-id ownership survives a room reload', () => {
     let closed: { code: number } | null = null;
     prov.on('closed', (ev: { code: number }) => (closed = ev));
     prov.connect();
-    await waitFor(() => prov.synced, 3000, 'victim re-synced');
+    await waitFor(async () => prov.synced, 3000, 'victim re-synced');
     victimDoc.transact(() => victimDoc.getMap('shapes').set('v2', shape({ type: 'geo', geo: 'rectangle' })));
-    await waitFor(() => !!app.manager.get(key)?.doc.getMap('shapes').has('v2'), 3000, 'v2 applied');
+    await waitFor(async () => !!(await roomDocs(app, key))?.doc.getMap('shapes').has('v2'), 3000, 'v2 applied');
     expect(closed).toBeNull();
-    expect(app.manager.get(key)!.ledger.getMap('attribution').get('v2')).toMatchObject({ createdBy: 'ana@corp' });
+    expect((await roomDocs(app, key))!.ledger.getMap('attribution').get('v2')).toMatchObject({ createdBy: 'ana@corp' });
     prov.destroy();
     bob.close();
   });
@@ -414,15 +414,15 @@ describe('fv3 O: client-id ownership survives a room reload', () => {
     const app = await startApp();
     const victimDoc = new Y.Doc();
     const { prov } = provider(app, key, victimDoc);
-    await waitFor(() => prov.synced, 3000);
+    await waitFor(async () => prov.synced, 3000);
     victimDoc.transact(() => victimDoc.getMap('shapes').set('v1', shape({ type: 'geo', geo: 'rectangle' })));
-    await waitFor(() => !!app.manager.get(key)?.doc.getMap('shapes').has('v1'), 3000, 'v1 stored');
+    await waitFor(async () => !!(await roomDocs(app, key))?.doc.getMap('shapes').has('v1'), 3000, 'v1 stored');
     const V = victimDoc.clientID;
     prov.disconnect();
-    await waitFor(() => !app.manager.get(key), 3000, 'room unloaded');
+    await waitFor(async () => !app.manager.get(key), 3000, 'room unloaded');
     const bob = new TestClient(`${base(app)}/${key}`, 'sid=bob');
     await bob.connect();
-    await waitFor(() => bob.doc.getMap('shapes').has('v1'), 3000, 'bob synced');
+    await waitFor(async () => bob.doc.getMap('shapes').has('v1'), 3000, 'bob synced');
     const sv = Y.encodeStateVector(bob.doc);
     const evil = new Y.Doc();
     Y.applyUpdate(evil, Y.encodeStateAsUpdate(bob.doc));
@@ -430,11 +430,11 @@ describe('fv3 O: client-id ownership survives a room reload', () => {
     evil.transact(() => evil.getMap('shapes').set('bob-as-victim', shape({ type: 'geo', geo: 'rectangle' })));
     bob.sendRaw(msg(Y.encodeStateAsUpdate(evil, sv)));
     await expectClose(bob, 4403);
-    expect(app.manager.get(key)?.doc.getMap('shapes').has('bob-as-victim') ?? false).toBe(false);
+    expect((await roomDocs(app, key))?.doc.getMap('shapes').has('bob-as-victim') ?? false).toBe(false);
     prov.connect();
-    await waitFor(() => prov.synced, 3000);
+    await waitFor(async () => prov.synced, 3000);
     victimDoc.transact(() => victimDoc.getMap('shapes').set('v2', shape({ type: 'geo', geo: 'rectangle' })));
-    await waitFor(() => !!app.manager.get(key)?.doc.getMap('shapes').has('v2'), 3000, 'v2 applied');
+    await waitFor(async () => !!(await roomDocs(app, key))?.doc.getMap('shapes').has('v2'), 3000, 'v2 applied');
     prov.destroy();
   });
 });
@@ -447,24 +447,24 @@ describe('fv3 F: edits made while disconnected are delivered', () => {
     const port = (app.server.address() as { port: number }).port;
     const doc = new Y.Doc();
     const { prov, ledger } = provider(app, key, doc);
-    await waitFor(() => prov.synced, 3000);
+    await waitFor(async () => prov.synced, 3000);
     doc.transact(() => doc.getMap('shapes').set('a', shape({ type: 'geo', geo: 'rectangle' })));
-    await waitFor(() => !!app.manager.get(key)?.doc.getMap('shapes').has('a'), 3000, 'a applied');
+    await waitFor(async () => !!(await roomDocs(app, key))?.doc.getMap('shapes').has('a'), 3000, 'a applied');
     let gotClose = false;
     prov.on('connection-close', () => (gotClose = true));
     await app.close(); // a deploy: same port, same store (the close flushes the room)
     apps.splice(apps.indexOf(app), 1);
-    await waitFor(() => gotClose && !prov.wsconnected, 3000, 'client saw the restart');
+    await waitFor(async () => gotClose && !prov.wsconnected, 3000, 'client saw the restart');
     for (const id of ['offline1', 'offline2', 'offline3']) doc.transact(() => doc.getMap('shapes').set(id, shape({ type: 'geo', geo: 'rectangle' })));
     app = await startOnPort(port);
     let closed: { code: number } | null = null;
     prov.on('closed', (ev: { code: number }) => (closed = ev));
-    await waitFor(() => prov.wsconnected && prov.synced, 5000, 're-synced');
-    await waitFor(() => ['offline1', 'offline2', 'offline3'].every((id) => !!app.manager.get(key)?.doc.getMap('shapes').has(id)), 3000, 'offline shapes delivered');
+    await waitFor(async () => prov.wsconnected && prov.synced, 5000, 're-synced');
+    await waitFor(async () => await (async () => { const d = (await roomDocs(app, key))?.doc; return ['offline1', 'offline2', 'offline3'].every((id) => !!d?.getMap('shapes').has(id)); })(), 3000, 'offline shapes delivered');
     doc.transact(() => doc.getMap('shapes').set('after', shape({ type: 'geo', geo: 'rectangle' })));
-    await waitFor(() => !!app.manager.get(key)?.doc.getMap('shapes').has('after'), 3000, 'after applied');
+    await waitFor(async () => !!(await roomDocs(app, key))?.doc.getMap('shapes').has('after'), 3000, 'after applied');
     expect(closed).toBeNull();
-    await waitFor(() => ledger.getMap('attribution').has('offline3'), 3000, 'ledger back on the client');
+    await waitFor(async () => ledger.getMap('attribution').has('offline3'), 3000, 'ledger back on the client');
     expect(ledger.getMap('attribution').get('offline1')).toMatchObject({ createdBy: 'ana@corp' });
     // persisted: content + ledger objects
     await app.manager.get(key)!.flush();

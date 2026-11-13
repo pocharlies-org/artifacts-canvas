@@ -19,7 +19,7 @@ import { createApp, type App } from '../src/app.js';
 import { MemoryCanvasObjectStore } from '../src/store.js';
 import { createLogger } from '../src/logging.js';
 import { startFakeCore, allowUser, allowAnon, type FakeCore } from './helpers/fakecore.js';
-import { TEST_ORIGIN, TestClient, expectClose, waitFor } from './helpers/yclient.js';
+import { TEST_ORIGIN, TestClient, expectClose, waitFor, roomDocs } from './helpers/yclient.js';
 import { checkClientUpdate, attachStamper } from '@pocharlies/artifacts-canvas-shared/stamper';
 import { materializeContent, materializeLedger, pruneAttribution } from '@pocharlies/artifacts-canvas-shared/ledger';
 import { sanitizeAwarenessUpdate } from '@pocharlies/artifacts-canvas-shared/awareness';
@@ -36,7 +36,10 @@ async function startApp(env: Record<string, string> = {}): Promise<App> {
     const cfg = loadConfig({
       GATE_AUTHZ_URL: core.authzUrl, ARTIFACT_BASE_URL: core.artifactBaseUrl, S3_BUCKET: 'canvas-test',
       STATIC_DIR: staticDir, LOG_LEVEL: 'silent', AUTHZ_RECHECK_SECONDS: '30', SAVE_DEBOUNCE_MS: '50',
-      READYZ_CACHE_MS: '10', PORT: String(++portSeq), ALLOWED_ORIGINS: TEST_ORIGIN, METRICS_PORT: '0', ...env,
+      READYZ_CACHE_MS: '10', PORT: String(++portSeq), ALLOWED_ORIGINS: TEST_ORIGIN, METRICS_PORT: '0',
+      // the accounting of fv6-fv8 at the room base it was written for (32 KiB); fv9's room worker
+      // (16 MiB per room) is in fv9.test.ts and the sizing tests
+      ROOM_BASE_COST_BYTES: '32768', ...env,
     });
     const app = createApp({ config: cfg, store, logger: silent });
     try {
@@ -77,9 +80,9 @@ async function fill(app: App, key: string, c: TestClient, n: number, batch = 200
       for (let j = i; j < Math.min(n, i + batch); j++) shapes.set(`f${j}`, shapeMap(geo(`f${j}`, j)));
     });
     const want = Math.min(n, i + batch);
-    await waitFor(() => (app.manager.get(key)?.doc.getMap('shapes').size ?? 0) >= want, 30_000, 'fill');
+    await waitFor(async () => ((await roomDocs(app, key))?.doc.getMap('shapes').size ?? 0) >= want, 30_000, 'fill');
   }
-  return Y.encodeStateAsUpdate(app.manager.get(key)!.doc).byteLength;
+  return Y.encodeStateAsUpdate((await roomDocs(app, key))!.doc).byteLength;
 }
 /** A raw socket as user `cookie` (no Y.Doc in this process); resolves once open. */
 async function raw(app: App, key: string, cookie?: string): Promise<{ ws: WebSocket; bytes: () => number; closed: Promise<number> }> {
@@ -135,7 +138,7 @@ describe('fv4 H1: sync step 1 is no amplifier', () => {
     (eve.ws as unknown as { _socket: { pause(): void } })._socket.pause(); // never reads again
     const rss0 = process.memoryUsage().rss;
     for (let i = 0; i < 200; i++) eve.ws.send(STEP1_EMPTY);
-    await waitFor(() => serverConn(app, key, 'eve@corp')?.closing !== false, 5000, 'eve closed');
+    await waitFor(async () => serverConn(app, key, 'eve@corp')?.closing !== false, 5000, 'eve closed');
     await sleep(500);
     const grew = process.memoryUsage().rss - rss0;
     // before: every message was answered with the whole room (+3 030 MB for 200 messages on
@@ -187,9 +190,9 @@ describe('fv4 H1: sync step 1 is no amplifier', () => {
     const doc = new Y.Doc();
     const prov = new WebsocketProvider(base(app), key, doc, { WebSocketPolyfill: OriginWs as never, disableBc: true, maxBackoffTime: 300 });
     prov.messageHandlers[102] = () => undefined;
-    await waitFor(() => doc.getMap('shapes').size === 3000, 10_000, 'bob synced');
+    await waitFor(async () => doc.getMap('shapes').size === 3000, 10_000, 'bob synced');
     doc.getMap('shapes').set('bob1', shapeMap(geo('bob1')));
-    await waitFor(() => app.manager.get(key)!.doc.getMap('shapes').has('bob1'), 3000, 'bob wrote');
+    await waitFor(async () => (await roomDocs(app, key))!.doc.getMap('shapes').has('bob1'), 3000, 'bob wrote');
     prov.destroy();
     ana.close();
   });
@@ -209,7 +212,7 @@ describe('fv4 H1: sync step 1 is no amplifier', () => {
       ana.doc.getMap('meta').set('k', `${i}`.padEnd(64_000, 'z')); // one key: the room stays small
       await sleep(10);
     }
-    await waitFor(() => serverConn(app, key, 'eve@corp') === undefined, 10_000, 'eve dropped');
+    await waitFor(async () => serverConn(app, key, 'eve@corp') === undefined, 10_000, 'eve dropped');
     expect(serverConn(app, key, 'ana@corp')).toBeDefined();
     ana.close();
   });
@@ -256,7 +259,7 @@ describe('fv4 H2: the guard is O(update), never O(room)', () => {
     await fill(app, key, ana, 8000);
     const room = app.manager.get(key)!;
     const probe = new Y.Doc();
-    Y.applyUpdate(probe, Y.encodeStateAsUpdate(room.doc));
+    Y.applyUpdate(probe, Y.encodeStateAsUpdate((await room.inspect()).doc));
     let craftClient = 70_000;
     const craft = (id: string) => {
       let upd: Uint8Array | null = null;
@@ -277,8 +280,9 @@ describe('fv4 H2: the guard is O(update), never O(room)', () => {
     };
     const u = craft('f1');
     expect(u.byteLength).toBeLessThan(100);
+    const roomDoc = (await room.inspect()).doc;
     const t0 = performance.now();
-    expect(checkClientUpdate(room.doc, u).bad).toBe('shapes-schema');
+    expect(checkClientUpdate(roomDoc, u).bad).toBe('shapes-schema');
     expect(performance.now() - t0).toBeLessThan(10); // before: 424-966 ms (slow path)
     let worst = 0;
     for (let i = 0; i < 5; i++) {
@@ -292,7 +296,7 @@ describe('fv4 H2: the guard is O(update), never O(room)', () => {
       worst = Math.max(worst, hist.max / 1e6);
     }
     expect(worst).toBeLessThan(100); // before: 19.5 s for 20 messages, no break
-    expect((room.doc.getMap('shapes').get('f2') as Y.Map<unknown>).get('type')).toBe('geo');
+    expect(((await room.inspect()).doc.getMap('shapes').get('f2') as Y.Map<unknown>).get('type')).toBe('geo');
     ana.close();
   }, 60_000);
 
@@ -410,7 +414,7 @@ describe('fv4 M2-M4', () => {
     }
     expect(await Promise.race([eve.closed, sleep(2000).then(() => null)])).toBe(4413);
     await sleep(200);
-    const total = Y.encodeStateAsUpdate(room.doc).byteLength + Y.encodeStateAsUpdate(room.ledger).byteLength;
+    const total = Y.encodeStateAsUpdate((await room.inspect()).doc).byteLength + Y.encodeStateAsUpdate((await room.inspect()).ledger).byteLength;
     // before: the ledger alone reached 7x the content cap and kept growing
     expect(total).toBeLessThan(400 * 1024 + 64 * 1024);
     ana.close();

@@ -35,6 +35,7 @@ import { SPLIT_COST_BYTES, applyGuarded, checkClientUpdate, encodeIntegratedStat
 import { materializeContent } from '@pocharlies/artifacts-canvas-shared/ledger';
 import { startFakeCore, allowUser, allowAnon, type FakeCore } from './helpers/fakecore.js';
 import { TEST_ORIGIN, TestClient, waitFor } from './helpers/yclient.js';
+import { testCore } from './helpers/core.js';
 import { insertsBetween, itemAt, knownCuts, syncUpdate } from './fv8/craft.js';
 
 let core: FakeCore;
@@ -54,7 +55,10 @@ async function startApp(env: Record<string, string> = {}, logger = silent): Prom
     const cfg = loadConfig({
       GATE_AUTHZ_URL: core.authzUrl, ARTIFACT_BASE_URL: core.artifactBaseUrl, S3_BUCKET: 'canvas-test',
       STATIC_DIR: staticDir, LOG_LEVEL: 'silent', AUTHZ_RECHECK_SECONDS: '300', SAVE_DEBOUNCE_MS: '50',
-      READYZ_CACHE_MS: '10', PORT: String(++portSeq), ALLOWED_ORIGINS: TEST_ORIGIN, METRICS_PORT: '0', ...env,
+      READYZ_CACHE_MS: '10', PORT: String(++portSeq), ALLOWED_ORIGINS: TEST_ORIGIN, METRICS_PORT: '0',
+      // the accounting of fv6-fv8 at the room base it was written for (32 KiB); fv9's room worker
+      // (16 MiB per room) is in fv9.test.ts and the sizing tests
+      ROOM_BASE_COST_BYTES: '32768', ...env,
     });
     const app = createApp({ config: cfg, store, logger });
     try {
@@ -82,7 +86,7 @@ function share(key: string, ...who: string[]) {
 async function join(app: App, key: string, cookie?: string): Promise<TestClient> {
   const c = new TestClient(`${base(app)}/${key}`, cookie);
   await c.connect();
-  await waitFor(() => c.step1Received > 0 || c.closeCode !== null, 10_000, 'join settled').catch(() => undefined);
+  await waitFor(async () => c.step1Received > 0 || c.closeCode !== null, 10_000, 'join settled').catch(() => undefined);
   return c;
 }
 const mapOf = (f: Record<string, unknown>) => {
@@ -268,7 +272,7 @@ describe('fv8 P1: every cut of an item counts; a room the server stored always l
     m.doc.clientID = 4294967000;
     strokes(m.doc, 1, 2 * N + 1);
     const room = app.manager.get(key)!;
-    await waitFor(() => pointsOf(room.doc, 'm0')?.length === 2 * N + 2, 5000, 'stroke');
+    await waitFor(async () => pointsOf((await room.inspect()).doc, 'm0')?.length === 2 * N + 2, 5000, 'stroke');
     await room.flush();
     const attack = insertsBetween([{ into: itemAt(pointsOf(m.doc, 'm0')!, 0), count: N, at: 0 }], 4294967001, 0);
     // what the server estimated before fv8 (no cut counted): under the cap
@@ -276,13 +280,13 @@ describe('fv8 P1: every cut of an item counts; a room the server stored always l
     expect(oldEstimate).toBeLessThan(cfgOf(app).maxDocBytes);
     // what the room would have become: past the cap
     expect(room.approxBytes + after - before + room.ledgerApproxBytes).toBeGreaterThan(cfgOf(app).maxDocBytes);
-    const chk = checkClientUpdate(room.doc, attack);
+    const chk = checkClientUpdate((await room.inspect()).doc, attack);
     expect(chk.splits).toBe(N);
     m.sendRaw(syncUpdate(attack));
     expect(await m.closed).toBe(4413);
     expect(m.notices.map((n) => n.kind)).toContain('too-large');
     expect(await rejected(app, 'doc_too_large')).toBe(1);
-    expect(pointsOf(room.doc, 'm0')!.length).toBe(2 * N + 2);
+    expect(pointsOf((await room.inspect()).doc, 'm0')!.length).toBe(2 * N + 2);
     await room.flush();
     expect(room.bytes).toBeLessThanOrEqual(cfgOf(app).maxDocBytes);
     console.log(`[fv8 P1 cap] cap ${cap} B; old estimate ${oldEstimate} B; would have stored ${room.approxBytes + after - before + room.ledgerApproxBytes} B; new estimate ${room.bytes + attack.byteLength + N * SPLIT_COST_BYTES} B: refused`);
@@ -297,12 +301,12 @@ describe('fv8 P1: every cut of an item counts; a room the server stored always l
     bob.doc.transact(() => { for (let i = 0; i < 40; i++) bob.doc.getMap('shapes').set(`bob${i}`, mapOf(geo(`bob${i}`, i))); });
     alice.doc.transact(() => { for (let i = 0; i < 40; i++) alice.doc.getMap('shapes').set(`alice${i}`, mapOf(geo(`alice${i}`, i))); });
     const room = app.manager.get(key)!;
-    await waitFor(() => room.doc.getMap('shapes').size === 80, 5000, 'honest');
+    await waitFor(async () => (await room.inspect()).doc.getMap('shapes').size === 80, 5000, 'honest');
     const m = await join(app, key, 'sid=mallory');
     const N = 100_000;
     m.doc.clientID = 4294967000;
     strokes(m.doc, 2, N + 1);
-    await waitFor(() => pointsOf(room.doc, 'm1')?.length === N + 2 || m.closeCode !== null, 20_000, 'base');
+    await waitFor(async () => pointsOf((await room.inspect()).doc, 'm1')?.length === N + 2 || m.closeCode !== null, 20_000, 'base');
     await room.flush();
     const bytesBefore = room.bytes;
     const attack = insertsBetween([0, 1].map((s) => ({ into: itemAt(pointsOf(m.doc, `m${s}`)!, 0), count: N })), 4294967001, 0);
@@ -313,13 +317,13 @@ describe('fv8 P1: every cut of an item counts; a room the server stored always l
     const ms = Math.round(performance.now() - t0);
     expect(m.notices.map((n) => n.kind)).toContain('too-large');
     expect(await rejected(app, 'too_many_splits')).toBe(1);
-    expect(pointsOf(room.doc, 'm0')!.length).toBe(N + 2);
-    expect(pointsOf(room.doc, 'm1')!.length).toBe(N + 2);
+    expect(pointsOf((await room.inspect()).doc, 'm0')!.length).toBe(N + 2);
+    expect(pointsOf((await room.inspect()).doc, 'm1')!.length).toBe(N + 2);
     await room.flush();
     expect(room.bytes).toBe(bytesBefore);
     // everyone leaves; the room is saved and evicted; it loads for everyone, also after a restart
     for (const c of [bob, alice]) c.close();
-    await waitFor(() => !app.manager.get(key), 20_000, 'evicted');
+    await waitFor(async () => !app.manager.get(key), 20_000, 'evicted');
     const codes: Record<string, number | null> = {};
     for (const who of ['bob', 'alice', 'mallory']) {
       const c = await join(app, key, `sid=${who}`);
@@ -342,19 +346,19 @@ describe('fv8 P1: every cut of an item counts; a room the server stored always l
     const v = await join(app, key);
     v.doc.transact(() => v.doc.getMap('shapes').set('v1', mapOf(geo('v1', 1))));
     const room = app.manager.get(key)!;
-    await waitFor(() => room.doc.getMap('shapes').has('v1'), 5000, 'honest');
+    await waitFor(async () => (await room.inspect()).doc.getMap('shapes').has('v1'), 5000, 'honest');
     const a = await join(app, key);
     const N = 20_000;
     a.doc.clientID = 4294967000;
     strokes(a.doc, 2, N + 1, 'a');
-    await waitFor(() => pointsOf(room.doc, 'a1')?.length === N + 2 || a.closeCode !== null, 20_000, 'base');
+    await waitFor(async () => pointsOf((await room.inspect()).doc, 'a1')?.length === N + 2 || a.closeCode !== null, 20_000, 'base');
     expect(a.closeCode).toBeNull();
     const attack = insertsBetween([0, 1].map((s) => ({ into: itemAt(pointsOf(a.doc, `a${s}`)!, 0), count: N })), 4294967001, 0);
     a.sendRaw(syncUpdate(attack));
     expect(await a.closed).toBe(4413);
     expect(await rejected(app, 'too_many_splits')).toBe(1);
     for (const c of [v]) c.ws.terminate();
-    await waitFor(() => !app.manager.get(key), 20_000, 'evicted');
+    await waitFor(async () => !app.manager.get(key), 20_000, 'evicted');
     const anon1 = await join(app, key);
     const anon2 = await join(app, key);
     expect([anon1.closeCode, anon2.closeCode]).toEqual([null, null]);
@@ -397,7 +401,7 @@ describe('fv8 P1: every cut of an item counts; a room the server stored always l
       o2.doc.getMap('assets').delete('a1');
     });
     const room = app.manager.get(big)!;
-    await waitFor(() => !room.doc.getMap('assets').has('a1'), 5000, 'deleted');
+    await waitFor(async () => !(await room.inspect()).doc.getMap('assets').has('a1'), 5000, 'deleted');
     expect(o2.closeCode).toBeNull();
     await room.flush();
     expect(room.bytes).toBeLessThan(64 * 1024);
@@ -409,20 +413,18 @@ describe('fv8 P1: every cut of an item counts; a room the server stored always l
 async function seedImage(key: string, target: number): Promise<number> {
   const cfg = loadConfig(BASE_ENV);
   const tmp = new MemoryCanvasObjectStore();
-  const room = new Room('seed', { cfg, store: tmp, log: silent, metrics: new Metrics(), onEmpty: () => undefined });
+  const room = testCore();
   const d = new Y.Doc();
   d.transact(() => {
     d.getMap('assets').set('a1', 'data:image/png;base64,' + 'A'.repeat(target - 2048));
     d.getMap('shapes').set('img', mapOf({ id: 'img', type: 'image', assetId: 'a1', x: 0, y: 0, w: 600, h: 400, rotation: 0, index: 0, groupId: '', locked: false, opacity: 1 }));
   });
   Y.applyUpdate(room.doc, Y.encodeStateAsUpdate(d), { identity: { id: 'bob@corp', name: 'bob', anonymous: false, color: '#000' } });
-  room.markDirty();
-  await room.save();
-  const c = tmp.objects.get(room.objectKey)!.body;
-  const l = tmp.objects.get(room.ledgerKey)!.body;
+  const saved = room.save();
+  const c = saved.content;
+  const l = saved.ledger;
   await store.put(`_plugins/canvas/${key}.ydoc`, c);
   await store.put(`_plugins/canvas/${key}.ydoc.ledger`, l);
-  room.dispose();
   return c.byteLength + l.byteLength;
 }
 
@@ -449,7 +451,7 @@ describe('fv8 P2: one update cannot hold the server', () => {
     m.doc.clientID = 4294967000;
     strokes(m.doc, 2, N + 1);
     const ra = app.manager.get(A)!;
-    await waitFor(() => pointsOf(ra.doc, 'm1')?.length === N + 2, 20_000, 'base');
+    await waitFor(async () => pointsOf((await ra.inspect()).doc, 'm1')?.length === N + 2, 20_000, 'base');
     const bw = await join(app, B, 'sid=bob');
     const br = await join(app, B, 'sid=bob');
     const lat: number[] = [];
@@ -458,7 +460,7 @@ describe('fv8 P2: one update cannot hold the server', () => {
       for (let i = 0; !stop; i++) {
         const t = performance.now();
         bw.doc.getMap('shapes').set(`h${i}`, mapOf(geo(`h${i}`, i)));
-        await waitFor(() => br.doc.getMap('shapes').has(`h${i}`), 30_000, 'honest edit');
+        await waitFor(async () => br.doc.getMap('shapes').has(`h${i}`), 30_000, 'honest edit');
         lat.push(performance.now() - t);
         await sleep(40);
       }
@@ -493,7 +495,7 @@ describe('fv8 P2: one update cannot hold the server', () => {
       sm.set('points', new Y.Array<number>());
       m.doc.getMap('shapes').set('s', sm);
     });
-    await waitFor(() => !!pointsOf(room.doc, 's'), 5000, 'stroke');
+    await waitFor(async () => !!pointsOf((await room.inspect()).doc, 's'), 5000, 'stroke');
     const pts = pointsOf(m.doc, 's')!;
     const helper = new Y.Doc();
     Y.applyUpdate(helper, Y.encodeStateAsUpdate(m.doc));
@@ -506,7 +508,7 @@ describe('fv8 P2: one update cannot hold the server', () => {
       }
       m.sendRaw(syncUpdate(Y.encodeStateAsUpdate(helper, sv)));
     }
-    await waitFor(() => pointsOf(room.doc, 's')!.length === 50_000 || m.closeCode !== null, 20_000, 'chain');
+    await waitFor(async () => pointsOf((await room.inspect()).doc, 's')!.length === 50_000 || m.closeCode !== null, 20_000, 'chain');
     expect(m.closeCode).toBeNull();
     Y.applyUpdate(m.doc, Y.encodeStateAsUpdate(helper, Y.encodeStateVector(m.doc)), 'server');
     const first = itemAt(pts, 0);
@@ -525,15 +527,16 @@ describe('fv8 P2: one update cannot hold the server', () => {
     }
     encoding.writeVarUint(e, 0);
     const forged = encoding.toUint8Array(e);
-    const chk = checkClientUpdate(room.doc, forged);
+    const chk = checkClientUpdate((await room.inspect()).doc, forged);
     expect(chk.splits).toBe(0);
-    expect(applyEstimateMs(0, chk.splitWork, chk.scanWork)).toBeGreaterThan(cfgOf(app).maxApplyMs * 100);
+    // fv9: MAX_APPLY_MS is 1000 now (the update runs in its room's worker); this one is 26 s
+    expect(applyEstimateMs(0, chk.splitWork, chk.scanWork)).toBeGreaterThan(cfgOf(app).maxApplyMs * 10);
     const t0 = performance.now();
     m.sendRaw(syncUpdate(forged));
     expect(await m.closed).toBe(4413);
     expect(performance.now() - t0).toBeLessThan(1000);
     expect(await rejected(app, 'too_many_splits')).toBe(1);
-    expect(pointsOf(room.doc, 's')!.length).toBe(50_000);
+    expect(pointsOf((await room.inspect()).doc, 's')!.length).toBe(50_000);
     // honest: typing into a text in the middle, a growing stroke, a move: no scan, no cut beyond one
     const b = materializeContent(new Y.Doc());
     const a = new Y.Doc();
@@ -563,7 +566,7 @@ describe('fv8 P2: one update cannot hold the server', () => {
     // covered: applied, the budget charged what it took (not the estimate twice)
     const level0 = conn.cpu.level();
     m.doc.getMap('assets').set('img1', payload);
-    await waitFor(() => room.doc.getMap('assets').has('img1') || m.closeCode !== null, 5000, 'applied');
+    await waitFor(async () => (await room.inspect()).doc.getMap('assets').has('img1') || m.closeCode !== null, 5000, 'applied');
     expect(m.closeCode).toBeNull();
     expect(level0 - conn.cpu.level()).toBeLessThan(estimate + 200);
     // the principal's budget is nearly used up: the next one is refused before it runs
@@ -572,13 +575,14 @@ describe('fv8 P2: one update cannot hold the server', () => {
     expect(await m.closed).toBe(1013);
     expect(m.notices.map((n) => n.kind)).toContain('busy');
     expect(await rejected(app, 'cpu_precharge')).toBe(1);
-    expect(room.doc.getMap('assets').has('img2')).toBe(false);
+    expect((await room.inspect()).doc.getMap('assets').has('img2')).toBe(false);
   });
 
-  it('the caps: MAX_SPLITS_PER_MESSAGE (5 000) counts cuts; MAX_APPLY_MS (50) bounds their estimated work, and the most short cuts it lets through apply within it', () => {
-    const cfg = loadConfig(BASE_ENV);
+  it('the caps: MAX_SPLITS_PER_MESSAGE (5 000) counts cuts; MAX_APPLY_MS (50 here: fv9 raised the default to 1000) bounds their estimated work, and the most short cuts it lets through apply within it', () => {
+    const cfg = loadConfig({ ...BASE_ENV, MAX_APPLY_MS: '50' });
     expect(cfg.maxSplitsPerMessage).toBe(5000);
     expect(cfg.maxApplyMs).toBe(50);
+    expect(loadConfig(BASE_ENV).maxApplyMs).toBe(1000);
     const a = new Y.Doc();
     a.clientID = 1000;
     strokes(a, 51, 100, 'q');
@@ -627,7 +631,7 @@ describe('fv8 U2: a loader that left no longer pays for what others keep open', 
     const r1cost = app.manager.get(R1)!.cost;
     expect(app.manager.held('u:ana@corp')).toBeCloseTo(r1cost, 0);
     a1.ws.terminate();
-    await waitFor(() => app.manager.get(R1)!.principals.size === 1, 15_000, 'ana left');
+    await waitFor(async () => app.manager.get(R1)!.principals.size === 1, 15_000, 'ana left');
     out.anaHeldAfterLeavingMiB = mib(app.manager.held('u:ana@corp'));
     out.carlHeldMiB = mib(app.manager.held('u:carl@corp'));
     expect(app.manager.held('u:ana@corp')).toBe(0);
@@ -636,7 +640,7 @@ describe('fv8 U2: a loader that left no longer pays for what others keep open', 
     out.anaOpensR2 = a2.closeCode;
     expect(a2.closeCode).toBeNull();
     for (const c of [c1, a2]) c.ws.terminate();
-    await waitFor(() => !app.manager.get(R1) && !app.manager.get(R2), 20_000, 'evicted');
+    await waitFor(async () => !app.manager.get(R1) && !app.manager.get(R2), 20_000, 'evicted');
     // anonymous: V opens a 1 MiB public canvas, W joins, V leaves; V opens a 0.7 MiB one
     const P1 = 'pub/a/index.html';
     const P2 = 'pub/b/index.html';
@@ -648,7 +652,7 @@ describe('fv8 U2: a loader that left no longer pays for what others keep open', 
     const vCookie = (v1.setCookie ?? '').split(';')[0];
     const w1 = await join(app, P1);
     v1.ws.terminate();
-    await waitFor(() => app.manager.get(P1)!.principals.size === 1, 15_000, 'visitor left');
+    await waitFor(async () => app.manager.get(P1)!.principals.size === 1, 15_000, 'visitor left');
     const v2 = await join(app, P2, vCookie);
     out.visitorOpensP2 = v2.closeCode;
     console.log(`[fv8 U2] ${JSON.stringify(out)}`);
@@ -671,21 +675,21 @@ describe('fv8 U2: a loader that left no longer pays for what others keep open', 
     // mallory writes (growth, hers alone) and an anonymous visitor reads along
     m.doc.transact(() => { for (let i = 0; i < 200; i++) m.doc.getMap('shapes').set(`g${i}`, mapOf(geo(`g${i}`, i))); });
     const room = mgr.get(key)!;
-    await waitFor(() => room.doc.getMap('shapes').size === 201, 5000, 'written');
+    await waitFor(async () => (await room.inspect()).doc.getMap('shapes').size === 201, 5000, 'written');
     await room.flush();
     const wrote = mgr.held('u:mallory@corp') - room.loadChargeOf('u:mallory@corp');
     expect(wrote).toBeGreaterThan(0);
     const v = await join(app, key);
     const vp = [...room.conns.values()].find((c) => c.identity.anonymous)!.principal;
     m.close();
-    await waitFor(() => room.principals.size === 1, 5000, 'mallory left');
+    await waitFor(async () => room.principals.size === 1, 5000, 'mallory left');
     // the visitor took the load charge up to its share; mallory keeps the rest and what she wrote
     expect(mgr.held(vp)).toBeLessThanOrEqual(mgr.share(true) + 1);
     expect(mgr.held(vp)).toBeGreaterThan(mgr.share(true) * 0.99);
     expect(mgr.held('u:mallory@corp')).toBeGreaterThanOrEqual(wrote - 1);
     expect(mgr.held(vp) + mgr.held('u:mallory@corp')).toBeCloseTo(room.cost, 0);
     v.close();
-    await waitFor(() => !mgr.get(key), 5000, 'evicted');
+    await waitFor(async () => !mgr.get(key), 5000, 'evicted');
     expect(mgr.held('u:mallory@corp')).toBe(0);
   });
 });

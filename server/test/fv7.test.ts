@@ -32,7 +32,8 @@ import { createLogger } from '../src/logging.js';
 import { Metrics } from '../src/metrics.js';
 import { Room } from '../src/room.js';
 import { startFakeCore, allowUser, allowAnon, type FakeCore } from './helpers/fakecore.js';
-import { TEST_ORIGIN, TestClient, waitFor } from './helpers/yclient.js';
+import { TEST_ORIGIN, TestClient, waitFor, roomDocs } from './helpers/yclient.js';
+import { testCore } from './helpers/core.js';
 
 let core: FakeCore;
 let staticDir: string;
@@ -49,7 +50,10 @@ async function startApp(env: Record<string, string> = {}, logger = silent): Prom
     const cfg = loadConfig({
       GATE_AUTHZ_URL: core.authzUrl, ARTIFACT_BASE_URL: core.artifactBaseUrl, S3_BUCKET: 'canvas-test',
       STATIC_DIR: staticDir, LOG_LEVEL: 'silent', AUTHZ_RECHECK_SECONDS: '300', SAVE_DEBOUNCE_MS: '50',
-      READYZ_CACHE_MS: '10', PORT: String(++portSeq), ALLOWED_ORIGINS: TEST_ORIGIN, METRICS_PORT: '0', ...env,
+      READYZ_CACHE_MS: '10', PORT: String(++portSeq), ALLOWED_ORIGINS: TEST_ORIGIN, METRICS_PORT: '0',
+      // the accounting of fv6-fv8 at the room base it was written for (32 KiB); fv9's room worker
+      // (16 MiB per room) is in fv9.test.ts and the sizing tests
+      ROOM_BASE_COST_BYTES: '32768', ...env,
     });
     const app = createApp({ config: cfg, store, logger });
     try {
@@ -89,7 +93,7 @@ async function seed(key: string, shapes: number, author = 'bob@corp'): Promise<n
   if (!objs) {
     const tmp = new MemoryCanvasObjectStore();
     const cfg = loadConfig(BASE_ENV);
-    const room = new Room('seed', { cfg, store: tmp, log: silent, metrics: new Metrics(), onEmpty: () => undefined });
+    const room = testCore();
     const d = new Y.Doc();
     const origin = { identity: { id: author, name: author, anonymous: false, color: '#000' } };
     for (let b = 0; b < shapes; b += 500) {
@@ -100,10 +104,8 @@ async function seed(key: string, shapes: number, author = 'bob@corp'): Promise<n
       });
       Y.applyUpdate(room.doc, Y.encodeStateAsUpdate(d, sv), origin);
     }
-    room.markDirty();
-    await room.save();
-    objs = { content: tmp.objects.get(room.objectKey)!.body, ledger: tmp.objects.get(room.ledgerKey)!.body };
-    room.dispose();
+    const saved = room.save();
+    objs = { content: saved.content, ledger: saved.ledger };
     seedCache.set(id, objs);
   }
   await store.put(`_plugins/canvas/${key}.ydoc`, objs.content);
@@ -142,14 +144,14 @@ async function join(app: App, key: string, cookie?: string): Promise<TestClient>
 }
 /** Joined and synced (the server's step 1 arrived), or closed: the close code (null = open). */
 async function joined(c: TestClient, ms = 10_000): Promise<number | null> {
-  await waitFor(() => c.step1Received > 0 || c.closeCode !== null, ms, 'join settled').catch(() => undefined);
+  await waitFor(async () => c.step1Received > 0 || c.closeCode !== null, ms, 'join settled').catch(() => undefined);
   return c.closeCode;
 }
 /** One more shape from `c`, applied by the server (or `c` was closed): true when it is in the room. */
 async function addShape(app: App, c: TestClient, key: string, id: string): Promise<boolean> {
   c.doc.getMap('shapes').set(id, shapeMap(geo(id, 1)));
-  await waitFor(() => app.manager.get(key)?.doc.getMap('shapes').has(id) === true || c.closeCode !== null, 5000, `${id} applied`).catch(() => undefined);
-  return app.manager.get(key)?.doc.getMap('shapes').has(id) === true;
+  await waitFor(async () => (await roomDocs(app, key))?.doc.getMap('shapes').has(id) === true || c.closeCode !== null, 5000, `${id} applied`).catch(() => undefined);
+  return (await roomDocs(app, key))?.doc.getMap('shapes').has(id) === true;
 }
 /** Wait until no room has unsaved changes (every pending debounced save ran: charges settled). */
 async function saved(app: App): Promise<void> {
@@ -215,7 +217,7 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
         await sleep(15);
         sample();
       }
-      await waitFor(() => w.closeCode !== null, 10_000, 'writer stopped').catch(() => undefined);
+      await waitFor(async () => w.closeCode !== null, 10_000, 'writer stopped').catch(() => undefined);
       writerCloses.push(w.closeCode);
       sample();
     }
@@ -287,7 +289,7 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
     a.doc.transact(() => {
       for (let i = 0; i < 200; i++) a.doc.getMap('shapes').set(`a${i}`, shapeMap(geo(`a${i}`, i)));
     });
-    await waitFor(() => room.doc.getMap('shapes').has('a199'), 5000, 'applied');
+    await waitFor(async () => (await room.inspect()).doc.getMap('shapes').has('a199'), 5000, 'applied');
     expect(mgr.held('u:ana@corp')).toBeCloseTo(room.cost - cost0, 0);
     expect(mgr.held('u:mallory@corp')).toBe(loaded);
     expect(mgr.held('u:carl@corp')).toBe(0);
@@ -301,14 +303,14 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
     const anaWrote = mgr.held('u:ana@corp');
     m.close();
     a.close();
-    await waitFor(() => room.principals.size === 1, 5000, 'left');
+    await waitFor(async () => room.principals.size === 1, 5000, 'left');
     expect(mgr.held('u:mallory@corp')).toBe(0);
     expect(mgr.held('u:ana@corp')).toBeCloseTo(anaWrote, 0);
     expect(mgr.held('u:carl@corp')).toBeCloseTo(loaded, 0);
     expect(mgr.held('u:mallory@corp') + mgr.held('u:ana@corp') + mgr.held('u:carl@corp')).toBeCloseTo(room.cost, 0);
     // the last reader leaves: the room is evicted and so are its charges
     c.close();
-    await waitFor(() => !mgr.get(key), 5000, 'evicted');
+    await waitFor(async () => !mgr.get(key), 5000, 'evicted');
     expect(mgr.held('u:mallory@corp')).toBe(0);
     expect(mgr.held('u:ana@corp')).toBe(0);
   });
@@ -324,7 +326,7 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
     m.doc.transact(() => {
       for (let i = 0; i < 300; i++) m.doc.getMap('shapes').set(`m${i}`, shapeMap(geo(`m${i}`, i)));
     });
-    await waitFor(() => room.doc.getMap('shapes').size === 300, 5000, 'applied');
+    await waitFor(async () => (await room.inspect()).doc.getMap('shapes').size === 300, 5000, 'applied');
     await saved(app);
     const mallory = mgr.held('u:mallory@corp');
     expect(mallory).toBeCloseTo(room.cost, 0);
@@ -338,7 +340,7 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
       a.doc.transact(() => {
         for (let i = 0; i < 100; i++) (a.doc.getMap('shapes').get(`m${i}`) as Y.Map<unknown>).set('x', round * 1000 + i);
       });
-      await waitFor(() => (room.doc.getMap('shapes').get('m99') as Y.Map<unknown>).get('x') === round * 1000 + 99, 5000, 'move');
+      await waitFor(async () => ((await room.inspect()).doc.getMap('shapes').get('m99') as Y.Map<unknown>).get('x') === round * 1000 + 99, 5000, 'move');
       estimates += charge0() - before;
       if (round % 3 === 0) await saved(app);
     }
@@ -347,13 +349,13 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
       a.doc.transact(() => {
         for (let i = 0; i < 200; i++) a.doc.getMap('shapes').set(`c${cycle}-${i}`, shapeMap(geo(`c${cycle}-${i}`, i)));
       });
-      await waitFor(() => room.doc.getMap('shapes').has(`c${cycle}-199`), 5000, 'create');
+      await waitFor(async () => (await room.inspect()).doc.getMap('shapes').has(`c${cycle}-199`), 5000, 'create');
       estimates += charge0() - before;
       await saved(app);
       a.doc.transact(() => {
         for (let i = 0; i < 200; i++) a.doc.getMap('shapes').delete(`c${cycle}-${i}`);
       });
-      await waitFor(() => !room.doc.getMap('shapes').has(`c${cycle}-199`), 5000, 'delete');
+      await waitFor(async () => !(await room.inspect()).doc.getMap('shapes').has(`c${cycle}-199`), 5000, 'delete');
       await saved(app);
     }
     const ana = mgr.held('u:ana@corp');
@@ -372,7 +374,7 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
     const keys = Array.from({ length: 4 }, (_, i) => `u/t${i}/index.html`);
     let bytes = 0;
     for (const k of keys) bytes = await seed(k, 300);
-    const perRoom = ROOM_BASE_COST_BYTES + ROOM_COST_FACTOR * bytes;
+    const perRoom = 32 * 1024 + ROOM_COST_FACTOR * bytes; // the room base this app runs with (startApp)
     const budget = Math.ceil((4 * perRoom) / 0.82);
     const app = await startApp({ ROOM_MEMORY_BUDGET_BYTES: String(budget) });
     const who = ['p1', 'p2', 'p3', 'p4'];
@@ -431,7 +433,7 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
     const s = await join(app, small, 'sid=mallory');
     expect(await s.closed).toBe(1013);
     c.close();
-    await waitFor(() => !app.manager.get(big), 5000, 'evicted');
+    await waitFor(async () => !app.manager.get(big), 5000, 'evicted');
     const s2 = await join(app, small, 'sid=mallory');
     expect(await joined(s2)).toBeNull();
     s2.close();
@@ -457,7 +459,7 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
       a.doc.getMap('assets').set('img1', data);
       a.doc.getMap('shapes').set('i1', shapeMap({ id: 'i1', type: 'image', x: 0, y: 0, w: 100, h: 100, rotation: 0, index: 1, groupId: '', locked: false, opacity: 1, assetId: 'img1' }));
     });
-    await waitFor(() => app.manager.get('u/img/index.html')?.doc.getMap('assets').has('img1') === true || a.closeCode !== null, 5000, 'image applied');
+    await waitFor(async () => (await roomDocs(app, 'u/img/index.html'))?.doc.getMap('assets').has('img1') === true || a.closeCode !== null, 5000, 'image applied');
     expect(a.closeCode).toBeNull();
     // fv6's estimate: 44 x size x 2.6 for a room under 64 KiB, more than the share
     expect(ROOM_COST_FACTOR * data.length * 2.6).toBeGreaterThan(app.manager.share(false));
@@ -478,8 +480,8 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
         for (let i = 0; i < 1000; i++) c.doc.getMap('shapes').set(`${tag}${i}`, shapeMap(geo(`${tag}${i}`, i)));
       });
     }
-    await waitFor(() => (room.doc.getMap('shapes').size === 2000 && p3.doc.getMap('shapes').size === 2000) || p1.closeCode !== null || p2.closeCode !== null, 10_000, 'created');
-    expect([p1.closeCode, p2.closeCode, room.doc.getMap('shapes').size]).toEqual([null, null, 2000]);
+    await waitFor(async () => ((await room.inspect()).doc.getMap('shapes').size === 2000 && p3.doc.getMap('shapes').size === 2000) || p1.closeCode !== null || p2.closeCode !== null, 10_000, 'created');
+    expect([p1.closeCode, p2.closeCode, (await room.inspect()).doc.getMap('shapes').size]).toEqual([null, null, 2000]);
     await saved(app);
     const ledger0 = room.ledgerApproxBytes;
     const sv = Y.encodeStateVector(p3.doc);
@@ -487,7 +489,7 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
       for (const id of p3.doc.getMap('shapes').keys()) (p3.doc.getMap('shapes').get(id) as Y.Map<unknown>).set('x', 7);
     });
     const moveBytes = Y.encodeStateAsUpdate(p3.doc, sv).byteLength;
-    await waitFor(() => (room.doc.getMap('shapes').get('b999') as Y.Map<unknown>).get('x') === 7 || p3.closeCode !== null, 10_000, 'moved');
+    await waitFor(async () => ((await room.inspect()).doc.getMap('shapes').get('b999') as Y.Map<unknown>).get('x') === 7 || p3.closeCode !== null, 10_000, 'moved');
     const ledgerAdded = room.ledgerApproxBytes - ledger0;
     console.log(`[fv7 F1 ledger] a move of 2000 shapes: ${moveBytes} B of update, ${ledgerAdded} B of ledger; p3 charged ${mib(app.manager.held('u:p3@corp'))} MiB`);
     expect(p3.closeCode).toBeNull();
@@ -509,15 +511,15 @@ describe('fv7 F1: the memory budget charges whoever loaded and wrote, in full', 
     m.doc.transact(() => {
       for (let i = 0; i < 2000; i++) m.doc.getMap('shapes').set(`s${i}`, shapeMap(geo(`s${i}`, i)));
     });
-    await waitFor(() => room.doc.getMap('shapes').size === 2000, 5000, 'created');
+    await waitFor(async () => (await room.inspect()).doc.getMap('shapes').size === 2000, 5000, 'created');
     m.doc.transact(() => {
       for (let i = 0; i < 2000; i += 2) m.doc.getMap('shapes').delete(`s${i}`);
     });
-    await waitFor(() => room.doc.getMap('shapes').size === 1000, 5000, 'deleted');
+    await waitFor(async () => (await room.inspect()).doc.getMap('shapes').size === 1000, 5000, 'deleted');
     await saved(app);
     const before = { approx: room.approxBytes, total: app.manager.memory().total, held: app.manager.held('u:mallory@corp') };
     // the client's step 2 against the room's state: no struct, the whole delete set
-    const upd = Y.encodeStateAsUpdate(m.doc, Y.encodeStateVector(room.doc));
+    const upd = Y.encodeStateAsUpdate(m.doc, Y.encodeStateVector((await room.inspect()).doc));
     expect(upd.byteLength).toBeGreaterThan(1000);
     for (let i = 0; i < 50; i++) {
       const e = encoding.createEncoder();
@@ -550,10 +552,14 @@ describe('fv7 F1: the share is a real fraction of the budget; the size caps foll
     expect(() => loadConfig({ ...BASE_ENV, ROOM_MEMORY_PRINCIPAL_SHARE: '0.5', ROOM_MEMORY_ANON_SHARE: '0.5' })).toThrow(/must be <= 0.8/);
   });
 
-  it('the chart default (2 GiB, heap limit 1560 MiB): 872 MiB budget, a full room fits a share, nothing lowered, no warning', () => {
+  it('the chart default (2304 MiB, --max-old-space-size=1728, heap limit 1776 MiB in node:22-alpine): 1088 MiB budget, a full room with its worker fits a share, nothing lowered, no warning', () => {
+    // fv9: every loaded room has a worker thread (ROOM_BASE_COST_BYTES, 16 MiB): the chart went from
+    // 2 GiB / 1536 to 2304 MiB / 1728 so that the default caps still fit a share (at 1536 the
+    // anonymous cap would be lowered to 1.07 MiB)
     const cfg = loadConfig(BASE_ENV);
-    deriveRoomLimits(cfg, 1560 * MiB, null);
-    expect(cfg.roomMemoryBudgetBytes).toBe(872 * MiB);
+    expect(cfg.roomBaseCostBytes).toBe(ROOM_BASE_COST_BYTES);
+    deriveRoomLimits(cfg, 1776 * MiB, null);
+    expect(cfg.roomMemoryBudgetBytes).toBe(1088 * MiB);
     expect(cfg.memoryWarnings).toEqual([]);
     expect([cfg.maxDocBytes, cfg.anonMaxDocBytes, cfg.maxMessageBytes, cfg.anonMaxMessageBytes]).toEqual([5 * MiB, 1280 * 1024, 4 * MiB, 1 * MiB]);
     const userShare = cfg.roomMemoryBudgetBytes / 3;

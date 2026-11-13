@@ -27,7 +27,8 @@ import { createLogger } from '../src/logging.js';
 import { Metrics } from '../src/metrics.js';
 import { Room, TAIL_MAX_MESSAGES } from '../src/room.js';
 import { startFakeCore, allowUser, allowAnon, type FakeCore } from './helpers/fakecore.js';
-import { TEST_ORIGIN, TestClient, waitFor } from './helpers/yclient.js';
+import { TEST_ORIGIN, TestClient, waitFor, roomDocs } from './helpers/yclient.js';
+import { testCore } from './helpers/core.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 let core: FakeCore;
@@ -43,7 +44,10 @@ async function startApp(env: Record<string, string> = {}): Promise<App> {
     const cfg = loadConfig({
       GATE_AUTHZ_URL: core.authzUrl, ARTIFACT_BASE_URL: core.artifactBaseUrl, S3_BUCKET: 'canvas-test',
       STATIC_DIR: staticDir, LOG_LEVEL: 'silent', AUTHZ_RECHECK_SECONDS: '30', SAVE_DEBOUNCE_MS: '50',
-      READYZ_CACHE_MS: '10', PORT: String(++portSeq), ALLOWED_ORIGINS: TEST_ORIGIN, METRICS_PORT: '0', ...env,
+      READYZ_CACHE_MS: '10', PORT: String(++portSeq), ALLOWED_ORIGINS: TEST_ORIGIN, METRICS_PORT: '0',
+      // the accounting of fv6-fv8 at the room base it was written for (32 KiB); fv9's room worker
+      // (16 MiB per room) is in fv9.test.ts and the sizing tests
+      ROOM_BASE_COST_BYTES: '32768', ...env,
     });
     const app = createApp({ config: cfg, store, logger: silent });
     try {
@@ -88,7 +92,7 @@ async function seed(key: string, shapes: number, author = 'bob@corp'): Promise<n
   if (!objs) {
     const tmp = new MemoryCanvasObjectStore();
     const cfg = loadConfig({ GATE_AUTHZ_URL: 'http://core.test/', ARTIFACT_BASE_URL: 'http://core.test/', S3_BUCKET: 'b', METRICS_PORT: '0' });
-    const room = new Room('seed', { cfg, store: tmp, log: silent, metrics: new Metrics(), onEmpty: () => undefined });
+    const room = testCore();
     const d = new Y.Doc();
     const origin = { identity: { id: author, name: author, anonymous: false, color: '#000' } };
     for (let b = 0; b < shapes; b += 2000) {
@@ -99,10 +103,8 @@ async function seed(key: string, shapes: number, author = 'bob@corp'): Promise<n
       });
       Y.applyUpdate(room.doc, Y.encodeStateAsUpdate(d, sv), origin);
     }
-    room.markDirty();
-    await room.save();
-    objs = { content: tmp.objects.get(room.objectKey)!.body, ledger: tmp.objects.get(room.ledgerKey)!.body };
-    room.dispose();
+    const saved = room.save();
+    objs = { content: saved.content, ledger: saved.ledger };
     seedCache.set(id, objs);
   }
   await store.put(`_plugins/canvas/${key}.ydoc`, objs.content);
@@ -139,7 +141,7 @@ async function join(app: App, key: string, cookie?: string): Promise<TestClient>
 }
 /** Wait until the client either synced `n` shapes or was closed; the close code (null = open). */
 async function settled(c: TestClient, n: number, ms = 15_000): Promise<number | null> {
-  await waitFor(() => c.closeCode !== null || c.doc.getMap('shapes').size >= n, ms, 'join settled').catch(() => undefined);
+  await waitFor(async () => c.closeCode !== null || c.doc.getMap('shapes').size >= n, ms, 'join settled').catch(() => undefined);
   return c.closeCode;
 }
 
@@ -198,10 +200,10 @@ describe('fv6 H-1: loaded rooms are bounded by a memory budget', () => {
     expect(await settled(second, 2000)).toBeNull();
     // the loaded rooms stay usable: an edit lands
     second.doc.getMap('shapes').set('after', shapeMap(geo('after')));
-    await waitFor(() => app.manager.get(keys[0])!.doc.getMap('shapes').has('after'), 5000, 'edit lands');
+    await waitFor(async () => (await roomDocs(app, keys[0]))!.doc.getMap('shapes').has('after'), 5000, 'edit lands');
     // the holder of room 1 leaves: its room is evicted, and the refused room loads now
     held[1].close();
-    await waitFor(() => !app.manager.get(keys[1]), 5000, 'room 1 evicted');
+    await waitFor(async () => !app.manager.get(keys[1]), 5000, 'room 1 evicted');
     const retry = await join(app, keys[fits], 'sid=dora');
     expect(await settled(retry, 2000)).toBeNull();
     for (const c of [...held, second, retry]) c.close();
@@ -231,12 +233,12 @@ describe('fv6 H-1: loaded rooms are bounded by a memory budget', () => {
           const s = c.doc.getMap('shapes');
           for (let i = b; i < b + 25; i++) s.set(`f${i}`, shapeMap(geo(`f${i}`, i)));
         });
-        await waitFor(() => c.closeCode !== null || app.manager.get(k)!.doc.getMap('shapes').size >= b + 25, 10_000, 'batch').catch(() => undefined);
+        await waitFor(async () => c.closeCode !== null || (await roomDocs(app, k))!.doc.getMap('shapes').size >= b + 25, 10_000, 'batch').catch(() => undefined);
         if (c.closeCode !== null) at = b;
       }
       closes.push(c.closeCode);
       // the refused batch was not applied
-      expect(app.manager.get(k)!.doc.getMap('shapes').size).toBe(at);
+      expect((await roomDocs(app, k))!.doc.getMap('shapes').size).toBe(at);
       expect(app.manager.held(`u:${w}@corp`)).toBeLessThanOrEqual(app.manager.share(false) * 1.01);
       if (c.closeCode === 1013) expect(c.notices.map((n) => n.kind)).toContain('busy');
       await sleep(100);
@@ -328,7 +330,7 @@ describe('fv6 H-1: loaded rooms are bounded by a memory budget', () => {
     };
     const c = new TestClient(`${base(app)}/${key}`);
     void c.connect().catch(() => undefined);
-    await waitFor(() => app.manager.rooms.size === 1, 3000, 'load started');
+    await waitFor(async () => app.manager.rooms.size === 1, 3000, 'load started');
     c.ws.terminate();
     await sleep(800);
     expect(app.manager.rooms.size).toBe(0);
@@ -382,15 +384,15 @@ describe('fv6 M-A: minted principals, shared join encodes, CPU debt', () => {
     const e0 = room.encodes;
     // q2: a tiny edit before every join (a new room version each time)
     const same = async (c: TestClient) => {
-      await waitFor(() => Buffer.from(Y.encodeStateVector(c.doc)).equals(Buffer.from(Y.encodeStateVector(room.doc))), 5000, 'joiner has the room').catch(() => undefined);
-      expect(Buffer.from(Y.encodeStateVector(c.doc)).equals(Buffer.from(Y.encodeStateVector(room.doc)))).toBe(true);
-      expect(c.doc.getMap('shapes').toJSON()).toEqual(room.doc.getMap('shapes').toJSON());
-      await waitFor(() => c.ledger.getMap('attribution').size === room.ledger.getMap('attribution').size, 5000, 'ledger').catch(() => undefined);
-      expect(c.ledger.getMap('attribution').toJSON()).toEqual(room.ledger.getMap('attribution').toJSON());
+      await waitFor(async () => Buffer.from(Y.encodeStateVector(c.doc)).equals(Buffer.from(Y.encodeStateVector((await room.inspect()).doc))), 5000, 'joiner has the room').catch(() => undefined);
+      expect(Buffer.from(Y.encodeStateVector(c.doc)).equals(Buffer.from(Y.encodeStateVector((await room.inspect()).doc)))).toBe(true);
+      expect(c.doc.getMap('shapes').toJSON()).toEqual((await room.inspect()).doc.getMap('shapes').toJSON());
+      await waitFor(async () => c.ledger.getMap('attribution').size === (await room.inspect()).ledger.getMap('attribution').size, 5000, 'ledger').catch(() => undefined);
+      expect(c.ledger.getMap('attribution').toJSON()).toEqual((await room.inspect()).ledger.getMap('attribution').toJSON());
     };
     for (let i = 0; i < 20; i++) {
       (bob.doc.getMap('shapes').get('f1') as Y.Map<unknown>).set('x', 1000 + i);
-      await waitFor(() => (room.doc.getMap('shapes').get('f1') as Y.Map<unknown>).get('x') === 1000 + i, 3000, 'bump');
+      await waitFor(async () => ((await room.inspect()).doc.getMap('shapes').get('f1') as Y.Map<unknown>).get('x') === 1000 + i, 3000, 'bump');
       const c = await join(app, key, i % 2 ? 'sid=eve' : 'sid=ana');
       await settled(c, 6000);
       // every joiner holds exactly the room: content and ledger (snapshot + tail + backlog)
@@ -401,7 +403,7 @@ describe('fv6 M-A: minted principals, shared join encodes, CPU debt', () => {
     expect(room.encodes - e0).toBeLessThanOrEqual(2);
     // more updates than the tail keeps: the next join encodes once more, never once per version
     for (let v = 0; v <= TAIL_MAX_MESSAGES; v++) bob.doc.getMap('meta').set('v', v);
-    await waitFor(() => room.doc.getMap('meta').get('v') === TAIL_MAX_MESSAGES, 3000, 'edits');
+    await waitFor(async () => (await room.inspect()).doc.getMap('meta').get('v') === TAIL_MAX_MESSAGES, 3000, 'edits');
     const e1 = room.encodes;
     const late = await join(app, key, 'sid=ana');
     await settled(late, 6000);
@@ -426,8 +428,8 @@ describe('fv6 M-A: minted principals, shared join encodes, CPU debt', () => {
     const e0 = room.encodes;
     for (let i = 0; i < 300; i++) {
       (bob.doc.getMap('shapes').get('f2') as Y.Map<unknown>).set('x', i);
-      await waitFor(() => (room.doc.getMap('shapes').get('f2') as Y.Map<unknown>).get('x') === i, 3000, 'edit');
-      room.step1Frame();
+      await waitFor(async () => ((await room.inspect()).doc.getMap('shapes').get('f2') as Y.Map<unknown>).get('x') === i, 3000, 'edit');
+      await room.step1Frame();
     }
     expect(room.encodes).toBe(e0);
     bob.close();
@@ -472,7 +474,7 @@ describe('fv6 M-A: minted principals, shared join encodes, CPU debt', () => {
       const id = `c${seq++}`;
       const t0 = performance.now();
       carol.doc.getMap('shapes').set(id, shapeMap(geo(id)));
-      await waitFor(() => !!carol.ledger.getMap('attribution').get(id), 20_000, 'rtt').catch(() => undefined);
+      await waitFor(async () => !!carol.ledger.getMap('attribution').get(id), 20_000, 'rtt').catch(() => undefined);
       return performance.now() - t0;
     };
     const probe = async (ms: number) => {
@@ -508,7 +510,7 @@ describe('fv6 M-A: minted principals, shared join encodes, CPU debt', () => {
       m.set('text', t);
       t.insert(0, 'é'.repeat(9000));
     });
-    await waitFor(() => room2().doc.getMap('shapes').has(pid), 8000, 'paste lands');
+    await waitFor(async () => (await room2().inspect()).doc.getMap('shapes').has(pid), 8000, 'paste lands');
     const results = (await Promise.all(children.map((c) => new Promise((r) => c.once('message', r))))) as { joins: number; codes: [string, number][] }[];
     for (const c of children) c.send('bye');
     const encodes = keys.map((k, i) => app.manager.get(k)!.encodes - encodes0[i]);
@@ -543,7 +545,7 @@ describe('fv6 L-A: paused sockets cannot hold the outgoing budget against honest
       b.on('message', () => undefined);
       b.on('error', () => undefined);
       await new Promise((r) => b.on('open', r));
-      await waitFor(() => (app.manager.get(k)?.conns.size ?? 0) === 1, 30_000, 'room loaded');
+      await waitFor(async () => (app.manager.get(k)?.conns.size ?? 0) === 1, 30_000, 'room loaded');
       holders.push(b);
     }
     const team = 'u/team/index.html';
@@ -555,7 +557,7 @@ describe('fv6 L-A: paused sockets cannot hold the outgoing budget against honest
     const dave = await join(app, small, 'sid=dave');
     const honestJoin = async (key: string, n: number): Promise<string> => {
       const c = await join(app, key, 'sid=erin');
-      await waitFor(() => c.closeCode !== null || c.doc.getMap('shapes').size >= n, 8000, 'honest join').catch(() => undefined);
+      await waitFor(async () => c.closeCode !== null || c.doc.getMap('shapes').size >= n, 8000, 'honest join').catch(() => undefined);
       const r = c.closeCode !== null ? String(c.closeCode) : c.doc.getMap('shapes').size >= n ? 'joined' : 'stuck';
       c.close();
       await sleep(200);
@@ -603,7 +605,7 @@ describe('fv6 L-A: paused sockets cannot hold the outgoing budget against honest
         return last;
       };
       // established: every paused socket is stalled by the server's own clock
-      await waitFor(() => stalledOf(keys[0]).length === PER_ROOM, 90_000, 'every paused socket is stalled').catch(async (e) => {
+      await waitFor(async () => stalledOf(keys[0]).length === PER_ROOM, 90_000, 'every paused socket is stalled').catch(async (e) => {
         await stop();
         throw e;
       });
@@ -638,7 +640,7 @@ describe('fv6 L-A: paused sockets cannot hold the outgoing budget against honest
         await settled(carolBig, 16_000);
         // the sweep forgets a join's frames once they drained; until then the server counts a join
         // of the same snapshot as sharing them, and the honest join would cost nothing
-        await waitFor(() => [...(app.manager.get(bigKey)?.conns.values() ?? [])].every((c) => !c.joinFrames), 15_000, 'carol\'s join frames released');
+        await waitFor(async () => [...(app.manager.get(bigKey)?.conns.values() ?? [])].every((c) => !c.joinFrames), 15_000, 'carol\'s join frames released');
       }
       cfg.wsOutgoingBudgetBytes = w1.held + 256 * 1024;
       const reclaim0 = await rejected(app, 'outgoing_reclaim');
@@ -678,7 +680,7 @@ describe('fv6 L-A: paused sockets cannot hold the outgoing budget against honest
     expect(dropped2).toBeGreaterThan(0);
     // the existing honest connections still edit
     carol.doc.getMap('shapes').set('after', shapeMap(geo('after')));
-    await waitFor(() => app.manager.get(team)!.doc.getMap('shapes').has('after'), 10_000, 'carol edits');
+    await waitFor(async () => (await roomDocs(app, team))!.doc.getMap('shapes').has('after'), 10_000, 'carol edits');
     expect(carol.closeCode).toBeNull();
     expect(holders.every((b) => b.readyState === WebSocket.OPEN)).toBe(true);
     for (const c of [carol, dave]) c.close();
