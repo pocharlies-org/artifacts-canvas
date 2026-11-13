@@ -83,6 +83,17 @@ data:
   CPU_SHED_MIN_BYTES: {{ int64 .Values.limits.cpuShedMinBytes | quote }}
   MAX_SPLITS_PER_MESSAGE: {{ int64 .Values.limits.maxSplitsPerMessage | quote }}
   MAX_APPLY_MS: {{ int64 .Values.limits.maxApplyMs | quote }}
+  MAX_CLIENTS_PER_UPDATE: {{ int64 .Values.limits.maxClientsPerUpdate | quote }}
+  # --- room isolation (fv9): watchdog, apply slots, strikes ---
+  WORKER_MESSAGE_TIMEOUT_MS: {{ int64 .Values.worker.messageTimeoutMs | quote }}
+  WORKER_TIMEOUT_NS_PER_BYTE: {{ int64 .Values.worker.timeoutNsPerByte | quote }}
+  WORKER_OP_TIMEOUT_MS: {{ int64 .Values.worker.opTimeoutMs | quote }}
+  WORKER_OP_NS_PER_BYTE: {{ int64 .Values.worker.opNsPerByte | quote }}
+  WORKER_APPLY_CONCURRENCY: {{ int64 .Values.worker.applyConcurrency | quote }}
+  WORKER_STRIKES: {{ int64 .Values.worker.strikes | quote }}
+  WORKER_STRIKE_WINDOW_MS: {{ int64 .Values.worker.strikeWindowMs | quote }}
+  WORKER_STRIKE_COOLDOWN_MS: {{ int64 .Values.worker.strikeCooldownMs | quote }}
+  WORKER_ANON_POOL_STRIKES: {{ int64 .Values.worker.anonPoolStrikes | quote }}
   ATTRIBUTION_RETENTION_DAYS: {{ int64 .Values.limits.attributionRetentionDays | quote }}
   # loaded-room memory budget: derived by the server from the V8 heap limit unless set
   {{- if .Values.limits.roomMemoryBudgetBytes }}

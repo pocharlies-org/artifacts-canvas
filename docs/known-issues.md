@@ -1,5 +1,54 @@
 # Known issues
 
+## Ninth verification (fv9)
+
+All findings of fv9 are fixed: A (a run of items Yjs merges, 183 KB, crashed the canvas out of
+heap), B (separate mergeable pairs, 5.4 s), C (a delete-only update enabling merges, 8.6 s), D
+(formatting items in a note, 60 s per anonymous message), E (the guard's own dependency check,
+27 s), F (anonymous visitors charged one visitor share for rooms that cost the budget 651 MiB).
+On top of the fixes, every room now runs in a worker thread of its own with a heap limit and a
+watchdog (protocol §12), so a path nobody has found yet costs one room's worker, rebuilt byte
+for byte, never the process. Regressions: `server/test/fv9.test.ts`,
+`e2e-system/adversarial-fv9.spec.ts`; PoCs and probes: `server/test/fv9/`. What the new design
+leaves open:
+
+- [ ] **One client message is processed at a time over all rooms (Low, design).** The apply slot
+  (`WORKER_APPLY_CONCURRENCY` 1) bounds the memory of the messages in flight to one worker's
+  headroom, as one main thread did before; a message holds it for its guard and apply, so other
+  rooms' updates wait behind it (up to its watchdog: 250 ms + 1 us per byte, its apply up to twice
+  its estimate, `MAX_APPLY_MS` 1 000 ms at most). Honest edits take well under a millisecond; an
+  attacker's messages are bounded by the CPU budgets and the strikes. The main thread never
+  waits (pings, joins, awareness, broadcasts go on).
+  Suggested fix: a second slot for messages under a size threshold, with the memory formula
+  reserving it.
+
+- [ ] **A worker per loaded room costs 15.7 MiB and ~80 ms to start (Low, design).** Counted in
+  every room's cost (`ROOM_BASE_COST_BYTES`), so the budget bounds the loaded rooms (~57 empty
+  ones with the chart's defaults) and the chart went from 2 GiB / 1536 to 2304 MiB / 1728 to keep
+  the default caps. A pool of workers would cost less but a fault would cost every room in the
+  faulted worker, and their heap limits could not follow one room.
+
+- [ ] **The anonymous strike pool can be used to lock anonymous visitors out (Low).** Cookieless
+  visitors are a new principal on every connection, so their strikes also count together:
+  `WORKER_ANON_POOL_STRIKES` (10) worker faults from anonymous messages within 10 minutes refuse
+  every anonymous join and write for 10 minutes. With `CLIENT_IP_HOPS` set, an IP that faults
+  `WORKER_STRIKES` times is refused first. Signed-in users are never affected.
+  Suggested fix: a pool per client IP prefix when the IP is known, the global pool only without.
+
+- [ ] **A delete of thousands of shapes one tab created in one session can be refused (Low).**
+  Yjs splices the writer's struct array once per deleted shape (its fields merge into one GC
+  struct), so deleting the first 6 000 of 12 000 shapes written from one client id takes Yjs
+  ~0.9 s on x86; the guard counts it and refuses a delete estimated over `MAX_APPLY_MS` (1 000)
+  with 4413. Deleting them in smaller selections, or from a later session (another client id),
+  works.
+
+- [ ] **A rebuild that fails drops the room's log (Low).** If a room cannot be rebuilt after a
+  fault (its saved objects unreadable, the replay failing — never seen), its connections are
+  closed 1013 and its write-ahead log is lost: the reconnecting tabs resend those edits, with the
+  re-attribution of M1 below for other people's.
+
+## Earlier verifications
+
 Findings of the eighth independent verification (fv8) that are not fixed yet. None of them
 crashes the server, loses data or makes a room unloadable. Each entry below is meant to become
 one GitHub issue.
@@ -198,15 +247,16 @@ meant to become one GitHub issue.
   bound to it, and the victim's next edit is closed `4403` (no auto-reconnect). Bounded by
   `SAVE_DEBOUNCE_MS` (2 s by default) and by needing a crash. fv6 found a way to cause one at
   will (Q4: open and fill rooms until the pod is OOM-killed); with the loaded-room memory budget
-  that is refused (shown on the full system under the chart's 2 GiB limit, no restart) and no
-  other way is known: the crash has to come from outside (a node failure, a kill) (protocol
-  §11). PoC: `poc7-crash-relay.ts`.
+  that is refused (shown on the full system under the chart's limit, no restart); fv9 A found
+  another (one message that ran the heap out), now refused, and since fv9 any other one costs a
+  room's worker, not the process (protocol §12): the crash has to come from outside (a node
+  failure, a kill) (protocol §11). PoC: `poc7-crash-relay.ts`.
   Suggested fix: save the ledger more often than the content, or write ahead the `writers`
   bindings; on reload, refuse relayed structs for client ids the relaying principal never
   bound instead of binding them to it.
 
-- [ ] **L1 — Writer-id takeover while the victim is disconnected (Low).** `Room.mayWrite`
-  (`server/src/room.ts`) only blocks an unbound client id while another principal's live
+- [ ] **L1 — Writer-id takeover while the victim is disconnected (Low).** `RoomCore.mayWrite`
+  (`server/src/room-core.ts`) only blocks an unbound client id while another principal's live
   connection announces it in awareness. Eve wrote with Bob's announced client id before Bob's
   first edit while Bob was offline; Bob's offline shape was then dropped silently (his
   connection stayed open, the room has no `B1`). PoC: `poc6-ledger-semantics.ts` (6b).

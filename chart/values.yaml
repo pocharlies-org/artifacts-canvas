@@ -102,7 +102,7 @@ limits:
   # Size caps (content + ledger per room; per message; pasted images). A full room must fit one
   # principal's share of the room memory budget (see "Memory" below): the server lowers these to
   # what the budget holds and warns at start ("memory sizing: ...") when the pod's memory is too
-  # small for them. The defaults fit the default 2Gi.
+  # small for them. The defaults fit the default 2304Mi.
   maxDocBytes: 5242880 # 5 MiB
   anonMaxDocBytes: 1310720 # 1.25 MiB
   maxMessageBytes: 4194304 # 4 MiB
@@ -171,11 +171,17 @@ limits:
   anonCpuTotalMsPerSec: 150
   anonCpuTotalBurstMs: 1500
   cpuShedMinBytes: 16384
-  # Cuts of items one update may make, and the Yjs time (ms) its cuts and placement may take by
-  # the server's estimate (fv8 P1/P2: one update of 200 000 cuts held the server for a minute and
-  # stored a room past every share). Over either, the sender is closed 4413.
+  # Cuts of items one update may make, and the Yjs time (ms) its cuts, placement, merges and
+  # deletes may take by the server's estimate (fv8 P1/P2: one update of 200 000 cuts held the
+  # server for a minute; fv9 A-C: runs and pairs of items that Yjs merges, deletes that make it
+  # merge). Over either, the sender is closed 4413. Since fv9 the update runs in its room's worker
+  # (see `worker`), so this bounds one message's worker time, not a stall of the server: honest
+  # deletes of thousands of shapes take Yjs 0.4-0.8 s, hence 1000 (it was 50).
   maxSplitsPerMessage: 5000
-  maxApplyMs: 50
+  maxApplyMs: 1000
+  # Client blocks (Yjs client ids) one update may carry (fv9 E: 20 000 of them made the guard's
+  # dependency check quadratic). An honest update carries one, a resync a few. Over it: 4413.
+  maxClientsPerUpdate: 256
   # Attribution of shapes deleted longer ago than this is pruned from the ledger.
   attributionRetentionDays: 30
   # Loaded-room memory budget in bytes (see "Memory" below). 0 = derived by the server from the
@@ -190,6 +196,31 @@ limits:
   # Optional key-space allowlist, e.g. ["runs/", "pub/"]. Empty = any structurally valid key.
   artifactPrefixes: []
   anonAllowedPrefixes: ["pub/"]
+
+# --- Room isolation (fv9) ---
+# Every loaded room runs in a worker thread of its own (its documents, the guard, the stamper, the
+# apply), with a V8 heap limit derived from the room budget (a room at its largest plus one message
+# being processed); the main thread only does HTTP/WebSocket, authorization, budgets, routing and
+# broadcast. It waits for each answer with a watchdog: a client message may take
+# messageTimeoutMs + timeoutNsPerByte per byte of it (its apply up to twice the guard's estimate
+# on top), an operation on the whole room opTimeoutMs + opNsPerByte per byte of the room. A worker
+# that misses it or runs out of its heap is terminated; the message's sender is closed (4413) and
+# struck, and the room is rebuilt in a fresh worker from its saved objects plus the log of every
+# change since (never the offending message), then every client is asked for what it holds.
+# strikes faults within strikeWindowMs refuse the principal's joins and writes for
+# strikeCooldownMs (1013); anonymous visitors also count per client IP (when clientIpHops says
+# where it is) and all together (anonPoolStrikes). applyConcurrency client messages are processed
+# at once over all rooms (the memory formula below reserves one message per slot).
+worker:
+  messageTimeoutMs: 250
+  timeoutNsPerByte: 1000
+  opTimeoutMs: 10000
+  opNsPerByte: 2000
+  applyConcurrency: 1
+  strikes: 3
+  strikeWindowMs: 600000
+  strikeCooldownMs: 600000
+  anonPoolStrikes: 10
 
 # --- Service ---
 service:
@@ -226,14 +257,25 @@ deployment:
 # Memory. The server keeps the rooms it has loaded under a budget it derives from the V8 heap
 # limit, so it is right for whatever nodeMaxOldSpaceMb is (server/src/config.ts, protocol §11):
 #
-#   heap limit   = nodeMaxOldSpaceMb + V8's young generation   (1536 -> 1560 MiB in the image
-#                                                               under the 2Gi limit, Node 22)
+#   heap limit   = nodeMaxOldSpaceMb + V8's young generation   (1728 -> 1776 MiB in the image,
+#                                                               node:22-alpine)
 #   room budget  = heap limit
 #                  - 192 MiB                          (Node runtime, libraries, the HTTP side)
 #                  - limits.wsOutgoingBudgetBytes     (bytes held for slow peers)
 #                  - 60 x limits.maxMessageBytes      (one max-size message being guarded and
-#                                                      applied: measured 51-53x, fv7 F2)
-#   loaded room  = 44 x (content + ledger) + 32 KiB   (measured 4x-39.5x by content kind, fv7 F2)
+#                    x worker.applyConcurrency         applied: measured 51-53x, fv7 F2)
+#   loaded room  = 44 x (content + ledger) + 16 MiB   (measured 4x-39.5x by content kind, fv7 F2;
+#                                                      16 MiB: the room's worker thread, fv9,
+#                                                      measured 15.7 MiB in the image)
+#
+# fv9: the rooms are no longer in the main thread's heap but in their workers' (nodeMaxOldSpaceMb
+# sizes the whole process: the main thread uses a few hundred MiB of it at most). Each worker's
+# heap limit is one user share (a room at the size cap fits it), or the stored room's cost when
+# that is more, plus 60 x maxMessageBytes: whatever a message makes Yjs allocate past that ends
+# the worker (ERR_WORKER_OUT_OF_MEMORY), never the process. With one apply slot, the process holds
+# at most: the loaded rooms (85% of the budget) + one worker's message headroom (a share +
+# 60 x maxMessageBytes) + the runtime and the outgoing budget: 925 + 603 + 192 + 256 = 1976 MiB
+# with the defaults, under the 2304 MiB limit.
 #
 # Each loaded room's cost is charged to the principal whose join loaded it, and what every update
 # adds to the principal that wrote it, in full (readers pay nothing; a charge stays while the room
@@ -242,35 +284,36 @@ deployment:
 # the loaded rooms past 80% of it, are refused with 1013 (the client retries; joins to loaded rooms
 # never are): the 5% between them is always left for loads. A principal may be charged at most
 # roomMemoryPrincipalShare (a third), an anonymous visitor a quarter of that, all anonymous
-# visitors together roomMemoryAnonShare (a third): one user and every anonymous visitor together
-# hold at most two thirds, and the rest can always load.
-# A room at the size cap must fit one share (44 x 1.25 x maxDocBytes + 32 KiB <= a third of the
+# visitors together roomMemoryAnonShare (a third) — for a room an anonymous visitor loads, the
+# anonymous pool pays its full cost even when the visitor is charged one share at most (fv9 F):
+# one user and every anonymous visitor together hold at most two thirds, and the rest can always
+# load.
+# A room at the size cap must fit one share (44 x 1.25 x maxDocBytes + 16 MiB <= a third of the
 # budget): the server lowers the caps to what fits, and the message and image caps with them,
 # with a warning at start; with a budget smaller than one full room it warns too.
-# Defaults: 1560 - 192 - 256 - 240 = 872 MiB of rooms (the server logs it at start and exports
+# Defaults: 1776 - 192 - 256 - 240 = 1088 MiB of rooms (the server logs it at start and exports
 # canvas_room_memory_budget_bytes and the shares as canvas_room_memory_share_bytes): a share of
-# 290 MiB holds one full 5 MiB room (220 MiB) and an anonymous visitor's 72 MiB one full 1.25 MiB
-# anonymous room; loads up to 741 MiB, growth up to 698 MiB. At 1Gi (nodeMaxOldSpaceMb 768, heap
-# limit 780 MiB in the image) the budget is 243 MiB and the caps are lowered to 1.48 MiB
-# (anonymous 0.37 MiB, messages with them), with a warning for each.
+# 363 MiB holds one full 5 MiB room (236 MiB with its worker) and an anonymous visitor's 91 MiB
+# one full 1.25 MiB anonymous room; loads up to 925 MiB, growth up to 870 MiB. fv9 raised the
+# default from 1536 / 2Gi: with a worker per room, 1536 would lower the anonymous cap to 1.07 MiB.
+# At 1Gi (nodeMaxOldSpaceMb 768) the caps are lowered, with a warning for each.
 #
 # Everything the formula subtracts adds up to the heap limit; what lives outside the V8 heap
-# (socket buffers, encoded frames, native code) needs the rest of the container:
+# (socket buffers, encoded frames, native code, the workers' stacks) needs the rest:
 #
-#   limits.memory >= nodeMaxOldSpaceMb / 0.75          (1536 / 0.75 = 2048 MiB = 2Gi)
+#   limits.memory >= nodeMaxOldSpaceMb / 0.75          (1728 / 0.75 = 2304 MiB)
 #
-# Change both together: the budget follows. Measured on the full system (fv7, 2 GiB and 1 GiB): one
-# user filling rooms while anonymous visitors or signed-in co-viewers sat in them, who then left,
-# is stopped at its share and a second user opens a new artifact; no OOM, no restart (before: that
-# user held 856 MiB of the 920 MiB budget and every new room was refused 1013 for everybody).
-nodeMaxOldSpaceMb: 1536
+# Change both together: the budget follows. CPU: the main thread and one room worker can be busy
+# at once (a worker on a message, up to its watchdog); with less than 2 CPUs the worker's time is
+# taken from the main thread's.
+nodeMaxOldSpaceMb: 1728
 resources:
   requests:
     cpu: 100m
     memory: 512Mi
   limits:
-    cpu: "1"
-    memory: 2Gi
+    cpu: "2"
+    memory: 2304Mi
 
 nodeSelector: {}
 tolerations: []
