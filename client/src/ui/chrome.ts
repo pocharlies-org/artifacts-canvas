@@ -11,9 +11,10 @@ import { geoOutline } from '../geometry/geo';
 import { polyPath } from '../render/shapeSvg';
 import { clear, h, installPopoverDismiss } from './dom';
 import { buildPresentation, startPresentation, stopPresentation } from './present';
+import type { VisibilityControl } from './visibility';
 
 /** Builds the panels of the approved mockup around the canvas and keeps them in sync. */
-export function buildChrome(ed: Editor, root: HTMLElement) {
+export function buildChrome(ed: Editor, root: HTMLElement, visibility?: VisibilityControl) {
   installPopoverDismiss();
   const toastEl = h('div', { class: 'toast', 'data-testid': 'toast', role: 'status' });
   root.append(toastEl);
@@ -33,7 +34,7 @@ export function buildChrome(ed: Editor, root: HTMLElement) {
 
   root.append(
     topLeft(ed),
-    topRight(ed),
+    topRight(ed, visibility),
     peoplePanel(ed),
     stylePanel(ed),
     bottomRow,
@@ -80,8 +81,12 @@ function topLeft(ed: Editor): HTMLElement {
 
 // ------------------------------------------------------------------ top right: avatars, follow, present, share, export
 
-function topRight(ed: Editor): HTMLElement {
+function topRight(ed: Editor, visibility?: VisibilityControl): HTMLElement {
   const avatars = h('div', { class: 'avatars', 'data-testid': 'avatars' });
+  // the canvas off: the artifact as the plain page, with a pill to bring the canvas back (ui/visibility.ts)
+  const hideBtn = h('button', { class: 'btn', 'data-testid': 'canvas-hide', title: t('canvas.hide'), 'aria-label': t('canvas.hide') },
+    h('span', { class: 'lbl-full' }, t('canvas.hide')), h('span', { class: 'lbl-short' }, t('canvas.hide.short')));
+  hideBtn.addEventListener('click', () => (visibility ? visibility.set(false, true) : ed.setCanvasVisible(false)));
   const followBtn = h('button', { class: 'btn', id: 'follow-btn', 'data-testid': 'follow' });
   const followMenu = h('div', { class: 'popover', 'data-owner': 'follow-btn', role: 'menu' });
   // the button says what presenting does: fullscreen with the laser, and the others follow
@@ -185,7 +190,7 @@ function topRight(ed: Editor): HTMLElement {
   ed.on('present', update);
   ed.on('identity', update);
   update();
-  return h('div', { class: 'panel topright' }, avatars,
+  return h('div', { class: 'panel topright' }, hideBtn, avatars,
     h('span', { class: 'anchor' }, followBtn, followMenu), presentBtn, shareBtn,
     h('span', { class: 'anchor' }, exportBtn, exportMenu));
 }

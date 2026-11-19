@@ -548,6 +548,9 @@ describe('http routes', () => {
     const html = await res.text();
     expect(html).toContain('id="artifacts-canvas-config"');
     expect(html).toContain('"artifactPath":"runs/w.html"');
+    // "Ver original": the plain artifact path on this host, the same the access-required page links to
+    const cfgJson = JSON.parse(/<script type="application\/json" id="artifacts-canvas-config">([^<]*)<\/script>/.exec(html)![1]);
+    expect(cfgJson.artifactUrl).toBe('/artifacts/runs/w.html');
     expect(res.headers.get('content-security-policy')).toContain("frame-ancestors 'self'");
     expect(res.headers.get('referrer-policy')).toBe('no-referrer');
     expect(res.headers.get('x-content-type-options')).toBe('nosniff');

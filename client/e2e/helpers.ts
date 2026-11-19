@@ -10,10 +10,15 @@ export function newRoom(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${roomCounter++}`;
 }
 
-/** Open the wrapper as `name` (dev identity) in its own browser context. */
-export async function open(browser: Browser, name: string, room: string, opts: { artifact?: string; viewport?: { width: number; height: number }; lang?: string; deviceScaleFactor?: number; prodCsp?: boolean; query?: Record<string, string>; mobile?: boolean; initScript?: string } = {}): Promise<Opened> {
+/**
+ * Open the wrapper as `name` (dev identity) in its own browser context. The canvas is shown
+ * (`?canvas=1`) unless `opts.query` sets `canvas` or `opts.firstVisit` asks for a visit with no
+ * query and no stored choice (a first visit opens the canvas hidden: src/ui/canvas-pref.ts).
+ */
+export async function open(browser: Browser, name: string, room: string, opts: { artifact?: string; viewport?: { width: number; height: number }; lang?: string; deviceScaleFactor?: number; prodCsp?: boolean; query?: Record<string, string>; mobile?: boolean; initScript?: string; firstVisit?: boolean; colorScheme?: 'light' | 'dark' } = {}): Promise<Opened> {
   const ctx = await browser.newContext({
     viewport: opts.viewport ?? { width: 1440, height: 900 }, deviceScaleFactor: opts.deviceScaleFactor, acceptDownloads: true,
+    ...(opts.colorScheme ? { colorScheme: opts.colorScheme } : {}),
     ...(opts.mobile ? { isMobile: true, hasTouch: true } : {}),
   });
   if (opts.initScript) await ctx.addInitScript(opts.initScript);
@@ -22,6 +27,7 @@ export async function open(browser: Browser, name: string, room: string, opts: {
   const q = new URLSearchParams({ room, as: name });
   if (opts.lang) q.set('lang', opts.lang);
   if (opts.prodCsp) q.set('csp', 'prod'); // the dev server then sends the production wrapper CSP
+  if (!opts.firstVisit && !opts.query?.present) q.set('canvas', '1');
   for (const [k, v] of Object.entries(opts.query ?? {})) q.set(k, v);
   await page.goto(`/_canvas/${opts.artifact ?? 'sample-report.html'}?${q}`);
   await ready(page);

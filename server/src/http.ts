@@ -292,6 +292,8 @@ export class HttpApp {
         maxImageBytes: anon ? cfg.anonMaxImageBytes : cfg.maxImageBytes,
         // fv8 U1: the editor says the canvas is full before the server would refuse it
         maxDocBytes: anon ? cfg.anonMaxDocBytes : cfg.maxDocBytes,
+        // "Ver original": the plain artifact on this host (the link the access-required page gives too)
+        artifactUrl: this.plainArtifactPath(key),
       });
     }
     res.statusCode = 200;
@@ -344,11 +346,16 @@ export class HttpApp {
    * browser read", by default https://<publicHost>/<bucket>) plus the key.
    */
   private accessRequired(req: IncomingMessage, res: ServerResponse, key: string, lang: 'es' | 'en'): void {
-    const base = new URL(this.deps.cfg.artifactBaseUrl).pathname.replace(/\/+$/, '');
-    const link = `${base}/${key.split('/').map(encodeURIComponent).join('/')}`;
+    const link = this.plainArtifactPath(key);
     res.statusCode = 403;
     for (const [k, v] of Object.entries(ACCESS_HEADERS)) res.setHeader(k, v);
     res.end(req.method === 'HEAD' ? undefined : accessRequiredPage(link, lang));
+  }
+
+  /** The plain artifact URL on this host, path only: the path of ARTIFACT_BASE_URL plus the key. */
+  private plainArtifactPath(key: string): string {
+    const base = new URL(this.deps.cfg.artifactBaseUrl).pathname.replace(/\/+$/, '');
+    return `${base}/${key.split('/').map(encodeURIComponent).join('/')}`;
   }
 
   private generic(res: ServerResponse, status: number): void {

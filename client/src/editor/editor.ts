@@ -14,6 +14,7 @@ import {
 import type { Notice } from '../collab/protocol';
 import { ArtifactFrame, type FrameWheel } from '../artifact/frame';
 import { canvasUrl, classifyLink, linkContext, type LinkContext } from '../artifact/links';
+import { DEFAULT_BOARD, isDark, opaque, toCss, type Rgba } from '../ui/theme';
 import { Renderer } from '../render/renderer';
 import {
   type Camera, clampZoom, fitBox, matchViewport, nextZoomStep, screenToWorld, visibleWorld, worldToScreen, zoomAt,
@@ -27,7 +28,7 @@ import { Overlay } from '../render/overlay';
 import { t } from '../i18n';
 import { own } from '../model/colors';
 
-export type Topic = 'camera' | 'selection' | 'tool' | 'style' | 'presence' | 'doc' | 'status' | 'identity' | 'visibility' | 'follow' | 'present' | 'history' | 'notice';
+export type Topic = 'camera' | 'selection' | 'tool' | 'style' | 'presence' | 'doc' | 'status' | 'identity' | 'visibility' | 'follow' | 'present' | 'canvas' | 'theme' | 'history' | 'notice';
 
 export interface EditorDom {
   stage: HTMLElement;
@@ -86,6 +87,18 @@ export class Editor {
   private publishedStatus: string | null = null;
   /** Where a click on a link of the artifact leads (artifact/links.ts). */
   readonly links: LinkContext;
+  /**
+   * The canvas is hidden (ui/visibility.ts): the artifact shows as the plain page (full view,
+   * its own scrolling, links work), no annotations, no chrome, and nothing of this tab's
+   * pointer goes to the others. The connection stays, so the annotation count stays live.
+   */
+  hidden = false;
+  private cameraBeforeHiding: Camera | null = null;
+  /** The artifact's background, as the board shows it (opaque), and whether it is dark. */
+  board: Rgba = DEFAULT_BOARD;
+  dark = false;
+  /** The user picked a colour: the default stroke colour no longer follows the board. */
+  private colorChosen = false;
   /** Local laser trail (published through awareness, never stored). */
   laser: LaserPoint[] = [];
   /** Receive time of each peer's laser state (for fading). */
@@ -121,7 +134,7 @@ export class Editor {
     this.frame = new ArtifactFrame(this.page, cfg.frameUrl, this.pageWidth, this.pageHeight, cfg.vendorUrl, {
       size: (_w, h) => {
         this.pageHeight = h;
-        this.page.style.height = `${h}px`;
+        if (!this.hidden) this.page.style.height = `${h}px`;
         this.emit('camera');
       },
       title: () => this.emit('status'),
@@ -138,8 +151,9 @@ export class Editor {
         if (this.tool === 'interact' && this.frame.hovered) this.wheelFromFrame(w);
       },
       escape: () => {
-        if (this.tool === 'interact' && this.focusInFrame()) this.escape();
+        if (this.tool === 'interact' && !this.hidden && this.focusInFrame()) this.escape();
       },
+      background: (c) => this.applyBackground(c),
     });
     const prefix = (() => {
       const base = (import.meta.env?.BASE_URL as string | undefined) ?? '/_canvas/_/';
@@ -268,6 +282,12 @@ export class Editor {
 
   publishPresence(patch: Partial<PresenceState>, immediate = false) {
     if (!this.conn) return;
+    if (this.hidden) {
+      // a hidden canvas is quiet: no cursor, viewport, laser, status or presentation for the others
+      patch = { ...patch };
+      for (const k of ['cursor', 'viewport', 'laser', 'status'] as const) if (k in patch) patch[k] = null;
+      if ('presenting' in patch) patch.presenting = false;
+    }
     if ('status' in patch) this.publishedStatus = patch.status ?? null;
     Object.assign(this.pendingPresence, patch);
     this.presencePace.schedule(() => this.flushPresence());
@@ -354,7 +374,7 @@ export class Editor {
   }
 
   private applyFollow() {
-    if (!this.conn) return;
+    if (!this.conn || this.hidden) return;
     const target = targetPeer(this.fstate, this.followPeers(), this.selfClientId());
     if (!target) return;
     const vp = peers(this.conn.awareness).find((p) => p.clientId === target.clientId)?.state.viewport;
@@ -370,6 +390,7 @@ export class Editor {
    */
   setPresenting(on: boolean) {
     if (on === this.fstate.presenting) return;
+    if (on && this.hidden) this.setCanvasVisible(true);
     if (on) {
       this.toolBeforePresenting = { tool: this.tool, geo: this.geoKind };
       this.setFollowState(startPresenting(this.fstate));
@@ -419,7 +440,91 @@ export class Editor {
       this.frameClickUntil = 0;
       return true;
     }
-    return this.tool === 'interact' && this.focusInFrame();
+    return (this.tool === 'interact' || this.hidden) && this.focusInFrame();
+  }
+
+  // ------------------------------------------------------------------ canvas shown / hidden
+
+  /** Show the canvas (the full editor) or hide it (the artifact as the plain page). */
+  setCanvasVisible(visible: boolean) {
+    if (visible === !this.hidden) return;
+    if (!visible) {
+      if (this.presenting) this.setPresenting(false);
+      if (this.editingId) this.stopEditing();
+      this.activeTool.cancel?.();
+      this.clearSelection();
+      this.hideHover();
+      this.setLaserPointer(null);
+      this.laser = [];
+      this.cameraBeforeHiding = { ...this.camera };
+      this.hidden = true;
+      // what the others had of this tab goes away (publishPresence keeps it quiet from now on)
+      this.publishPresence({ cursor: null, viewport: null, laser: null, status: null }, true);
+      this.frame.setInteractive(true);
+      this.layoutHidden();
+    } else {
+      this.hidden = false;
+      this.page.style.width = `${this.pageWidth}px`;
+      this.page.style.height = `${this.pageHeight}px`;
+      this.frame.setNative(false);
+      this.frame.setInteractive(this.tool === 'interact');
+      const cam = this.cameraBeforeHiding;
+      this.cameraBeforeHiding = null;
+      if (cam && this.initialCameraSet) this.setCamera(cam, 'system');
+      else this.resetCamera();
+      this.publishPresence({ status: this.tool === 'laser' ? 'cursor.laser' : null, viewport: this.visibleWorld() });
+      if (this.fstate.target) this.applyFollow();
+    }
+    this.emit('canvas');
+    this.emit('camera');
+  }
+
+  /** Hidden: the frame takes the whole view at scale 1, and the page scrolls on its own. */
+  private layoutHidden() {
+    this.page.style.width = `${this.viewW}px`;
+    this.page.style.height = `${this.viewH}px`;
+    this.frame.setNative(true, this.viewW, this.viewH);
+    this.camera = { tx: 0, ty: 0, z: 1 };
+    this.world.style.transform = 'translate(0px, 0px) scale(1)';
+  }
+
+  /** Annotations in the room (the hidden canvas's badge). */
+  annotationCount(): number {
+    return this.doc.all().length;
+  }
+
+  /** Other people with the canvas shown (their viewport is in their presence), by person. */
+  othersDrawing(): number {
+    if (!this.conn) return 0;
+    const ids = new Set<string>();
+    for (const p of peers(this.conn.awareness)) {
+      const u = p.state.user;
+      if (u && u.id !== this.me?.id && p.state.viewport) ids.add(u.id);
+    }
+    return ids.size;
+  }
+
+  // ------------------------------------------------------------------ the artifact's background
+
+  /**
+   * The board takes the artifact's background (ui/theme.ts), so the area around and beyond the
+   * page is the page's own colour. On a dark one the chrome goes dark and the default stroke
+   * colour is white, unless the user picked a colour.
+   */
+  private applyBackground(c: Rgba) {
+    this.board = opaque(c);
+    const dark = isDark(c);
+    document.documentElement.style.setProperty('--board', toCss(c));
+    document.body.classList.toggle('theme-dark', dark);
+    if (dark !== this.dark) {
+      this.dark = dark;
+      const color = dark ? 'white' : 'black';
+      if (!this.colorChosen && (this.style.color === 'black' || this.style.color === 'white') && this.style.color !== color) {
+        this.style = { ...this.style, color };
+        this.emit('style');
+      }
+    }
+    this.emit('theme');
   }
 
   private focusInFrame(): boolean {
@@ -499,7 +604,8 @@ export class Editor {
         this.initialCameraSet = true;
         this.resetCamera();
       }
-    } else if (this.followingUserId) this.applyFollow();
+    } else if (this.hidden) this.layoutHidden();
+    else if (this.followingUserId) this.applyFollow();
     // fullscreen on or off, a phone turned: the page fills the new width, the same line at the top
     else if (this.presenting && r.width > 0) this.fitForPresentation();
     this.emit('camera');
@@ -507,6 +613,10 @@ export class Editor {
 
   /** Initial camera: the artifact page at the top, as wide as fits (100% on a desktop). */
   resetCamera() {
+    if (this.hidden) {
+      this.layoutHidden();
+      return;
+    }
     if (this.presenting) {
       this.fitForPresentation();
       return;
@@ -531,9 +641,11 @@ export class Editor {
     const w = this.doc.pageWidth(this.cfg.pageWidth);
     if (w === this.pageWidth) return;
     this.pageWidth = w;
-    this.page.style.width = `${w}px`;
     this.frame.width = w;
-    this.frame.el.style.width = `${w}px`;
+    if (!this.hidden) {
+      this.page.style.width = `${w}px`;
+      this.frame.el.style.width = `${w}px`;
+    }
     this.resetCamera();
   }
 
@@ -647,6 +759,7 @@ export class Editor {
 
   /** Change the style for the next shape and for the selected shapes. */
   applyStyle(patch: Partial<Style>) {
+    if (patch.color) this.colorChosen = true;
     this.style = { ...this.style, ...patch };
     const ids = this.selected().filter((s) => !s.locked).map((s) => s.id);
     if (ids.length && !this.readOnly) {
@@ -781,7 +894,7 @@ export class Editor {
     this.stage.dataset.tool = id;
     // a cursor the select tool set (move, a resize arrow, a link's pointer) must not hide the new tool's
     this.stage.dataset.cursor = '';
-    this.frame.setInteractive(id === 'interact');
+    this.frame.setInteractive(id === 'interact' || this.hidden);
     if (id !== 'laser') this.setLaserPointer(null);
     // the others see a laser dot instead of an arrow for this cursor
     const status = id === 'laser' ? 'cursor.laser' : null;
@@ -1204,6 +1317,7 @@ export class Editor {
       if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
     });
     st.addEventListener('drop', (e) => {
+      if (this.hidden) return;
       const files = Array.from(e.dataTransfer?.files ?? []).filter((f) => f.type.startsWith('image/'));
       if (!files.length) return;
       e.preventDefault();
@@ -1211,7 +1325,7 @@ export class Editor {
       files.forEach((f, i) => void this.insertImageFile(f, { x: at.x + i * 24, y: at.y + i * 24 }));
     });
     window.addEventListener('paste', (e) => {
-      if (isTyping(e.target)) return;
+      if (isTyping(e.target) || this.hidden) return;
       const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith('image/'));
       if (files.length) {
         e.preventDefault();
@@ -1221,12 +1335,12 @@ export class Editor {
       if (this.paste()) e.preventDefault();
     });
     window.addEventListener('copy', (e) => {
-      if (isTyping(e.target) || !this.selection.size) return;
+      if (isTyping(e.target) || !this.selection.size || this.hidden) return;
       this.copy();
       e.preventDefault();
     });
     window.addEventListener('cut', (e) => {
-      if (isTyping(e.target) || !this.selection.size) return;
+      if (isTyping(e.target) || !this.selection.size || this.hidden) return;
       this.copy();
       this.deleteSelection();
       e.preventDefault();
@@ -1263,7 +1377,8 @@ export class Editor {
   }
 
   private onKeyDown(e: KeyboardEvent) {
-    if (isTyping(e.target)) return;
+    // a hidden canvas takes no shortcut: the page is the plain artifact
+    if (isTyping(e.target) || this.hidden) return;
     const mod = e.metaKey || e.ctrlKey;
     const k = e.key.toLowerCase();
     if (e.code === 'Space') {

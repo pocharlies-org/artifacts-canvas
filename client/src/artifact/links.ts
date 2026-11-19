@@ -88,12 +88,12 @@ function canvasKey(rest: string): LinkAction {
   return key ? { kind: 'canvas', key } : { kind: 'blocked', reason: 'invalid' };
 }
 
-/** Query parameters a canvas page hands to the next one. */
-const KEEP = ['lang'];
+/** Query parameters a canvas page hands to the next one (`canvas`: a forced shown/hidden stays forced). */
+const KEEP = ['lang', 'canvas'];
 const KEEP_DEV = ['as', 'room', 'csp'];
 
 /**
- * The canvas URL (path and query, same origin) of `key`: `lang` (and the development
+ * The canvas URL (path and query, same origin) of `key`: `lang`, `canvas` (and the development
  * parameters) are kept, `present=1` is added while presenting.
  */
 export function canvasUrl(key: string, ctx: LinkContext, current: URLSearchParams, opts: { presenting: boolean; dev: boolean }): string {

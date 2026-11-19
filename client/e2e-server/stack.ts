@@ -201,7 +201,8 @@ export async function openAs(
   page.on('console', (m) => {
     if (m.type() === 'error' || m.type() === 'warning') console.log(`[e2e-server] console.${m.type()}`, m.text());
   });
-  const res = await page.goto(`${stack.serverUrl}/_canvas/${key.split('/').map(encodeURIComponent).join('/')}`);
+  // ?canvas=1: the canvas shown (a first visit opens it hidden: src/ui/canvas-pref.ts)
+  const res = await page.goto(`${stack.serverUrl}/_canvas/${key.split('/').map(encodeURIComponent).join('/')}?canvas=1`);
   if (!res?.ok()) throw new Error(`wrapper ${res?.status()} for ${key}: ${await res?.text().catch(() => '')}`);
   await page.waitForFunction(() => {
     const c = (window as any).__canvas;

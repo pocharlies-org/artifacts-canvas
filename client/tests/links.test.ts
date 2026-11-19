@@ -104,6 +104,10 @@ describe('canvas URL of a link', () => {
     expect(canvasUrl('u/run-1/page two.html', ctx, new URLSearchParams(), { presenting: false, dev: false })).toBe('/_canvas/artifacts/u/run-1/page%20two.html');
   });
 
+  it('a forced canvas visibility stays forced on the next page', () => {
+    expect(canvasUrl('u/x.html', ctx, new URLSearchParams('canvas=0'), { presenting: false, dev: false })).toBe('/_canvas/artifacts/u/x.html?canvas=0');
+  });
+
   it('development keeps the dev identity and room, never ?artifact=', () => {
     const q = new URLSearchParams('as=Ana&room=r1&artifact=x.html&pageWidth=500&csp=prod');
     expect(canvasUrl('links-b.html', plain, q, { presenting: true, dev: true })).toBe('/_canvas/links-b.html?as=Ana&room=r1&csp=prod&present=1');

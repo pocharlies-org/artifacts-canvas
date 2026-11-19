@@ -31,6 +31,8 @@ export interface CanvasConfig {
   maxImageBytes: number;
   /** The room's size cap for this visitor (MAX_DOC_BYTES / ANON_MAX_DOC_BYTES): the editor says the canvas is full before it (fv8 U1). */
   maxDocBytes: number;
+  /** Path of the plain artifact on this host (the server's ARTIFACT_BASE_URL path + key), for "Ver original". */
+  artifactUrl?: string | null;
 }
 
 export const DEFAULT_PREFIX = '/_canvas/';

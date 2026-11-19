@@ -1,5 +1,6 @@
 import type { Box } from '../geometry/vec';
 import { MAX_LINK_LENGTH } from './links';
+import { parseColor, type Rgba } from '../ui/theme';
 
 /**
  * The artifact, rendered in a sandboxed iframe (`sandbox="allow-scripts"`, never
@@ -55,6 +56,8 @@ export interface FrameEvents {
   wheel?: (w: FrameWheel) => void;
   /** Escape pressed inside the artifact. */
   escape?: () => void;
+  /** The artifact's background colour (checked: rgb(), rgba() or hex only). */
+  background?: (c: Rgba) => void;
 }
 
 /** Most a wheel delta may say (one event); anything bigger is clamped. */
@@ -69,6 +72,14 @@ export class ArtifactFrame {
   loaded = false;
   /** The pointer is over the frame (it only gets the pointer with the interact tool). */
   hovered = false;
+  /** The artifact's background colour, once the reporter has said it. */
+  background: Rgba | null = null;
+  /**
+   * Native mode (the canvas hidden): the frame fills the view and the page scrolls on its own,
+   * as the plain artifact does. Otherwise it is laid out at the page width and full height.
+   */
+  native = false;
+  private modeSent = false;
   private pending = new Map<string, (snap: FrameSnapshot | null) => void>();
   private growthStreak = 0;
   private probes = new Map<string, (link: boolean) => void>();
@@ -90,6 +101,8 @@ export class ArtifactFrame {
     f.src = src;
     f.addEventListener('load', () => {
       this.loaded = true;
+      this.modeSent = false;
+      this.sendMode();
     });
     f.addEventListener('pointerenter', () => {
       this.hovered = true;
@@ -108,7 +121,18 @@ export class ArtifactFrame {
     if (e.origin !== 'null') return;
     const d = e.data as Record<string, unknown> | null;
     if (!d || typeof d !== 'object' || d.source !== REPORTER_SOURCE) return;
+    // the reporter starts in canvas mode: tell it the mode as soon as it speaks
+    if (!this.modeSent) this.sendMode();
     switch (d.type) {
+      case 'bg': {
+        const c = parseColor(d.color);
+        if (!c) return;
+        const b = this.background;
+        if (b && b.r === c.r && b.g === c.g && b.b === c.b && b.a === c.a) return;
+        this.background = c;
+        this.ev.background?.(c);
+        return;
+      }
       case 'link':
         if (typeof d.href === 'string' && d.href.length <= MAX_LINK_LENGTH && typeof d.newTab === 'boolean') this.ev.link?.(d.href, d.newTab);
         return;
@@ -143,7 +167,8 @@ export class ArtifactFrame {
         else this.growthStreak = 0;
         if (this.growthStreak > 20) return;
         this.height = nh;
-        this.el.style.height = `${nh}px`;
+        // native mode: the page scrolls inside a frame the size of the view; only its height is noted
+        if (!this.native) this.el.style.height = `${nh}px`;
         this.ev.size?.(this.width, nh);
         return;
       }
@@ -204,6 +229,31 @@ export class ArtifactFrame {
   /** Follow the link of the artifact at (x, y) artifact px, if there is one (the select tool's click). */
   clickAt(x: number, y: number, newTab: boolean) {
     this.el.contentWindow?.postMessage({ source: 'artifacts-canvas', type: 'click', x, y, newTab }, '*');
+  }
+
+  /**
+   * Native mode on (the frame takes `w` x `h`, the view, and the page scrolls itself) or off
+   * (the page width, its full height, no scrolling: the canvas pans it).
+   */
+  setNative(on: boolean, w = 0, h = 0) {
+    this.native = on;
+    // the frame scrolls only in native mode (the canvas pans it otherwise)
+    this.el.setAttribute('scrolling', on ? 'auto' : 'no');
+    if (on) {
+      this.el.style.width = `${w}px`;
+      this.el.style.height = `${h}px`;
+    } else {
+      this.el.style.width = `${this.width}px`;
+      this.el.style.height = `${this.height}px`;
+    }
+    this.sendMode();
+  }
+
+  private sendMode() {
+    const win = this.el.contentWindow;
+    if (!win) return;
+    this.modeSent = true;
+    win.postMessage({ source: 'artifacts-canvas', type: 'mode', native: this.native }, '*');
   }
 
   /** With the interact tool the frame takes the pointer (links, buttons, inner scrolling). */

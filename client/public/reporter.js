@@ -10,7 +10,11 @@
  *     navigating on a link click and tells the parent which URL was clicked (the parent decides
  *     what opens: docs/protocol.md §3 "Links"), scrolls to same-document anchors through the
  *     parent, and hands the parent the wheel that no element of the page scrolls,
- *   - on the parent's request, says whether there is a link under a point, or follows it.
+ *   - on the parent's request, says whether there is a link under a point, or follows it,
+ *   - posts the page's background colour (html, else body, else white) when it changes, so the
+ *     canvas board can follow it (a theme toggle included),
+ *   - in "native" mode (the canvas hidden: the page is shown as itself) lets the page scroll on
+ *     its own, as the plain artifact does.
  * It reads no cookies or storage (it has none) and sends nothing anywhere else.
  * Copyright 2026 Daniel Ibáñez. Licensed under the Apache License, Version 2.0.
  */
@@ -46,22 +50,97 @@
     if (document.title) post({ type: 'title', title: String(document.title).slice(0, 200) });
   }
 
+  // The canvas lays the page out at its full height and pans it: the page itself must not scroll.
+  // In native mode (canvas hidden) the page scrolls as the plain artifact does.
+  var noScroll = document.createElement('style');
+  noScroll.textContent = 'html,body{overflow:hidden !important;scrollbar-width:none}';
+  var native = false;
+  var started = false;
+
+  function setNative(on) {
+    native = !!on;
+    if (!started) return;
+    if (native) {
+      if (noScroll.parentNode) noScroll.parentNode.removeChild(noScroll);
+    } else if (!noScroll.parentNode) {
+      (document.head || document.documentElement).appendChild(noScroll);
+      window.scrollTo(0, 0);
+    }
+    lastH = -1;
+    reportSize();
+  }
+
   function start() {
-    var style = document.createElement('style');
-    style.textContent = 'html,body{overflow:hidden !important;scrollbar-width:none}';
-    (document.head || document.documentElement).appendChild(style);
+    started = true;
+    if (!native) (document.head || document.documentElement).appendChild(noScroll);
     reportTitle();
     reportSize();
+    checkBg();
     if (window.ResizeObserver) {
       var ro = new ResizeObserver(reportSize);
       ro.observe(document.documentElement);
       if (document.body) ro.observe(document.body);
     }
-    if (window.MutationObserver) new MutationObserver(reportSize).observe(document.documentElement, { childList: true, subtree: true, attributes: true });
-    setInterval(reportSize, 1000);
+    if (window.MutationObserver) {
+      new MutationObserver(function () { reportSize(); checkBg(); }).observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+    }
+    try {
+      var mq = window.matchMedia('(prefers-color-scheme: dark)');
+      if (mq.addEventListener) mq.addEventListener('change', checkBg);
+      else if (mq.addListener) mq.addListener(checkBg);
+    } catch (e) { /* ignore */ }
+    // also catches a background that changes by a CSS transition or a late stylesheet
+    setInterval(function () { reportSize(); checkBg(); }, 1000);
+  }
+
+  // ---- background colour: html's, else body's, else white; posted only when it changes ----
+  var lastBg = null;
+  var bgTimer = 0;
+  var bgAt = 0;
+  var BG_EVERY = 250; // at most 4 checks a second
+  function clear(c) {
+    return !c || c === 'transparent' || /^rgba\(.*,\s*0(\.0+)?\s*\)$/.test(c) || /\/\s*0(\.0+)?%?\s*\)$/.test(c);
+  }
+  /** A colour in rgb()/rgba() (what computed styles give); other forms go through a 1x1 canvas. */
+  function rgbOf(c) {
+    if (/^rgba?\(/.test(c)) return c;
+    try {
+      var cv = document.createElement('canvas');
+      cv.width = cv.height = 1;
+      var g = cv.getContext('2d');
+      g.fillStyle = '#ffffff';
+      g.fillStyle = c;
+      g.fillRect(0, 0, 1, 1);
+      var d = g.getImageData(0, 0, 1, 1).data;
+      return 'rgba(' + d[0] + ', ' + d[1] + ', ' + d[2] + ', ' + Math.round((d[3] / 255) * 1000) / 1000 + ')';
+    } catch (e) {
+      return 'rgb(255, 255, 255)';
+    }
+  }
+  function effectiveBg() {
+    var c = '';
+    try {
+      c = window.getComputedStyle(document.documentElement).backgroundColor;
+      if (clear(c) && document.body) c = window.getComputedStyle(document.body).backgroundColor;
+    } catch (e) { c = ''; }
+    return clear(c) ? 'rgb(255, 255, 255)' : rgbOf(c);
+  }
+  function checkBg() {
+    if (bgTimer) return;
+    var wait = Math.max(0, bgAt + BG_EVERY - Date.now());
+    bgTimer = setTimeout(function () {
+      bgTimer = 0;
+      bgAt = Date.now();
+      var c = effectiveBg();
+      if (c !== lastBg) {
+        lastBg = c;
+        post({ type: 'bg', color: c.slice(0, 64) });
+      }
+    }, wait);
   }
 
   window.addEventListener('scroll', function () {
+    if (native) return; // the page scrolls itself
     var x = window.scrollX || 0;
     var y = window.scrollY || 0;
     if (x || y) {
@@ -227,6 +306,7 @@
     var href = ln.url.href;
     if (ln.url.protocol === 'javascript:') return false;
     if ((ln.url.protocol === 'http:' || ln.url.protocol === 'https:') && href.indexOf('#') >= 0 && base(href) === base(location.href) && !newTab) {
+      if (native) return false; // the page scrolls to it itself
       var p = anchorTarget(ln.url.hash || '#');
       if (p) post({ type: 'anchor', x: p.x, y: p.y });
       return true;
@@ -263,7 +343,7 @@
   }
 
   window.addEventListener('wheel', function (e) {
-    if (e.defaultPrevented) return; // the page's own widget took it
+    if (native || e.defaultPrevented) return; // the page scrolls itself, or its own widget took it
     var zoom = e.ctrlKey || e.metaKey;
     if (!zoom && scrollsInside(e.target, e.deltaX, e.deltaY)) return;
     e.preventDefault();
@@ -278,6 +358,10 @@
   window.addEventListener('message', function (e) {
     if (e.source !== parentWin) return;
     var d = e.data;
+    if (d && d.source === 'artifacts-canvas' && d.type === 'mode') {
+      setNative(d.native === true);
+      return;
+    }
     if (!d || d.source !== 'artifacts-canvas' || (d.type !== 'probe' && d.type !== 'click')) return;
     var x = Number(d.x);
     var y = Number(d.y);
@@ -291,5 +375,5 @@
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
   else start();
-  window.addEventListener('load', function () { reportTitle(); reportSize(); });
+  window.addEventListener('load', function () { reportTitle(); reportSize(); checkBg(); });
 })();

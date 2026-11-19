@@ -6,14 +6,16 @@
   --bg: #e9ebef;
   --blue: #2563eb;
   --red: #e03131;
+  /* the artifact's own background (the reporter says it; ui/theme.ts): the board takes it */
+  --board: #ffffff;
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; color: var(--ink); background: var(--bg); overscroll-behavior: none; }
+html, body { margin: 0; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; color: var(--ink); background: var(--board); overscroll-behavior: none; }
 #app { position: fixed; inset: 0; }
 button { font: inherit; color: inherit; }
 
 /* ---------- stage: the artifact page + the shared canvas ---------- */
-.stage { position: absolute; inset: 0; overflow: hidden; background: var(--bg); touch-action: none; user-select: none; -webkit-user-select: none; cursor: default; }
+.stage { position: absolute; inset: 0; overflow: hidden; background: var(--board); touch-action: none; user-select: none; -webkit-user-select: none; cursor: default; }
 .stage[data-tool="draw"], .stage[data-tool="highlight"], .stage[data-tool="arrow"], .stage[data-tool="line"],
 .stage[data-tool="geo"], .stage[data-tool="frame"], .stage[data-tool="note"] { cursor: crosshair; }
 .stage[data-tool="text"] { cursor: text; }
@@ -30,8 +32,8 @@ button { font: inherit; color: inherit; }
 .stage[data-cursor="ns-resize"] { cursor: ns-resize; }
 .stage[data-cursor="ew-resize"] { cursor: ew-resize; }
 .world { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
-.page { position: absolute; left: 0; top: 0; background: #fff; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow: hidden; }
-.artifact-frame { display: block; border: 0; background: #fff; pointer-events: none; }
+.page { position: absolute; left: 0; top: 0; background: var(--board); border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow: hidden; }
+.artifact-frame { display: block; border: 0; background: var(--board); pointer-events: none; }
 /* the interact tool: the artifact takes the pointer (links, buttons, inner scrolling) */
 .artifact-frame.interactive { pointer-events: auto; }
 svg.shapes { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
@@ -158,6 +160,53 @@ body.present-mode .topleft, body.present-mode .topright, body.present-mode .side
 .present-controls .tool.on { background: #ff2d55; color: #fff; }
 .present-controls .sep { background: rgba(255,255,255,.25); }
 .present-controls .exit { font-size: 16px; }
+
+/* ---------- canvas hidden: the artifact as the plain page, and a small pill ---------- */
+body.canvas-hidden .topleft, body.canvas-hidden .topright, body.canvas-hidden .side, body.canvas-hidden .bottomrow,
+body.canvas-hidden .banner, body.canvas-hidden .present-ui { display: none !important; }
+body.canvas-hidden svg.shapes, body.canvas-hidden svg.overlay, body.canvas-hidden .cursors, body.canvas-hidden .hovercard,
+body.canvas-hidden .laser-pointer, body.canvas-hidden .text-editor { display: none !important; }
+body.canvas-hidden .page { border-radius: 0; box-shadow: none; }
+.quiet-bar { display: none; }
+body.canvas-hidden .quiet-bar { display: flex; position: fixed; right: 12px; bottom: 12px; z-index: 40; align-items: center; gap: 8px; padding: 4px; border-radius: 999px; background: rgba(255,255,255,.92); box-shadow: 0 2px 12px rgba(0,0,0,.18); font-size: 12.5px; }
+.quiet-pill { border: 0; border-radius: 999px; padding: 6px 12px; background: var(--blue); color: #fff; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.quiet-people { display: inline-flex; align-items: center; gap: 5px; color: #374151; white-space: nowrap; }
+.quiet-people::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #16a34a; }
+.quiet-people[hidden] { display: none; }
+.quiet-link { color: #374151; padding: 0 10px 0 2px; white-space: nowrap; }
+
+/* ---------- dark artifacts: dark chrome (body.theme-dark, from the artifact's background) ---------- */
+body.theme-dark { --ink: #e5e7eb; --muted: #9ca3af; --line: #374151; --panel: #1f2937; }
+body.theme-dark .panel { box-shadow: 0 2px 12px rgba(0,0,0,.55); border: 1px solid #374151; }
+body.theme-dark .page { box-shadow: none; }
+body.theme-dark .pill { background: #374151; color: #e5e7eb; }
+body.theme-dark .pill.live { background: #7f1d1d; color: #fecaca; }
+body.theme-dark .pill.off { background: #374151; color: #9ca3af; }
+body.theme-dark .btn { background: #111827; color: #e5e7eb; border-color: #4b5563; }
+body.theme-dark .btn.primary { background: var(--blue); color: #fff; border-color: var(--blue); }
+body.theme-dark .btn.primary.on { background: #b91c1c; border-color: #b91c1c; }
+body.theme-dark .btn.on { background: #1e3a8a; color: #bfdbfe; border-color: #1d4ed8; }
+body.theme-dark .popover { background: #1f2937; box-shadow: 0 6px 24px rgba(0,0,0,.6); }
+body.theme-dark .menu-item:hover { background: #374151; }
+body.theme-dark .tool { color: #d1d5db; }
+body.theme-dark .tool:hover { background: #374151; }
+body.theme-dark .tool.on { background: #1e3a8a; color: #93c5fd; }
+body.theme-dark .tool .k { color: #6b7280; }
+body.theme-dark .tool[data-tip]:hover::after { background: #f3f4f6; color: #111827; }
+body.theme-dark .tb-nav.prev { background: linear-gradient(to right, var(--panel) 55%, rgba(31,41,55,0)); color: #93c5fd; }
+body.theme-dark .tb-nav.next { background: linear-gradient(to left, var(--panel) 55%, rgba(31,41,55,0)); color: #93c5fd; }
+body.theme-dark .seg button { color: #d1d5db; }
+body.theme-dark .seg button.on { background: #1e3a8a; color: #bfdbfe; }
+body.theme-dark .sw.on { outline-color: #e5e7eb; }
+body.theme-dark .av { border-color: #1f2937; }
+body.theme-dark .prow { border-bottom-color: #374151; }
+body.theme-dark .history { color: #d1d5db; }
+body.theme-dark .mini { background: #111827; }
+body.theme-dark .banner { background: #374151; border: 1px solid #4b5563; }
+body.theme-dark .toast { background: #f3f4f6; color: #111827; }
+body.theme-dark .present-badge, body.theme-dark .present-controls { border: 1px solid rgba(255,255,255,.18); }
+body.theme-dark.canvas-hidden .quiet-bar { background: rgba(31,41,55,.94); box-shadow: 0 2px 12px rgba(0,0,0,.6); border: 1px solid #4b5563; }
+body.theme-dark .quiet-people, body.theme-dark .quiet-link { color: #e5e7eb; }
 
 /* ---------- narrow screens (phones) ---------- */
 @media (max-width: 760px) {
