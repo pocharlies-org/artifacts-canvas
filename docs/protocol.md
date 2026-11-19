@@ -35,7 +35,12 @@ credentials (§7), and MUST answer exactly like the gate would for a denied arti
 otherwise (no existence leak). One exception mirrors the gate: when `LOGIN_URL` is set and
 the gate answers `unauthenticated` (no session; not a bearer caller), the **wrapper** answers
 `302` to `LOGIN_URL` with `{rd}` = the URL-encoded original path, so a visitor who opens a
-canvas link first logs in and comes back. Frame and ws never redirect.
+canvas link first logs in and comes back. Frame and ws never redirect. A visitor the gate refuses
+otherwise gets, on the **wrapper**, a `403` HTML page ("Acceso necesario" / "Access required",
+`?lang=en`) that links to the plain artifact URL (the path of `ARTIFACT_BASE_URL` plus the key),
+where the core explains the refusal and offers its request-access form; the page is built from
+the requested key only, so it is the same for every refused key. Frame and ws keep their plain
+`403` / `4403`.
 
 With anonymous drawing off (`ANON_ENABLED=false`, the chart's `anon.enabled: false` default) the
 canvas has no anonymous visitors at all. A request that brings no credential (no `Authorization`,

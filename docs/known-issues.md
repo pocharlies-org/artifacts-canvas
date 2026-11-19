@@ -54,6 +54,14 @@ Regressions: `client/e2e-server/rate.spec.ts`, `client/tests/pacer.test.ts`,
   delete, 1 KiB once the data is deleted with it). Tests: `client/tests/assets.test.ts`,
   `client/e2e-server/assets.spec.ts`. Left: a copy pasted by one user while another deletes the last
   shape naming the same data (concurrently) names data that is gone, and shows an empty image.
+- [x] **L-5 — A signed-in user outside the ACL got a bare "forbidden" (Low).** The wrapper answered
+  `403 text/plain` "forbidden", while the plain artifact link answers with the core's access-required
+  page and its request-access form. Now the wrapper's `403` is an HTML page that says the canvas is not
+  open to the visitor and links to the plain artifact URL, where the core takes the request. The status
+  stays `403`, a visitor without a session is still sent to login, gone and expired keys keep `404` and
+  `410`, frame and WebSocket keep their plain answers, and the page depends on the requested key only
+  (the same for a key that is not shared and one that does not exist). Tests:
+  `server/test/integration.test.ts` (access-required page), `e2e-system/system.spec.ts` (b).
 
 ## Review of the fv9 branch (security and QA)
 
