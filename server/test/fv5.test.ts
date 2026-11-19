@@ -666,7 +666,10 @@ describe('fv5 M-2: an honest reconnect is never refused', () => {
       expect(r.updates).toBeGreaterThan(500);
       if (mode === 'ywebsocket') expect(r.resyncs).toBeGreaterThan(0);
     }
-  }, 180_000);
+    // a fixed, seeded amount of work (the runs and steps above): its time is the machine's speed
+    // only. On a GitHub runner it took 140 to 180 s and failed once at the old 180 s limit; the
+    // limit only catches a hang, so it is three times the slowest run seen.
+  }, 540_000);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -880,6 +883,33 @@ describe('fv5 M-6: anonymous joins cannot lock other visitors out', () => {
     expect(await join('192.0.2.2')).toBeNull();
     const req = { headers: { 'x-forwarded-for': 'a, b, c' }, socket: { remoteAddress: 'peer' } } as never;
     expect([clientIp(req, -1), clientIp(req, 0), clientIp(req, 1), clientIp(req, 3), clientIp(req, 4)]).toEqual([null, 'peer', 'c', 'a', 'peer']);
+  });
+
+  it('a join still loading its room when the server shuts down is ended within a second, not after the 30 s close handshake', async () => {
+    // CI: this file's afterEach (app.close) timed out at 30 s on a slow runner. The last join of a
+    // test was still loading its room (the socket is not read until join() listens) when the server
+    // shut down: join() closed it 4503, never read the client's own close frame, and the server's
+    // close waited for ws's 30 s close timeout
+    const app = await startApp();
+    const key = 'u/m6-shutdown/index.html';
+    users(key);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const mgr = app.manager as unknown as { getOrCreate: (...a: unknown[]) => Promise<unknown> };
+    const getOrCreate = mgr.getOrCreate.bind(app.manager);
+    mgr.getOrCreate = async (...a: unknown[]) => {
+      await gate;
+      return getOrCreate(...a);
+    };
+    const s = await raw(app, key); // upgraded; join() waits for the room, the socket is paused
+    s.ws.close(); // the client leaves: its close frame waits unread
+    apps.splice(apps.indexOf(app), 1);
+    const t0 = Date.now();
+    const closed = app.close(); // shutting down: the room load now fails, join() closes 4503
+    release();
+    await closed;
+    expect(Date.now() - t0).toBeLessThan(5000); // before: 30 s
+    await s.closed;
   });
 });
 

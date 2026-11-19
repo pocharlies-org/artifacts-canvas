@@ -717,10 +717,15 @@ export class WsServer {
         manager.abandon(artifactKey, old);
       }
     } catch (err) {
+      // the socket is not read yet (paused at the upgrade): the peer's answer to the close is never
+      // seen, so it is ended after a second instead of the 30 s of the close handshake (a socket a
+      // shutdown refused held the process's close for 30 s)
+      const end = () => setTimeout(() => ws.terminate(), 1000).unref?.();
       if (manager.closing) {
         // restarting: the client reconnects (4503) to the next process
         sendWs(ws, encodeNotice({ kind: 'shutdown' }));
         ws.close(CLOSE.serverRestart, 'server restart');
+        end();
         return;
       }
       if (err instanceof BusyError) {
@@ -729,7 +734,7 @@ export class WsServer {
         metrics.wsRejected.inc({ reason: err.reason });
         sendWs(ws, encodeNotice({ kind: err.terminal ? 'too-large' : 'busy' }));
         ws.close(err.terminal ? CLOSE.tooLarge : CLOSE.tryAgain, err.terminal ? 'document too large for this server' : 'server memory busy');
-        setTimeout(() => ws.terminate(), 1000).unref?.();
+        end();
         return;
       }
       if (err instanceof WorkerFault) {
@@ -738,10 +743,12 @@ export class WsServer {
         metrics.wsRejected.inc({ reason: `load_${err.kind}` });
         sendWs(ws, encodeNotice({ kind: 'busy' }));
         ws.close(CLOSE.tryAgain, 'server busy');
+        end();
         return;
       }
       log.error({ err: String(err), room: artifactKey }, 'room load failed');
       ws.close(1011, 'storage error');
+      end();
       return;
     }
     if (ws.readyState !== ws.OPEN) {
