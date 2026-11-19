@@ -522,11 +522,18 @@ export class Editor {
 
   paste(offset = 24): boolean {
     if (!this.clipboard || this.readOnly) return false;
+    // image data the room no longer holds (its shapes were deleted since the copy) is stored again:
+    // it must fit like a new image (canvasFits), or the server would refuse the update (4413)
+    const missing = Object.entries(this.clipboard.assets).filter(([aid, url]) => url && !this.doc.assets.has(aid));
+    const adding = missing.reduce((a, [, url]) => a + url.length, 0);
+    if (adding && !this.canvasFits(adding)) return true;
     const idMap = new Map<string, string>();
     const groupMap = new Map<string, string>();
     for (const s of this.clipboard.shapes) idMap.set(s.id, newId());
     const created: string[] = [];
     this.doc.transact(() => {
+      // setAsset keeps only raster data URLs (assetValueOk); in the same transaction as the shapes
+      for (const [aid, url] of missing) this.doc.setAsset(aid, url);
       for (const s of this.clipboard!.shapes) {
         const copy: Record<string, unknown> = { ...s, id: idMap.get(s.id), index: undefined };
         if (s.groupId) {
@@ -547,8 +554,6 @@ export class Editor {
         created.push(this.doc.create(copy as unknown as Shape));
       }
     });
-    // setAsset keeps only raster data URLs (assetValueOk)
-    for (const [aid, url] of Object.entries(this.clipboard.assets)) if (url && !this.doc.assets.has(aid)) this.doc.setAsset(aid, url);
     this.doc.endGesture();
     this.select(created);
     return true;
@@ -736,24 +741,55 @@ export class Editor {
       this.toast(t('image.tooLarge', { max: `${Math.round(max / 1024 / 1024)} MB` }));
       return;
     }
-    // fv8 U1: a canvas that cannot take the image says so, before the server would refuse the
-    // update by closing the connection (4413)
-    const cap = this.cfg.maxDocBytes;
-    if (wouldOverfill(roomBytes(this.doc.doc, this.doc.ledger), dataUrl.length, cap)) {
-      this.toast(t('image.canvasFull', { max: `${(cap / 1024 / 1024).toFixed(cap < 2 * 1024 * 1024 ? 2 : 1)} MB` }));
-      this.canvasFullRefusals++;
-      return;
-    }
+    this.insertImageData(dataUrl, img.naturalWidth, img.naturalHeight, at);
+  }
+
+  /**
+   * Add an image already in its stored form (a data URL the server accepts) of `naturalWidth` x
+   * `naturalHeight` px at `at`, when the canvas can take it. Returns the new shape's id, or null.
+   */
+  insertImageData(dataUrl: string, naturalWidth: number, naturalHeight: number, at?: Pt): string | null {
+    if (this.readOnly || !this.canvasFits(dataUrl.length)) return null;
     const assetId = newId('a');
-    if (!this.doc.setAsset(assetId, dataUrl)) return;
-    const scale = Math.min(1, 600 / img.naturalWidth, 600 / img.naturalHeight);
-    const w = Math.max(20, img.naturalWidth * scale);
-    const h = Math.max(20, img.naturalHeight * scale);
+    const scale = Math.min(1, 600 / naturalWidth, 600 / naturalHeight);
+    const w = Math.max(20, naturalWidth * scale);
+    const h = Math.max(20, naturalHeight * scale);
     const c = at ?? this.toWorld({ x: this.viewW / 2, y: this.viewH / 2 });
-    const id = this.doc.create({ type: 'image', assetId, x: c.x - w / 2, y: c.y - h / 2, w, h, opacity: this.style.opacity } as Partial<Shape> & { type: 'image' });
+    // the data and the shape that names it: one update, one undo step
+    let id = '';
+    this.doc.transact(() => {
+      if (!this.doc.setAsset(assetId, dataUrl)) return;
+      id = this.doc.create({ type: 'image', assetId, x: c.x - w / 2, y: c.y - h / 2, w, h, opacity: this.style.opacity } as Partial<Shape> & { type: 'image' });
+    });
+    if (!id) return null;
     this.doc.endGesture();
     this.select([id]);
     this.setTool('select');
+    return id;
+  }
+
+  /**
+   * fv8 U1: a canvas that cannot take `adding` more characters of image data says so, before the
+   * server would refuse the update by closing the connection (4413). The room is measured as the
+   * server stores it (deleted image data no longer counts, roomBytes), and image data left with no
+   * shape naming it is deleted first. Data deleted in the last FREED_GRACE_MS still counts: the
+   * server forgets it at its next save, and until then the toast asks to wait a moment.
+   */
+  canvasFits(adding: number): boolean {
+    const cap = this.cfg.maxDocBytes;
+    let room = roomBytes(this.doc.doc, this.doc.ledger);
+    if (wouldOverfill(room, adding, cap) && this.doc.collectUnreferencedAssets() > 0) room = roomBytes(this.doc.doc, this.doc.ledger);
+    if (wouldOverfill(room, adding, cap)) {
+      this.toast(t('image.canvasFull', { max: `${(cap / 1024 / 1024).toFixed(cap < 2 * 1024 * 1024 ? 2 : 1)} MB` }));
+      this.canvasFullRefusals++;
+      return false;
+    }
+    if (wouldOverfill(room + this.doc.recentlyFreedBytes(), adding, cap)) {
+      this.toast(t('image.freeing'), 6000);
+      this.canvasFullRefusals++;
+      return false;
+    }
+    return true;
   }
 
   pickImage(at?: Pt) {

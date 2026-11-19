@@ -19,6 +19,14 @@ const YARRAY_FIELDS = new Set(['points']);
 /** Shapes one delete transaction (one update to the server) removes at most (see CanvasDoc.delete). */
 export const DELETE_BATCH = 1000;
 
+/**
+ * How long the bytes of a deleted image still count against the room after the delete. The server
+ * measures a room again at its next save (SAVE_DEBOUNCE_MS, 2 s by default) and counts until then
+ * every update at its size: an image that only fits once the delete is measured would be refused
+ * (4413) if sent at once. See CanvasDoc.recentlyFreedBytes.
+ */
+export const FREED_GRACE_MS = 10_000;
+
 let idCounter = 0;
 export function newId(prefix = 's'): string {
   const rnd = Math.random().toString(36).slice(2, 10);
@@ -123,8 +131,14 @@ export interface ChangeSet {
  *   ledger  the LEDGER document (attribution, users, history) — read-only here: the server
  *           stamps it and sends it on its own message type (a dev tab against a plain relay
  *           stamps a local one, see Editor.setIdentity).
- * Only `shapes` is in the undo scope: undo never touches other people's work,
- * attribution or history.
+ * `shapes` and `assets` are in the undo scope, for this tab's own edits only: undo never touches
+ * other people's work, attribution or history.
+ *
+ * Image data lives in `assets`, apart from the image shapes that name it. A shape delete that
+ * leaves an asset with no shape naming it deletes the asset in the same transaction (the room's
+ * size drops at the server's next save), and an undo of that delete brings both back. Before, the
+ * data stayed after its last shape was gone: a room filled by images could not be emptied by
+ * deleting them.
  */
 export class CanvasDoc {
   readonly doc: Y.Doc;
@@ -140,6 +154,8 @@ export class CanvasDoc {
   readonly undoManager: Y.UndoManager;
   private cache = new Map<string, Shape>();
   private listeners = new Set<(c: ChangeSet) => void>();
+  /** Asset bytes deleted (by anyone) and when: see recentlyFreedBytes. */
+  private freed: { at: number; bytes: number }[] = [];
 
   constructor(doc: Y.Doc = new Y.Doc(), ledger: Y.Doc = new Y.Doc()) {
     if (doc === ledger) throw new Error('CanvasDoc: the ledger must be a separate Y.Doc');
@@ -151,7 +167,7 @@ export class CanvasDoc {
     this.attribution = ledger.getMap(ROOT.attribution);
     this.users = ledger.getMap(ROOT.users);
     this.history = ledger.getArray(ROOT.history);
-    this.undoManager = new Y.UndoManager([this.shapes], {
+    this.undoManager = new Y.UndoManager([this.shapes, this.assets], {
       trackedOrigins: new Set([this.origin]),
       // Gestures are delimited explicitly with stopCapturing(); never merge by time alone
       // across separate gestures, always merge within one gesture.
@@ -185,7 +201,13 @@ export class CanvasDoc {
     this.attribution.observe((e) => this.emit({ ...this.flag('users'), users: false, attribution: new Set(e.keysChanged) }));
     this.users.observe(() => this.emit(this.flag('users')));
     this.history.observe(() => this.emit(this.flag('history')));
-    this.assets.observe(() => this.emit(this.flag('assets')));
+    this.assets.observe((e) => {
+      const now = Date.now();
+      for (const [, ch] of e.changes.keys) {
+        if (ch.action === 'delete' && typeof ch.oldValue === 'string') this.freed.push({ at: now, bytes: ch.oldValue.length });
+      }
+      this.emit(this.flag('assets'));
+    });
     this.meta.observe(() => this.emit(this.flag('meta')));
   }
 
@@ -435,6 +457,7 @@ export class CanvasDoc {
     const all = [...new Set(ids)];
     if (!all.length) return;
     const set = new Set(all);
+    const last = Math.floor((all.length - 1) / DELETE_BATCH) * DELETE_BATCH;
     for (let i = 0; i < all.length; i += DELETE_BATCH) {
       this.doc.transact((tr) => {
         // the batches stay apart on the wire too (the connection merges small updates)
@@ -452,8 +475,47 @@ export class CanvasDoc {
           }
         }
         for (const id of all.slice(i, i + DELETE_BATCH)) this.shapes.delete(id);
+        // the image data no remaining shape names goes with its last shape (same undo step)
+        if (i === last) for (const aid of this.unreferencedAssets()) this.assets.delete(aid);
       }, this.origin);
     }
+  }
+
+  /** Asset ids that no shape of the document names. */
+  unreferencedAssets(): string[] {
+    if (!this.assets.size) return [];
+    const named = new Set<string>();
+    for (const id of this.shapes.keys()) {
+      const s = this.get(id);
+      if (s?.type === 'image' && s.assetId) named.add(s.assetId);
+    }
+    return [...this.assets.keys()].filter((aid) => !named.has(aid));
+  }
+
+  /**
+   * Delete every asset no shape names, outside the undo history: image data left behind by a
+   * client that did not delete it with its shape. Returns the bytes removed.
+   */
+  collectUnreferencedAssets(): number {
+    const ids = this.unreferencedAssets();
+    if (!ids.length) return 0;
+    let bytes = 0;
+    this.transact(() => {
+      for (const aid of ids) {
+        bytes += this.assets.get(aid)?.length ?? 0;
+        this.assets.delete(aid);
+      }
+    }, 'asset');
+    return bytes;
+  }
+
+  /**
+   * Bytes of assets deleted within FREED_GRACE_MS: the server still counts them until it saves
+   * the room again, so a new image must fit with them counted.
+   */
+  recentlyFreedBytes(now = Date.now()): number {
+    this.freed = this.freed.filter((f) => now - f.at < FREED_GRACE_MS);
+    return this.freed.reduce((a, f) => a + f.bytes, 0);
   }
 
   setStyle(ids: string[], style: Partial<Style>) {
@@ -515,10 +577,14 @@ export class CanvasDoc {
     return Array.from(out);
   }
 
-  /** Store an image asset; only raster data URLs (assetValueOk, what the server accepts). */
+  /**
+   * Store an image asset; only raster data URLs (assetValueOk, what the server accepts). A local,
+   * undoable edit: call it in the transaction that creates the shape naming it, so that the two
+   * travel in one update and one undo step.
+   */
   setAsset(id: string, dataUrl: string): boolean {
     if (!assetValueOk(dataUrl)) return false;
-    this.transact(() => this.assets.set(id, dataUrl), 'asset');
+    this.transact(() => this.assets.set(id, dataUrl));
     return true;
   }
 

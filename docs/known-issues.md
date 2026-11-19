@@ -37,6 +37,23 @@ Regressions: `client/e2e-server/rate.spec.ts`, `client/tests/pacer.test.ts`,
   fetch, an undecodable image), and the export says so after the download, as it does when the page
   could not be captured at all (`client/public/reporter.js`, `client/src/export/export.ts`; test
   `client/e2e/export.spec.ts` with `client/dev/artifacts/broken-image.html`).
+- [x] **L-3 — Deleted images kept filling the room; "delete something first" could not be satisfied
+  (Medium).** An image's data lives in `assets`, apart from the image shape that names it, and a delete
+  removed the shape only. Three images (2.1, 2.1 and 0.8 MB) pasted and deleted left the room at
+  5 087 137 of its 5 242 880 bytes, 5 041 037 of them data no shape named, saved and loaded on every
+  join; a new image was refused with "the canvas is full, delete something first", and deleting more
+  did not help. Now the data goes in the
+  transaction that deletes the last shape naming it, and comes back with an undo of that delete (the
+  undo scope covers `assets`); an image's data and its shape are written in one transaction too, so an
+  undo of the insert removes both. The editor measures the room as the server stores it (a copy without
+  the undo history), collects data no shape names (left by earlier clients) before it says the canvas
+  is full, and, for `FREED_GRACE_MS` after a delete, asks to try again in a few seconds: the server
+  counts every update at its size until its next save measures the room. The server needs no change:
+  Yjs drops the deleted data, and the next save measures the room again
+  (`server/test/fv8.test.ts` "L-3": 801 KiB with two 400 KiB images, 801 KiB after a shape-only
+  delete, 1 KiB once the data is deleted with it). Tests: `client/tests/assets.test.ts`,
+  `client/e2e-server/assets.spec.ts`. Left: a copy pasted by one user while another deletes the last
+  shape naming the same data (concurrently) names data that is gone, and shows an empty image.
 
 ## Review of the fv9 branch (security and QA)
 

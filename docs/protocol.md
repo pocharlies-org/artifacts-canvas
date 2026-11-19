@@ -382,7 +382,7 @@ Never announce it in production.
 | Document | Root | Type | Written by | Content |
 |---|---|---|---|---|
 | content | `shapes` | `Y.Map<Y.Map>` | clients | one Y.Map per shape, key = shape id |
-| content | `assets` | `Y.Map<string>` | clients | pasted images as data URLs, key = asset id (client caps at `maxImageBytes`, default 2 MiB, downscaled to ≤1600 px) |
+| content | `assets` | `Y.Map<string>` | clients | pasted images as data URLs, key = asset id (client caps at `maxImageBytes`, default 2 MiB, downscaled to ≤1600 px). The client writes an asset in the transaction that creates the image shape naming it, and deletes it in the transaction that deletes the last shape naming it (an undo brings both back); the server drops deleted data (Yjs garbage collection) and measures the room again at its next save |
 | content | `meta` | `Y.Map` | clients | `pageWidth` (set once by the first client) |
 | ledger | `attribution` | `Y.Map<Attribution>` | server | §5 |
 | ledger | `users` | `Y.Map<UserInfo>` | server | §5 |

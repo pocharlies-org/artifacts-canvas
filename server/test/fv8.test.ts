@@ -707,3 +707,62 @@ describe('fv8 U1: the editor knows the room cap', () => {
     expect(await page('pub/w/index.html')).toContain(`"maxImageBytes":${cfg.anonMaxImageBytes},"maxDocBytes":${cfg.anonMaxDocBytes}`);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+describe('live test L-3: image data deleted with its last shape frees the room on the server', () => {
+  const KiB = 1024;
+  const url = (n: number, c: string) => 'data:image/png;base64,' + c.repeat(n);
+  const image = (id: string, assetId: string, j: number) => ({ id, type: 'image', assetId, x: j * 120, y: 0, w: 100, h: 100, rotation: 0, index: j, groupId: '', locked: false, opacity: 1 });
+  /** What the editor sends for one image: the data and the shape that names it, in one update. */
+  const insert = (c: TestClient, id: string, assetId: string, n: number, ch: string, j: number) =>
+    c.doc.transact(() => {
+      c.doc.getMap('assets').set(assetId, url(n, ch));
+      c.doc.getMap('shapes').set(id, mapOf(image(id, assetId, j)));
+    });
+  const settled = async (app: App, key: string) => {
+    // the next save measures the room again (SAVE_DEBOUNCE_MS 50 here)
+    await sleep(400);
+    return app.manager.get(key)!.bytes;
+  };
+
+  it('no server change is needed: deleting the asset key with the shape drops the room at the next save, and an image that only fits then is accepted; a shape delete alone frees nothing', async () => {
+    const key = 'u/assets/index.html';
+    share(key, 'ana');
+    const app = await startApp({ MAX_DOC_BYTES: String(1024 * KiB), ANON_MAX_DOC_BYTES: String(256 * KiB) });
+    const ana = await join(app, key, 'sid=ana');
+    insert(ana, 's1', 'a1', 400 * KiB, 'A', 1);
+    insert(ana, 's2', 'a2', 400 * KiB, 'B', 2);
+    const full = await settled(app, key);
+    expect(full).toBeGreaterThan(800 * KiB);
+
+    // what the client did before: the shape goes, its data stays (and still counts)
+    ana.doc.transact(() => ana.doc.getMap('shapes').delete('s1'));
+    const shapeOnly = await settled(app, key);
+    expect(full - shapeOnly).toBeLessThan(4 * KiB);
+
+    // what it does now: the data goes with its last shape (the asset key deleted in the same update)
+    ana.doc.transact(() => ana.doc.getMap('assets').delete('a1'));
+    ana.doc.transact(() => {
+      ana.doc.getMap('shapes').delete('s2');
+      ana.doc.getMap('assets').delete('a2');
+    });
+    const freed = await settled(app, key);
+    console.log(`[L-3] room ${Math.round(full / KiB)} KiB with two 400 KiB images; shape deleted alone ${Math.round(shapeOnly / KiB)} KiB; with its data ${Math.round(freed / KiB)} KiB`);
+    expect(freed).toBeLessThan(16 * KiB);
+
+    // two new images that only fit in the freed room are accepted: no 4413, the room has them
+    insert(ana, 's3', 'a3', 400 * KiB, 'C', 3);
+    insert(ana, 's4', 'a4', 400 * KiB, 'D', 4);
+    await sleep(400);
+    expect(ana.closeCode).toBeNull();
+    const docs = await roomDocsOf(app, key);
+    expect([...docs!.doc.getMap('assets').keys()].sort()).toEqual(['a3', 'a4']);
+    expect(app.manager.get(key)!.bytes).toBeLessThanOrEqual(cfgOf(app).maxDocBytes);
+    ana.close();
+  });
+});
+
+async function roomDocsOf(app: App, key: string): Promise<{ doc: Y.Doc; ledger: Y.Doc } | undefined> {
+  const r = app.manager.get(key);
+  return r ? r.inspect() : undefined;
+}
