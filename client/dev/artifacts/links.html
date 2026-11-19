@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Links test page</title>
+<style>
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;color:#1d1d1f;background:#fff}
+  .wrap{padding:32px 48px;font-size:15px;line-height:1.55}
+  h1{margin:0 0 16px;font-size:24px}
+  .links a,.links button{display:inline-block;margin:6px 8px 6px 0;padding:10px 14px;border-radius:8px;background:#eef2ff;color:#1d4ed8;text-decoration:none;font:inherit;border:0;cursor:pointer}
+  #out{display:inline-block;min-width:160px;color:#065f46;font-weight:600}
+  .scroller{height:140px;overflow:auto;border:1px solid #e5e7eb;border-radius:8px;margin:16px 0;padding:0 12px}
+  .scroller div{height:640px;background:linear-gradient(#fff,#dbeafe)}
+  section{height:640px;border-top:2px solid #e5e7eb;padding-top:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 id="top">Links</h1>
+  <p class="links">
+    <a id="internal" href="links-b.html">Internal: page B</a>
+    <a id="external" href="https://external.test/landing?from=canvas">External page</a>
+    <a id="anchor" href="#section-3">Anchor: section 3</a>
+    <a id="blank" href="links-b.html" target="_blank">Page B in a new tab</a>
+    <a id="data" href="data:text/html,%3Cb%3Ex%3C/b%3E">Data link</a>
+    <a id="js" href="javascript:void(document.getElementById('out').textContent='js ran')">Script link</a>
+    <button id="btn" type="button" onclick="document.getElementById('out').textContent='button clicked'">A button</button>
+    <span id="out"></span>
+  </p>
+  <div class="scroller" id="scroller"><div>inner scroll area</div></div>
+  <section id="section-1"><h2>Section 1</h2></section>
+  <section id="section-2"><h2>Section 2</h2></section>
+  <section id="section-3"><h2>Section 3</h2><p><a id="back" href="#top">Back to the top</a></p></section>
+</div>
+</body>
+</html>

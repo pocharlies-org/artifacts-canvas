@@ -12,7 +12,7 @@ import { type Box, type Pt, boxFrom2, dist, snapAngle, unionBoxes } from '../geo
 import { layoutText } from '../render/text';
 
 export type ToolId =
-  | 'select' | 'hand' | 'draw' | 'highlight' | 'eraser' | 'arrow' | 'line' | 'text' | 'note'
+  | 'select' | 'hand' | 'interact' | 'draw' | 'highlight' | 'eraser' | 'arrow' | 'line' | 'text' | 'note'
   | 'geo' | 'frame' | 'image' | 'laser';
 
 export interface PointerInfo {
@@ -85,7 +85,7 @@ const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
 
 type SelectState =
   | { kind: 'idle' }
-  | { kind: 'pressing'; start: PointerInfo; hit: Shape | null; wasSelected: boolean }
+  | { kind: 'pressing'; start: PointerInfo; hit: Shape | null; wasSelected: boolean; hadSelection: boolean }
   | { kind: 'translating'; start: Pt; shapes: Shape[] }
   | { kind: 'marquee'; start: Pt; add: boolean; base: Set<string> }
   | { kind: 'resizing'; handle: Handle; shapes: Shape[]; box: Box; rotation: number }
@@ -126,12 +126,13 @@ export class SelectTool implements Tool {
     }
     const hit = ed.shapeAt(p.world);
     const wasSelected = !!hit && ed.selection.has(hit.id);
+    const hadSelection = ed.selection.size > 0;
     if (hit) {
       if (p.shift) {
         if (!wasSelected) ed.select([hit.id], true);
       } else if (!wasSelected) ed.select([hit.id]);
     }
-    this.state = { kind: 'pressing', start: p, hit, wasSelected };
+    this.state = { kind: 'pressing', start: p, hit, wasSelected, hadSelection };
   }
 
   move(p: PointerInfo) {
@@ -142,7 +143,10 @@ export class SelectTool implements Tool {
         const hit = ed.shapeAt(p.world);
         ed.showHover(hit?.id ?? null);
         const h = ed.overlay.handleAt(p.screen);
-        ed.stage.dataset.cursor = h ? h.cursor : hit ? 'move' : '';
+        const cur = h ? h.cursor : hit ? 'move' : '';
+        // over the bare page: a pointer when there is a link of the artifact under it
+        if (cur || ed.stage.dataset.cursor !== 'pointer') ed.stage.dataset.cursor = cur;
+        ed.probeLink(cur ? null : p.world);
         return;
       }
       case 'pressing': {
@@ -233,7 +237,11 @@ export class SelectTool implements Tool {
     if (st.kind === 'pressing') {
       if (st.hit && st.wasSelected && p.shift) ed.deselect([st.hit.id]);
       else if (st.hit && st.wasSelected && !p.shift && ed.selection.size > 1) ed.select([st.hit.id]);
-      else if (!st.hit && !p.shift) ed.clearSelection();
+      else if (!st.hit && !p.shift) {
+        ed.clearSelection();
+        // a plain click on the bare page, with nothing to deselect: a link of the artifact there opens
+        if (!st.hadSelection && !st.start.shift && !st.start.alt) ed.clickArtifact(p.world, p.mod);
+      }
     }
     if (st.kind !== 'idle' && st.kind !== 'pressing' && st.kind !== 'marquee') ed.doc.endGesture();
     this.marquee = null;
@@ -260,6 +268,18 @@ export class SelectTool implements Tool {
       ed.startEditing(id);
     }
   }
+}
+
+// ------------------------------------------------------------------ interact
+
+/**
+ * The artifact takes the pointer (links, buttons, inner scrolling: the frame gets the events,
+ * ArtifactFrame.setInteractive). Outside the page a drag pans, as with the hand (editor).
+ */
+class InteractTool implements Tool {
+  down() {}
+  move() {}
+  up() {}
 }
 
 // ------------------------------------------------------------------ hand
@@ -585,21 +605,25 @@ class LaserTool implements Tool {
   down(p: PointerInfo) {
     this.active = true;
     this.ed.addLaserPoint(p.world);
+    this.ed.holdLaser(true);
   }
   move(p: PointerInfo) {
     if (this.active) this.ed.addLaserPoint(p.world);
   }
   up() {
     this.active = false;
+    this.ed.holdLaser(false);
   }
   cancel() {
     this.active = false;
+    this.ed.holdLaser(false);
   }
 }
 
 export const TOOLS: Record<ToolId, (ed: Editor) => Tool> = {
   select: (ed) => new SelectTool(ed),
   hand: () => new HandTool(),
+  interact: () => new InteractTool(),
   draw: (ed) => new DrawTool(ed, false),
   highlight: (ed) => new DrawTool(ed, true),
   eraser: (ed) => new EraserTool(ed),

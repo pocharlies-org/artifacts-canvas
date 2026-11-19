@@ -73,8 +73,8 @@ for (const vp of PHONES) {
     await expect(page.getByTestId('toolbar-prev')).toBeHidden();
 
     const ids = await toolIds(page);
-    expect(ids).toEqual(expect.arrayContaining(["tool-select", "tool-note", "tool-more", "tool-frame", "tool-image", "tool-laser"]));
-    expect(ids.length).toBe(15);
+    expect(ids).toEqual(expect.arrayContaining(["tool-select", "tool-interact", "tool-note", "tool-more", "tool-frame", "tool-image", "tool-laser"]));
+    expect(ids.length).toBe(16);
     for (const id of ids) {
       const btn = page.locator(`[data-testid="toolbar"] [data-testid="${id}"]`);
       // Page with the chevrons until the button sits fully in the free band.

@@ -7,8 +7,13 @@ import { DEFAULT_STYLE, STYLE_KEYS, type Identity, type Shape, type Style, type 
 import { Connection, type Status } from '../collab/connection';
 import { Throttle, sendIntervalMs } from '../collab/pacer';
 import { peers, setPresence, type LaserPoint, type PresenceState } from '../collab/presence';
+import {
+  INITIAL_FOLLOW, currentPresenter, followPresenter, followUser, onPeers, startPresenting, stopFollowing, stopPresenting,
+  targetPeer, type FollowPeer, type FollowState,
+} from '../collab/follow';
 import type { Notice } from '../collab/protocol';
-import { ArtifactFrame } from '../artifact/frame';
+import { ArtifactFrame, type FrameWheel } from '../artifact/frame';
+import { canvasUrl, classifyLink, linkContext, type LinkContext } from '../artifact/links';
 import { Renderer } from '../render/renderer';
 import {
   type Camera, clampZoom, fitBox, matchViewport, nextZoomStep, screenToWorld, visibleWorld, worldToScreen, zoomAt,
@@ -16,19 +21,33 @@ import {
 import { type Box, type Pt, unionBoxes } from '../geometry/vec';
 import { shapeBounds, topShapeAt, FONT_SIZE, NOTE_FONT_SIZE, NOTE_SIZE } from '../geometry/shapes';
 import { FONT_FAMILY, layoutText } from '../render/text';
-import type { CanvasConfig } from '../config';
+import { DEFAULT_PREFIX, RESERVED, type CanvasConfig } from '../config';
 import { TOOLS, nudgeSelection as TOOLS_NUDGE, type ToolId, type Tool, type PointerInfo } from '../tools/tools';
 import { Overlay } from '../render/overlay';
 import { t } from '../i18n';
 import { own } from '../model/colors';
 
-export type Topic = 'camera' | 'selection' | 'tool' | 'style' | 'presence' | 'doc' | 'status' | 'identity' | 'visibility' | 'follow' | 'history' | 'notice';
+export type Topic = 'camera' | 'selection' | 'tool' | 'style' | 'presence' | 'doc' | 'status' | 'identity' | 'visibility' | 'follow' | 'present' | 'history' | 'notice';
 
 export interface EditorDom {
   stage: HTMLElement;
 }
 
 const LASER_TTL = 1000;
+/** While the laser is held still, its point is sent again this often, so it does not fade for the others. */
+const LASER_HOLD_MS = 300;
+/** Presentation mode: the artifact page fills the screen width, up to this zoom. */
+const PRESENT_MAX_ZOOM = 2;
+/** Presentation mode: screen px above the page top, under the "Presentando" badge. */
+const PRESENT_TOP = 48;
+
+/** The presenter seen by this tab: who, and whether it is this person in another tab or device. */
+export interface PresenterInfo {
+  name: string;
+  userId: string;
+  clientId: number;
+  self: boolean;
+}
 
 export class Editor {
   readonly doc: CanvasDoc;
@@ -59,10 +78,14 @@ export class Editor {
   hoverId: string | null = null;
   pointerWorld: Pt | null = null;
   spaceDown = false;
-  presenting = false;
-  followingUserId: string | null = null;
-  private followReason: 'manual' | 'presenter' | null = null;
-  private dismissedPresenter: string | null = null;
+  /** Presenting and following (collab/follow.ts): what this tab presents or follows. */
+  private fstate: FollowState = INITIAL_FOLLOW;
+  /** The tool in use when presentation mode started; back when it ends. */
+  private toolBeforePresenting: { tool: ToolId; geo: GeoKind } | null = null;
+  /** The presence `status` last published (a laser cursor shows as one for the others). */
+  private publishedStatus: string | null = null;
+  /** Where a click on a link of the artifact leads (artifact/links.ts). */
+  readonly links: LinkContext;
   /** Local laser trail (published through awareness, never stored). */
   laser: LaserPoint[] = [];
   /** Receive time of each peer's laser state (for fading). */
@@ -103,7 +126,26 @@ export class Editor {
       },
       title: () => this.emit('status'),
       scroll: (x, y) => this.panTo({ x, y }),
+      // The artifact's own scripts share the frame with the reporter and can post the same
+      // messages, so each is taken only when the user is acting on the artifact (frameGesture)
+      link: (href, newTab) => {
+        if (this.frameGesture()) this.openLink(href, newTab);
+      },
+      anchor: (x, y) => {
+        if (this.frameGesture()) this.revealTop({ x, y });
+      },
+      wheel: (w) => {
+        if (this.tool === 'interact' && this.frame.hovered) this.wheelFromFrame(w);
+      },
+      escape: () => {
+        if (this.tool === 'interact' && this.focusInFrame()) this.escape();
+      },
     });
+    const prefix = (() => {
+      const base = (import.meta.env?.BASE_URL as string | undefined) ?? '/_canvas/_/';
+      return base.endsWith(RESERVED) ? base.slice(0, -RESERVED.length) : DEFAULT_PREFIX;
+    })();
+    this.links = linkContext(location.origin, location.pathname, prefix, cfg.artifactPath);
 
     this.renderer = new Renderer(this.world, this.doc);
     this.overlay = new Overlay(this);
@@ -226,6 +268,7 @@ export class Editor {
 
   publishPresence(patch: Partial<PresenceState>, immediate = false) {
     if (!this.conn) return;
+    if ('status' in patch) this.publishedStatus = patch.status ?? null;
     Object.assign(this.pendingPresence, patch);
     this.presencePace.schedule(() => this.flushPresence());
     if (immediate) this.presencePace.flush();
@@ -246,52 +289,202 @@ export class Editor {
       if (p.state.laser && p.state.laser.pts.length) this.laserSeen.set(p.clientId, { at: now, now: p.state.laser.now });
     }
     this.ensureLaserAnimation();
-    // presenter / follow
-    const presenter = peers(this.conn.awareness).find((p) => p.state.presenting && p.state.user && p.state.user.id !== this.me?.id);
-    const pid = presenter?.state.user?.id ?? null;
-    if (!pid) this.dismissedPresenter = null;
-    if (this.followReason === 'presenter' && this.followingUserId !== pid) this.stopFollowing();
-    if (pid && !this.presenting && !this.followingUserId && this.dismissedPresenter !== pid) this.follow(pid, 'presenter');
-    if (this.followingUserId) this.applyFollow();
+    this.setFollowState(onPeers(this.fstate, this.followPeers(), this.selfClientId()));
+    if (this.fstate.target) this.applyFollow();
     this.overlay.updateCursors();
     this.emit('presence');
   }
 
-  presenterName(): string | null {
-    if (!this.conn) return null;
-    const p = peers(this.conn.awareness).find((x) => x.state.presenting && x.state.user);
-    return p?.state.user?.name ?? null;
+  /** The awareness peers as the follow state machine sees them. */
+  private followPeers(): FollowPeer[] {
+    if (!this.conn) return [];
+    return peers(this.conn.awareness).map((p) => ({ clientId: p.clientId, userId: p.state.user!.id, presenting: !!p.state.presenting }));
   }
 
-  follow(userId: string, reason: 'manual' | 'presenter' = 'manual') {
-    this.followingUserId = userId;
-    this.followReason = reason;
-    this.publishPresence({ following: userId });
+  private selfClientId(): number {
+    return this.conn?.awareness.clientID ?? -1;
+  }
+
+  private setFollowState(next: FollowState) {
+    const prev = this.fstate;
+    if (next === prev) return;
+    this.fstate = next;
+    const following = next.target?.userId ?? null;
+    if (following !== (prev.target?.userId ?? null)) this.publishPresence({ following });
+    if (next.target !== prev.target || next.dismissed !== prev.dismissed) this.emit('follow');
+  }
+
+  /** This tab presents (presentation mode). */
+  get presenting(): boolean {
+    return this.fstate.presenting;
+  }
+
+  /** The person this tab follows, or null. */
+  get followingUserId(): string | null {
+    return this.fstate.target?.userId ?? null;
+  }
+
+  /** Following because someone presents (not "Seguir a ..."). */
+  get followingPresenter(): boolean {
+    return this.fstate.target?.reason === 'presenter';
+  }
+
+  /** The presenter this tab sees (followed or not), or null. Never this tab. */
+  presenter(): PresenterInfo | null {
+    if (!this.conn) return null;
+    const p = currentPresenter(this.followPeers(), this.selfClientId(), this.fstate);
+    if (!p) return null;
+    const st = peers(this.conn.awareness).find((x) => x.clientId === p.clientId)?.state;
+    return { name: st?.user?.name ?? '', userId: p.userId, clientId: p.clientId, self: p.userId === this.me?.id };
+  }
+
+  follow(userId: string) {
+    this.setFollowState(followUser(this.fstate, userId, this.followPeers(), this.selfClientId()));
     this.applyFollow();
-    this.emit('follow');
+  }
+
+  /** Follow the presenter again after "Dejar de seguir". */
+  followPresenter() {
+    this.setFollowState(followPresenter(this.fstate, this.followPeers(), this.selfClientId()));
+    this.applyFollow();
   }
 
   stopFollowing() {
-    if (!this.followingUserId) return;
-    if (this.followReason === 'presenter') this.dismissedPresenter = this.followingUserId;
-    this.followingUserId = null;
-    this.followReason = null;
-    this.publishPresence({ following: null });
-    this.emit('follow');
+    this.setFollowState(stopFollowing(this.fstate));
   }
 
   private applyFollow() {
-    if (!this.conn || !this.followingUserId) return;
-    const target = peers(this.conn.awareness).find((p) => p.state.user?.id === this.followingUserId && p.state.viewport);
-    if (!target?.state.viewport) return;
-    this.setCamera(matchViewport(target.state.viewport, this.viewW, this.viewH), 'follow');
+    if (!this.conn) return;
+    const target = targetPeer(this.fstate, this.followPeers(), this.selfClientId());
+    if (!target) return;
+    const vp = peers(this.conn.awareness).find((p) => p.clientId === target.clientId)?.state.viewport;
+    if (!vp) return;
+    this.setCamera(matchViewport(vp, this.viewW, this.viewH), 'follow');
   }
 
+  /**
+   * Presentation mode on or off. On: this tab follows nobody, the others (this person's other
+   * tabs too) follow it, the laser is the tool and the artifact fills the screen width. Off:
+   * the tool from before comes back, and the followers are released. Fullscreen is the UI's
+   * part (ui/present.ts): it needs the click that started it.
+   */
   setPresenting(on: boolean) {
-    this.presenting = on;
-    if (on) this.stopFollowing();
+    if (on === this.fstate.presenting) return;
+    if (on) {
+      this.toolBeforePresenting = { tool: this.tool, geo: this.geoKind };
+      this.setFollowState(startPresenting(this.fstate));
+      if (this.tool !== 'laser') this.setTool('laser');
+      this.fitForPresentation();
+    } else {
+      this.setFollowState(stopPresenting(this.fstate, this.followPeers(), this.selfClientId()));
+      const back = this.toolBeforePresenting;
+      this.toolBeforePresenting = null;
+      if (back) {
+        this.geoKind = back.geo;
+        this.setTool(back.tool);
+      }
+      if (this.fstate.target) this.applyFollow();
+    }
     this.publishPresence({ presenting: on, viewport: this.visibleWorld() }, true);
+    this.emit('present');
     this.emit('follow');
+  }
+
+  /** Esc: leave presentation mode, else drop the tool for select, else the selection. */
+  escape() {
+    if (this.presenting) {
+      this.setPresenting(false);
+      return;
+    }
+    this.activeTool.cancel?.();
+    if (this.tool !== 'select') this.setTool('select');
+    else this.clearSelection();
+  }
+
+  // ------------------------------------------------------------------ links of the artifact
+
+  /** Until when a link or anchor message answers the select tool's click (clickArtifact). */
+  private frameClickUntil = 0;
+
+  /**
+   * Is a `link` or `anchor` message from the frame the user's doing? It must come with a user
+   * gesture on this page (a click inside the frame activates its ancestors too), and either
+   * answer the select tool's click of the last moment, or come while the user works inside the
+   * artifact (interact tool, focus in the frame). A script of the artifact posting on its own,
+   * or riding on a click made elsewhere on the canvas, gets nothing.
+   */
+  private frameGesture(): boolean {
+    if (!userActivated()) return false;
+    if (performance.now() < this.frameClickUntil) {
+      this.frameClickUntil = 0;
+      return true;
+    }
+    return this.tool === 'interact' && this.focusInFrame();
+  }
+
+  private focusInFrame(): boolean {
+    return document.activeElement === this.frame.el;
+  }
+
+  /** A link clicked in the artifact (the reporter's `link` message, artifact/links.ts). */
+  openLink(href: string, newTab: boolean) {
+    const a = classifyLink(href, this.links);
+    if (a.kind === 'blocked') {
+      this.toast(t('link.blocked'));
+      return;
+    }
+    if (a.kind === 'external') {
+      window.open(a.url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    const url = canvasUrl(a.key, this.links, new URLSearchParams(location.search), { presenting: this.presenting, dev: this.cfg.dev });
+    if (newTab) {
+      window.open(url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    // the edits of the last send interval go out before the page changes
+    this.conn?.flush();
+    this.navigate(url);
+  }
+
+  /** A full page load opens the other file's canvas (its own room, its own annotations). */
+  navigate(url: string) {
+    location.assign(url);
+  }
+
+  /** Follow the link of the artifact at a world point (the select tool's click on the page). */
+  clickArtifact(p: Pt, newTab: boolean) {
+    if (p.x < 0 || p.y < 0 || p.x > this.pageWidth || p.y > this.pageHeight) return;
+    this.frameClickUntil = performance.now() + 1500;
+    this.frame.clickAt(p.x, p.y, newTab);
+  }
+
+  private probeSeq = 0;
+  private readonly probePace = new Throttle(() => 80);
+
+  /** The select tool hovers the page: a pointer cursor over a link of the artifact. */
+  probeLink(p: Pt | null) {
+    const seq = ++this.probeSeq;
+    if (!p || p.x < 0 || p.y < 0 || p.x > this.pageWidth || p.y > this.pageHeight) {
+      if (this.stage.dataset.cursor === 'pointer') this.stage.dataset.cursor = '';
+      return;
+    }
+    this.probePace.schedule(() => {
+      void this.frame.probe(p.x, p.y).then((link) => {
+        if (seq !== this.probeSeq || this.tool !== 'select') return;
+        const cur = this.stage.dataset.cursor ?? '';
+        if (cur === '' || cur === 'pointer') this.stage.dataset.cursor = link ? 'pointer' : '';
+      });
+    });
+  }
+
+  /** Bring the world point `p` near the top of the view, under the top panels (an anchor of the artifact). */
+  revealTop(p: Pt) {
+    const z = this.camera.z;
+    const vis = this.visibleWorld();
+    const tx = p.x >= vis.x && p.x <= vis.x + vis.w ? this.camera.tx : this.viewW / 2 - p.x * z;
+    const margin = this.presenting ? PRESENT_TOP : this.viewW < 760 ? 112 : 70;
+    this.setCamera({ z, tx, ty: margin - p.y * z });
   }
 
   // ------------------------------------------------------------------ camera
@@ -307,13 +500,31 @@ export class Editor {
         this.resetCamera();
       }
     } else if (this.followingUserId) this.applyFollow();
+    // fullscreen on or off, a phone turned: the page fills the new width, the same line at the top
+    else if (this.presenting && r.width > 0) this.fitForPresentation();
     this.emit('camera');
   }
 
   /** Initial camera: the artifact page at the top, as wide as fits (100% on a desktop). */
   resetCamera() {
+    if (this.presenting) {
+      this.fitForPresentation();
+      return;
+    }
     const z = clampZoom(Math.min(1, (this.viewW - 24) / this.pageWidth));
     this.setCamera({ z, tx: (this.viewW - this.pageWidth * z) / 2, ty: this.viewW < 760 ? 112 : 70 }, 'system');
+  }
+
+  /**
+   * Presentation: the artifact page as wide as the screen (up to PRESENT_MAX_ZOOM), the line at
+   * the top of the view kept at the top (the page top, under the badge, when it was in view).
+   */
+  fitForPresentation() {
+    if (this.viewW <= 0) return;
+    const pad = this.viewW < 760 ? 6 : 24;
+    const z = clampZoom(Math.min(PRESENT_MAX_ZOOM, (this.viewW - 2 * pad) / this.pageWidth));
+    const top = Math.max(0, this.visibleWorld().y);
+    this.setCamera({ z, tx: (this.viewW - this.pageWidth * z) / 2, ty: top > 0 ? -top * z : PRESENT_TOP }, 'system');
   }
 
   private applyPageWidth() {
@@ -568,6 +779,13 @@ export class Editor {
     this.activeTool = TOOLS[id](this);
     if (id !== 'select') this.hideHover();
     this.stage.dataset.tool = id;
+    // a cursor the select tool set (move, a resize arrow, a link's pointer) must not hide the new tool's
+    this.stage.dataset.cursor = '';
+    this.frame.setInteractive(id === 'interact');
+    if (id !== 'laser') this.setLaserPointer(null);
+    // the others see a laser dot instead of an arrow for this cursor
+    const status = id === 'laser' ? 'cursor.laser' : null;
+    if (status !== this.publishedStatus) this.publishPresence({ status });
     this.emit('tool');
   }
 
@@ -583,6 +801,28 @@ export class Editor {
     this.laser = this.laser.filter((q) => now - q[2] < LASER_TTL);
     this.publishPresence({ laser: { pts: this.laser.slice(-60), now } });
     this.ensureLaserAnimation();
+  }
+
+  private laserHoldTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * The laser is pressed (true) or released (false). While it is pressed and held still, its
+   * last point goes out again every LASER_HOLD_MS so the dot stays on for the others (a few
+   * messages per second, inside the awareness pace).
+   */
+  holdLaser(on: boolean) {
+    if (this.laserHoldTimer) clearInterval(this.laserHoldTimer);
+    this.laserHoldTimer = null;
+    if (!on) return;
+    this.laserHoldTimer = setInterval(() => {
+      const last = this.laser[this.laser.length - 1];
+      if (last && Date.now() - last[2] >= LASER_HOLD_MS) this.addLaserPoint({ x: last[0], y: last[1] });
+    }, LASER_HOLD_MS);
+  }
+
+  /** The laser dot under a finger or a pen (no mouse cursor there); null hides it. */
+  setLaserPointer(screen: Pt | null) {
+    this.overlay?.setLaserPointer(screen);
   }
 
   ensureLaserAnimation() {
@@ -876,7 +1116,8 @@ export class Editor {
         this.pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), c: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, cam: { ...this.camera } };
         return;
       }
-      if (e.button === 1 || this.spaceDown || (e.button === 0 && this.tool === 'hand')) {
+      // the interact tool: the page takes the pointer itself; around it, a drag pans
+      if (e.button === 1 || this.spaceDown || (e.button === 0 && (this.tool === 'hand' || this.tool === 'interact'))) {
         this.panning = { last: info.screen };
         st.classList.add('panning');
         e.preventDefault();
@@ -891,12 +1132,15 @@ export class Editor {
         return;
       }
       if (this.readOnly && this.tool !== 'select' && this.tool !== 'laser') return;
+      if (this.tool === 'laser' && e.pointerType !== 'mouse') this.setLaserPointer(info.screen);
       this.activeTool.down(info);
     });
     st.addEventListener('pointermove', (e) => {
       const info = this.info(e);
       if (this.activePointers.has(e.pointerId)) this.activePointers.set(e.pointerId, info.screen);
       this.pointerWorld = info.world;
+      // a finger only moves while it touches; a pen also hovers
+      if (this.tool === 'laser' && (e.pointerType === 'pen' || (e.pointerType === 'touch' && this.activePointers.has(e.pointerId)))) this.setLaserPointer(info.screen);
       if (this.annotationsVisible || this.tool === 'laser') this.publishPresence({ cursor: { x: round(info.world.x), y: round(info.world.y) } });
       if (this.pinch && this.activePointers.size >= 2) {
         const [a, b] = [...this.activePointers.values()];
@@ -921,6 +1165,7 @@ export class Editor {
     });
     const up = (e: PointerEvent) => {
       this.activePointers.delete(e.pointerId);
+      if (e.pointerType === 'touch') this.setLaserPointer(null);
       if (this.pinch) {
         if (this.activePointers.size < 2) this.pinch = null;
         return;
@@ -935,6 +1180,7 @@ export class Editor {
     st.addEventListener('pointerup', up);
     st.addEventListener('pointercancel', (e) => {
       this.activePointers.delete(e.pointerId);
+      this.setLaserPointer(null);
       this.pinch = null;
       this.panning = null;
       this.activeTool.cancel?.();
@@ -942,6 +1188,7 @@ export class Editor {
     st.addEventListener('pointerleave', () => {
       this.publishPresence({ cursor: null });
       this.hideHover();
+      this.setLaserPointer(null);
     });
     st.addEventListener(
       'wheel',
@@ -949,15 +1196,7 @@ export class Editor {
         e.preventDefault();
         const r = st.getBoundingClientRect();
         const anchor = { x: e.clientX - r.left, y: e.clientY - r.top };
-        if (e.ctrlKey || e.metaKey) {
-          const factor = Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0025) * 4);
-          this.setCamera(zoomAt(this.camera, this.camera.z * factor, anchor));
-        } else {
-          const k = e.deltaMode === 1 ? 16 : 1;
-          const dx = e.shiftKey && !e.deltaX ? e.deltaY : e.deltaX;
-          const dy = e.shiftKey && !e.deltaX ? 0 : e.deltaY;
-          this.panBy(-dx * k, -dy * k);
-        }
+        this.wheel({ dx: e.deltaX, dy: e.deltaY, mode: e.deltaMode, zoom: e.ctrlKey || e.metaKey, shift: e.shiftKey }, anchor);
       },
       { passive: false },
     );
@@ -1005,6 +1244,24 @@ export class Editor {
     });
   }
 
+  /** A wheel: ctrl/⌘ (or a trackpad pinch) zooms at `anchor` (screen px), else it pans. */
+  wheel(w: Omit<FrameWheel, 'x' | 'y'>, anchor: Pt) {
+    if (w.zoom) {
+      const factor = Math.exp(-w.dy * (w.mode === 1 ? 0.05 : 0.0025) * 4);
+      this.setCamera(zoomAt(this.camera, this.camera.z * factor, anchor));
+      return;
+    }
+    const k = w.mode === 1 ? 16 : w.mode === 2 ? this.viewH : 1;
+    const dx = w.shift && !w.dx ? w.dy : w.dx;
+    const dy = w.shift && !w.dx ? 0 : w.dy;
+    this.panBy(-dx * k, -dy * k);
+  }
+
+  /** The artifact handed over a wheel (interact tool): the same as a wheel on the canvas. */
+  private wheelFromFrame(w: FrameWheel) {
+    this.wheel(w, this.toScreen({ x: w.x, y: w.y }));
+  }
+
   private onKeyDown(e: KeyboardEvent) {
     if (isTyping(e.target)) return;
     const mod = e.metaKey || e.ctrlKey;
@@ -1040,9 +1297,7 @@ export class Editor {
       return;
     }
     if (e.key === 'Escape') {
-      this.activeTool.cancel?.();
-      if (this.tool !== 'select') this.setTool('select');
-      else this.clearSelection();
+      this.escape();
       return;
     }
     if (e.key === 'Enter' && this.selection.size === 1) {
@@ -1070,7 +1325,7 @@ export class Editor {
     }
     const map: Record<string, ToolId> = {
       v: 'select', h: 'hand', d: 'draw', p: 'draw', e: 'eraser', a: 'arrow', l: 'line', t: 'text', n: 'note',
-      f: 'frame', k: 'laser',
+      f: 'frame', k: 'laser', i: 'interact',
     };
     if (map[k]) {
       this.setTool(map[k]);
@@ -1088,6 +1343,15 @@ export class Editor {
   }
 }
 
+
+/**
+ * Does this page have a user gesture right now? A click inside the artifact counts: user
+ * activation reaches the ancestors of the frame clicked. A browser without the API says no.
+ */
+function userActivated(): boolean {
+  const ua = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation;
+  return !!ua?.isActive;
+}
 
 function el(tag: string, cls: string): HTMLElement {
   const e = document.createElement(tag);

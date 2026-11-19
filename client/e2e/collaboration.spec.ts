@@ -142,12 +142,12 @@ test('Presentar: the others follow the presenter until they pan themselves', asy
   const A = await open(browser, 'Ana', room);
   const B = await open(browser, 'Marta', room);
   await A.page.getByTestId('present').click();
-  await expect(A.page.getByTestId('present')).toContainText('Dejar de presentar');
+  await expect(A.page.getByTestId('present-badge')).toBeVisible();
   await expect(B.page.getByTestId('banner')).toContainText('Ana está presentando');
-  // presenter scrolls and zooms
+  // presenter scrolls and zooms (the zoom buttons are hidden while presenting: the keyboard)
   await A.page.mouse.move(700, 450);
   await A.page.mouse.wheel(0, 900);
-  await A.page.getByTestId('zoom-in').click();
+  await A.page.keyboard.press('=');
   const centre = async (p: typeof A.page) => p.evaluate(() => {
     const e = (window as any).__canvas.editor;
     const v = e.visibleWorld();
@@ -157,10 +157,10 @@ test('Presentar: the others follow the presenter until they pan themselves', asy
     const [a, b] = [await centre(A.page), await centre(B.page)];
     return Math.abs(a.x - b.x) < 2 && Math.abs(a.y - b.y) < 2 && Math.abs(a.z - b.z) < 0.01;
   }).toBe(true);
-  // B pans: stops following
+  // B pans: stops following; the banner still says who presents and offers to follow again
   await B.page.mouse.move(700, 450);
   await B.page.mouse.wheel(0, 300);
-  await expect(B.page.getByTestId('banner')).toBeHidden();
+  await expect(B.page.getByTestId('banner-action')).toHaveText('Seguir');
   const bBefore = await camera(B.page);
   await A.page.mouse.wheel(0, 600);
   await A.page.waitForTimeout(300);

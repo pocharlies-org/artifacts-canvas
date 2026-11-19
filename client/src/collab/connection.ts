@@ -279,6 +279,11 @@ export class Connection {
     fn(this.status);
   }
 
+  /** Send the content updates waiting for the next send interval now (before the page changes). */
+  flush() {
+    this.batcher.flush();
+  }
+
   destroy() {
     if (this.devTimer) clearTimeout(this.devTimer);
     if (this.retryTimer) clearTimeout(this.retryTimer);

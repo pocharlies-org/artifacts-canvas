@@ -10,6 +10,7 @@ import { download, exportCanvas, type ExportFormat, type ExportScope } from '../
 import { geoOutline } from '../geometry/geo';
 import { polyPath } from '../render/shapeSvg';
 import { clear, h, installPopoverDismiss } from './dom';
+import { buildPresentation, startPresentation, stopPresentation } from './present';
 
 /** Builds the panels of the approved mockup around the canvas and keeps them in sync. */
 export function buildChrome(ed: Editor, root: HTMLElement) {
@@ -38,6 +39,7 @@ export function buildChrome(ed: Editor, root: HTMLElement) {
     bottomRow,
     banner(ed),
   );
+  buildPresentation(ed, root);
 }
 
 // ------------------------------------------------------------------ top left: title, live, annotations
@@ -82,7 +84,8 @@ function topRight(ed: Editor): HTMLElement {
   const avatars = h('div', { class: 'avatars', 'data-testid': 'avatars' });
   const followBtn = h('button', { class: 'btn', id: 'follow-btn', 'data-testid': 'follow' });
   const followMenu = h('div', { class: 'popover', 'data-owner': 'follow-btn', role: 'menu' });
-  const presentBtn = h('button', { class: 'btn primary', 'data-testid': 'present' });
+  // the button says what presenting does: fullscreen with the laser, and the others follow
+  const presentBtn = h('button', { class: 'btn primary', 'data-testid': 'present', title: t('app.present.title') });
   const shareBtn = h('button', { class: 'btn', 'data-testid': 'share', 'aria-label': t('app.share') },
     h('span', { class: 'lbl-full' }, t('app.share')), h('span', { class: 'lbl-short' }, '⤴'));
   const exportBtn = h('button', { class: 'btn', id: 'export-btn', 'data-testid': 'export', 'aria-label': t('app.export') },
@@ -142,7 +145,8 @@ function topRight(ed: Editor): HTMLElement {
     }
     followMenu.classList.toggle('open');
   });
-  presentBtn.addEventListener('click', () => ed.setPresenting(!ed.presenting));
+  // fullscreen needs this click: startPresentation asks for it inside the gesture
+  presentBtn.addEventListener('click', () => (ed.presenting ? stopPresentation(ed) : startPresentation(ed)));
   shareBtn.addEventListener('click', async () => {
     try {
       await navigator.clipboard.writeText(ed.cfg.shareUrl);
@@ -178,6 +182,7 @@ function topRight(ed: Editor): HTMLElement {
   exportBtn.addEventListener('click', () => exportMenu.classList.toggle('open'));
   ed.on('presence', update);
   ed.on('follow', update);
+  ed.on('present', update);
   ed.on('identity', update);
   update();
   return h('div', { class: 'panel topright' }, avatars,
@@ -345,6 +350,7 @@ function toolbar(ed: Editor): HTMLElement {
   const items: Item[] = [
     { id: 'select', icon: '⬉', key: 'V', tip: 'tool.select' },
     { id: 'hand', icon: '✋', key: 'H', tip: 'tool.hand' },
+    { id: 'interact', icon: '👆', key: 'I', tip: 'tool.interact' },
     'sep',
     { id: 'draw', icon: '✎', key: 'D', tip: 'tool.draw' },
     { id: 'highlight', icon: '🖍', key: '⇧D', tip: 'tool.highlight' },
@@ -455,19 +461,35 @@ function banner(ed: Editor): HTMLElement {
     let text = '';
     if (ed.notice) text = t(`app.notice.${ed.notice.kind}` as MessageKey);
     else if (ed.status === 'closed') text = t('app.notice.closed', { code: ed.conn?.closeCode ?? 0 });
-    else if (ed.followingUserId) {
-      const pres = ed.presenterName();
-      const u = displayUser((x) => ed.doc.user(x), ed.followingUserId);
-      const name = (ed.conn && peers(ed.conn.awareness).find((p) => p.state.user?.id === ed.followingUserId)?.state.user?.name) || u.name;
-      text = pres && pres === name ? t('app.presenting', { name: shortName(name) }) : t('app.following', { name: shortName(name) });
-      el.append(text, ' ', h('button', { class: 'btn small', onclick: () => ed.stopFollowing() }, t('app.follow.stop')));
-      el.classList.add('show');
-      return;
+    else if (!ed.presenting) {
+      const pres = ed.presenter();
+      const manual = ed.followingUserId && !ed.followingPresenter ? ed.followingUserId : null;
+      if (manual) {
+        const u = displayUser((x) => ed.doc.user(x), manual);
+        const name = (ed.conn && peers(ed.conn.awareness).find((p) => p.state.user?.id === manual)?.state.user?.name) || u.name;
+        show('following', t('app.following', { name: shortName(name) }), t('app.follow.stop'), () => ed.stopFollowing());
+        return;
+      }
+      if (pres) {
+        // someone presents: everyone else follows, this person's other tabs too; a follower may stop and follow again
+        const what = pres.self ? t('app.presenting.self') : t('app.presenting', { name: shortName(pres.name) });
+        if (ed.followingPresenter) show('presenting', what, t('app.follow.stop'), () => ed.stopFollowing());
+        else show('presenting', what, t('app.follow.again'), () => ed.followPresenter());
+        return;
+      }
     }
+    el.dataset.kind = text ? 'notice' : '';
     el.textContent = text;
     el.classList.toggle('show', !!text);
   };
+  const show = (kind: string, text: string, action: string, fn: () => void) => {
+    el.dataset.kind = kind;
+    el.append(h('span', { 'data-testid': 'banner-text' }, text), ' ',
+      h('button', { class: 'btn small', 'data-testid': 'banner-action', onclick: fn }, action));
+    el.classList.add('show');
+  };
   ed.on('follow', update);
+  ed.on('present', update);
   ed.on('notice', update);
   ed.on('status', update);
   ed.on('presence', update);

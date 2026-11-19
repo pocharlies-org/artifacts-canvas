@@ -5,6 +5,7 @@ import { setLang } from './i18n';
 import { Connection, anonPseudonym } from './collab/connection';
 import { Editor } from './editor/editor';
 import { buildChrome } from './ui/chrome';
+import { presentFromUrl } from './ui/present';
 import { personColor } from './model/colors';
 import { loadHandFont } from './render/fonts';
 import type { Identity } from './model/types';
@@ -30,6 +31,8 @@ const conn = new Connection(ydoc, { wsUrl: cfg.wsUrl, room: cfg.room, params, de
 const app = document.getElementById('app')!;
 const editor = new Editor(cfg, app, ydoc, conn, ledger);
 buildChrome(editor, app);
+// ?present=1: straight into presentation mode once the page has loaded
+presentFromUrl(editor);
 // the bundled hand font: lay text out again once it replaces the fallback
 void loadHandFont(() => editor.renderer.invalidateAll());
 

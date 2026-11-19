@@ -5,7 +5,12 @@
  *   - posts the content size and title to the parent (the canvas wrapper),
  *   - turns internal scrolling (anchor links) into a pan request for the parent,
  *   - renders a PNG snapshot of the page on the parent's request (export), and says whether
- *     part of it could not be captured (an image or a background that did not load).
+ *     part of it could not be captured (an image or a background that did not load),
+ *   - when the page takes the pointer (the canvas's interact tool): stops the frame from
+ *     navigating on a link click and tells the parent which URL was clicked (the parent decides
+ *     what opens: docs/protocol.md §3 "Links"), scrolls to same-document anchors through the
+ *     parent, and hands the parent the wheel that no element of the page scrolls,
+ *   - on the parent's request, says whether there is a link under a point, or follows it.
  * It reads no cookies or storage (it has none) and sends nothing anywhere else.
  * Copyright 2026 Daniel Ibáñez. Licensed under the Apache License, Version 2.0.
  */
@@ -168,6 +173,120 @@
       restore();
       post({ type: 'snapshot', id: d.id, dataUrl: null });
     });
+  });
+
+  // ---- links, anchors, wheel and Escape (docs/protocol.md §3 "Links") ----
+  var MAX_LINK = 4096;
+
+  /** The link (<a href>, <area href>, SVG <a>) at or around `node`, or null. */
+  function linkOf(node) {
+    for (var n = node; n && n.nodeType !== 9; n = n.parentNode) {
+      if (n.nodeType !== 1) continue;
+      var tag = String(n.localName || '').toLowerCase();
+      if (tag !== 'a' && tag !== 'area') continue;
+      var raw = n.getAttribute('href');
+      if (raw === null && n.getAttributeNS) raw = n.getAttributeNS('http://www.w3.org/1999/xlink', 'href');
+      if (raw === null) return null;
+      var url;
+      try { url = new URL(raw, document.baseURI); } catch (e) { return { el: n, url: null }; }
+      return { el: n, url: url };
+    }
+    return null;
+  }
+
+  /** The URL of this document without its fragment. */
+  function base(u) {
+    var i = u.indexOf('#');
+    return i < 0 ? u : u.slice(0, i);
+  }
+
+  /** Position (document px) of the target of `#hash`, or null; '#' and '#top' are the top. */
+  function anchorTarget(hash) {
+    var id = hash.charAt(0) === '#' ? hash.slice(1) : hash;
+    try { id = decodeURIComponent(id); } catch (e) { /* keep it */ }
+    var el = id ? document.getElementById(id) : null;
+    if (!el && id) {
+      var named = document.getElementsByName(id);
+      for (var i = 0; i < named.length; i++) if (String(named[i].localName).toLowerCase() === 'a') { el = named[i]; break; }
+    }
+    if (el) {
+      var r = el.getBoundingClientRect();
+      return { x: r.left + (window.scrollX || 0), y: r.top + (window.scrollY || 0) };
+    }
+    if (!id || id.toLowerCase() === 'top') return { x: 0, y: 0 };
+    return null;
+  }
+
+  /**
+   * A click on link `ln`. Returns true when the reporter took it over (the frame must not
+   * navigate): a same-document anchor scrolls through the parent, every other URL goes to the
+   * parent as a `link` message. `javascript:` links stay with the page's own script.
+   */
+  function follow(ln, newTab) {
+    if (!ln.url) return true; // an unparsable href: nothing opens
+    var href = ln.url.href;
+    if (ln.url.protocol === 'javascript:') return false;
+    if ((ln.url.protocol === 'http:' || ln.url.protocol === 'https:') && href.indexOf('#') >= 0 && base(href) === base(location.href) && !newTab) {
+      var p = anchorTarget(ln.url.hash || '#');
+      if (p) post({ type: 'anchor', x: p.x, y: p.y });
+      return true;
+    }
+    post({ type: 'link', href: href.length <= MAX_LINK ? href : '', newTab: !!newTab });
+    return true;
+  }
+
+  function wantsNewTab(e, ln) {
+    var target = ln && ln.el.getAttribute ? String(ln.el.getAttribute('target') || '').toLowerCase() : '';
+    return !!(e.ctrlKey || e.metaKey || e.shiftKey || e.button === 1 || (target && target !== '_self' && target !== '_top' && target !== '_parent'));
+  }
+
+  function onClick(e) {
+    if (e.defaultPrevented || (e.button !== 0 && e.button !== 1)) return; // the page handled it
+    var ln = linkOf(e.target);
+    if (ln && follow(ln, wantsNewTab(e, ln))) e.preventDefault();
+  }
+  window.addEventListener('click', onClick);
+  window.addEventListener('auxclick', onClick);
+
+  /** Can `node` or an element around it scroll by (dx, dy)? Then the wheel is the page's own. */
+  function scrollsInside(node, dx, dy) {
+    for (var n = node; n && n.nodeType === 1 && n !== document.documentElement && n !== document.body; n = n.parentNode) {
+      var cs = window.getComputedStyle(n);
+      if (dy && /(auto|scroll|overlay)/.test(cs.overflowY) && n.scrollHeight > n.clientHeight + 1) {
+        if ((dy > 0 && n.scrollTop + n.clientHeight < n.scrollHeight - 1) || (dy < 0 && n.scrollTop > 0)) return true;
+      }
+      if (dx && /(auto|scroll|overlay)/.test(cs.overflowX) && n.scrollWidth > n.clientWidth + 1) {
+        if ((dx > 0 && n.scrollLeft + n.clientWidth < n.scrollWidth - 1) || (dx < 0 && n.scrollLeft > 0)) return true;
+      }
+    }
+    return false;
+  }
+
+  window.addEventListener('wheel', function (e) {
+    if (e.defaultPrevented) return; // the page's own widget took it
+    var zoom = e.ctrlKey || e.metaKey;
+    if (!zoom && scrollsInside(e.target, e.deltaX, e.deltaY)) return;
+    e.preventDefault();
+    post({ type: 'wheel', dx: e.deltaX, dy: e.deltaY, mode: e.deltaMode, zoom: zoom, shift: e.shiftKey, x: e.clientX + (window.scrollX || 0), y: e.clientY + (window.scrollY || 0) });
+  }, { passive: false });
+
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !e.defaultPrevented) post({ type: 'key', key: 'Escape' });
+  });
+
+  // The parent's select tool: a link under a point (probe), and following it (click).
+  window.addEventListener('message', function (e) {
+    if (e.source !== parentWin) return;
+    var d = e.data;
+    if (!d || d.source !== 'artifacts-canvas' || (d.type !== 'probe' && d.type !== 'click')) return;
+    var x = Number(d.x);
+    var y = Number(d.y);
+    var ln = isFinite(x) && isFinite(y) ? linkOf(document.elementFromPoint(x - (window.scrollX || 0), y - (window.scrollY || 0))) : null;
+    if (d.type === 'probe') {
+      post({ type: 'probe', id: String(d.id || '').slice(0, 32), link: !!(ln && ln.url && ln.url.protocol !== 'javascript:') });
+      return;
+    }
+    if (ln) follow(ln, d.newTab === true);
   });
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);

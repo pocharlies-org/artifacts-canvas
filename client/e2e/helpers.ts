@@ -11,13 +11,18 @@ export function newRoom(prefix: string): string {
 }
 
 /** Open the wrapper as `name` (dev identity) in its own browser context. */
-export async function open(browser: Browser, name: string, room: string, opts: { artifact?: string; viewport?: { width: number; height: number }; lang?: string; deviceScaleFactor?: number; prodCsp?: boolean } = {}): Promise<Opened> {
-  const ctx = await browser.newContext({ viewport: opts.viewport ?? { width: 1440, height: 900 }, deviceScaleFactor: opts.deviceScaleFactor, acceptDownloads: true });
+export async function open(browser: Browser, name: string, room: string, opts: { artifact?: string; viewport?: { width: number; height: number }; lang?: string; deviceScaleFactor?: number; prodCsp?: boolean; query?: Record<string, string>; mobile?: boolean; initScript?: string } = {}): Promise<Opened> {
+  const ctx = await browser.newContext({
+    viewport: opts.viewport ?? { width: 1440, height: 900 }, deviceScaleFactor: opts.deviceScaleFactor, acceptDownloads: true,
+    ...(opts.mobile ? { isMobile: true, hasTouch: true } : {}),
+  });
+  if (opts.initScript) await ctx.addInitScript(opts.initScript);
   const page = await ctx.newPage();
   page.on('pageerror', (e) => console.log(`[${name}] pageerror`, e.message));
   const q = new URLSearchParams({ room, as: name });
   if (opts.lang) q.set('lang', opts.lang);
   if (opts.prodCsp) q.set('csp', 'prod'); // the dev server then sends the production wrapper CSP
+  for (const [k, v] of Object.entries(opts.query ?? {})) q.set(k, v);
   await page.goto(`/_canvas/${opts.artifact ?? 'sample-report.html'}?${q}`);
   await ready(page);
   return { page, close: () => ctx.close() };

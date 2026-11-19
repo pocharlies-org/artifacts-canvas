@@ -6,7 +6,7 @@ import { lineGeometry, lineMidpoint, shapeBounds, shapeCorners } from '../geomet
 import { HANDLE_DIR, type Handle } from '../geometry/transform';
 import { type Pt, rotate } from '../geometry/vec';
 import { EraserTool, SelectTool, selectionFrame } from '../tools/tools';
-import { t } from '../i18n';
+import { has, t } from '../i18n';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const HANDLE = 9;
@@ -27,6 +27,8 @@ export class Overlay {
   readonly laserSvg: SVGSVGElement;
   readonly cursors: HTMLElement;
   readonly hover: HTMLElement;
+  /** The local laser dot under a finger or a pen (a mouse gets the laser cursor instead). */
+  readonly laserPointer: HTMLElement;
   private handles: { p: Pt; hit: HandleHit }[] = [];
   private frame = 0;
   private cursorEls = new Map<number, HTMLElement>();
@@ -43,7 +45,21 @@ export class Overlay {
     this.hover.className = 'hovercard';
     this.hover.setAttribute('data-testid', 'hovercard');
     this.hover.style.display = 'none';
-    ed.stage.append(this.svg, this.laserSvg, this.cursors, this.hover);
+    this.laserPointer = document.createElement('div');
+    this.laserPointer.className = 'laser-pointer';
+    this.laserPointer.setAttribute('data-testid', 'laser-pointer');
+    this.laserPointer.hidden = true;
+    ed.stage.append(this.svg, this.laserSvg, this.cursors, this.hover, this.laserPointer);
+  }
+
+  /** Show the local laser dot at a screen point, or hide it (null). */
+  setLaserPointer(p: Pt | null) {
+    if (!p) {
+      this.laserPointer.hidden = true;
+      return;
+    }
+    this.laserPointer.hidden = false;
+    this.laserPointer.style.transform = `translate(${p.x}px, ${p.y}px)`;
   }
 
   update() {
@@ -143,6 +159,8 @@ export class Overlay {
       const st = peer.state;
       if (!st.cursor || !st.user) continue;
       if (st.user.id === ed.me?.id && peer.clientId === conn.awareness.clientID) continue;
+      // while its laser trail shows, the trail's own dot and label stand for the cursor
+      if (st.laser && st.laser.pts.length) continue;
       seen.add(peer.clientId);
       let el = this.cursorEls.get(peer.clientId);
       if (!el) {
@@ -155,13 +173,18 @@ export class Overlay {
       const p = ed.toScreen(st.cursor);
       el.style.transform = `translate(${p.x}px, ${p.y}px)`;
       const name = shortName(st.user.name, st.user.anonymous);
-      const status = st.status && st.status.startsWith('cursor.') ? ` · ${t(st.status as 'cursor.typing')}` : '';
+      const laser = st.status === 'cursor.laser';
+      const status = st.status && st.status.startsWith('cursor.') && has(st.status) ? ` · ${t(st.status)}` : '';
       const label = name + status;
       if (el.dataset.label !== label || el.dataset.color !== st.user.color) {
         el.dataset.label = label;
         el.dataset.color = st.user.color;
         el.dataset.userId = st.user.id;
-        el.innerHTML = `<svg width="18" height="20"><path d="M1 1 L1 17 L5.5 12.5 L9 19 L11.5 18 L8 11.5 L14 11.5 Z" fill="${st.user.color}" stroke="#fff" stroke-width="1.2"/></svg><span class="lbl" style="background:${st.user.color}"></span>`;
+        el.classList.toggle('laser', laser);
+        // a laser cursor is a red dot centred on the point, not an arrow
+        el.innerHTML = laser
+          ? `<svg width="22" height="22" class="dot"><circle cx="11" cy="11" r="9" fill="${LASER_COLOR}" opacity="0.25"/><circle cx="11" cy="11" r="5" fill="${LASER_COLOR}" stroke="#fff" stroke-width="1.5"/></svg><span class="lbl" style="background:${LASER_COLOR}"></span>`
+          : `<svg width="18" height="20"><path d="M1 1 L1 17 L5.5 12.5 L9 19 L11.5 18 L8 11.5 L14 11.5 Z" fill="${st.user.color}" stroke="#fff" stroke-width="1.2"/></svg><span class="lbl" style="background:${st.user.color}"></span>`;
         el.querySelector('.lbl')!.textContent = label;
       }
     }
@@ -210,7 +233,10 @@ export class Overlay {
       const alpha = Math.max(0, 1 - tr.age(last[2]) / 1000);
       out += `<circle data-testid="laser-dot" cx="${lp.x}" cy="${lp.y}" r="6" fill="${LASER_COLOR}" opacity="${alpha.toFixed(3)}"/>`;
       const label = t(tr.presenting ? 'laser.presenting' : 'laser.label', { name: shortName(tr.name) });
-      out += `<g opacity="${alpha.toFixed(3)}" transform="translate(${lp.x + 10} ${lp.y + 6})"><rect width="${label.length * 6.2 + 12}" height="17" rx="4" fill="${LASER_COLOR}"/><text x="6" y="12.5" font-size="10.5" font-weight="600" fill="#fff" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,sans-serif">${esc(label)}</text></g>`;
+      const lw = label.length * 6.2 + 12;
+      // the tag goes to the left of the dot when it would run off the right edge (phones)
+      const lx = lp.x + 10 + lw > ed.viewW && lp.x - 10 - lw >= 0 ? lp.x - 10 - lw : lp.x + 10;
+      out += `<g opacity="${alpha.toFixed(3)}" transform="translate(${lx} ${lp.y + 6})"><rect width="${lw}" height="17" rx="4" fill="${LASER_COLOR}"/><text x="6" y="12.5" font-size="10.5" font-weight="600" fill="#fff" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,sans-serif">${esc(label)}</text></g>`;
     }
     g.innerHTML = out;
     return active;

@@ -18,7 +18,9 @@ button { font: inherit; color: inherit; }
 .stage[data-tool="geo"], .stage[data-tool="frame"], .stage[data-tool="note"] { cursor: crosshair; }
 .stage[data-tool="text"] { cursor: text; }
 .stage[data-tool="eraser"] { cursor: cell; }
-.stage[data-tool="laser"] { cursor: none; }
+.stage[data-tool="laser"] { cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%23ff2d55' fill-opacity='0.28'/%3E%3Ccircle cx='12' cy='12' r='5' fill='%23ff2d55' stroke='%23ffffff' stroke-width='1.5'/%3E%3C/svg%3E") 12 12, crosshair; }
+.stage[data-tool="interact"] { cursor: default; }
+.stage[data-cursor="pointer"] { cursor: pointer; }
 .stage[data-tool="hand"], .stage.space { cursor: grab; }
 .stage.panning { cursor: grabbing; }
 .stage[data-cursor="move"] { cursor: move; }
@@ -30,12 +32,21 @@ button { font: inherit; color: inherit; }
 .world { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
 .page { position: absolute; left: 0; top: 0; background: #fff; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow: hidden; }
 .artifact-frame { display: block; border: 0; background: #fff; pointer-events: none; }
+/* the interact tool: the artifact takes the pointer (links, buttons, inner scrolling) */
+.artifact-frame.interactive { pointer-events: auto; }
 svg.shapes { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
 svg.shapes g.editing text { display: none; }
 svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
 .cursors { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
 .cursor { position: absolute; left: 0; top: 0; pointer-events: none; transition: transform 60ms linear; }
 .cursor .lbl { position: absolute; left: 14px; top: 14px; font-size: 11px; color: #fff; padding: 2px 7px; border-radius: 9px; white-space: nowrap; font-weight: 600; }
+/* another person's laser cursor: a red dot centred on the point */
+.cursor.laser svg { position: absolute; left: -11px; top: -11px; }
+.cursor.laser .lbl { left: 12px; top: 6px; }
+/* my laser under a finger or a pen, where there is no mouse cursor */
+.laser-pointer { position: absolute; left: -18px; top: -18px; width: 36px; height: 36px; border-radius: 50%; pointer-events: none; z-index: 7;
+  background: radial-gradient(circle, #ff2d55 0 6px, #fff 6px 7.5px, rgba(255,45,85,.45) 7.5px, rgba(255,45,85,0) 18px); }
+.laser-pointer[hidden] { display: none; }
 .hovercard { position: absolute; left: 0; top: 0; background: #111827; color: #fff; font-size: 12px; border-radius: 8px; padding: 8px 10px; box-shadow: 0 6px 18px rgba(0,0,0,.25); line-height: 1.45; pointer-events: none; max-width: 260px; z-index: 5; }
 .hovercard .dim { color: #9ca3af; }
 .text-editor { position: absolute; z-index: 6; border: 0; outline: 1px dashed rgba(37,99,235,.6); background: transparent; resize: none; overflow: hidden; line-height: 1.35; margin: 0; white-space: pre-wrap; word-break: break-word; }
@@ -132,6 +143,21 @@ svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-e
 .banner { position: absolute; top: 62px; left: 50%; transform: translateX(-50%); background: #111827; color: #fff; font-size: 12.5px; padding: 6px 8px 6px 12px; border-radius: 10px; display: none; align-items: center; gap: 8px; z-index: 30; }
 .banner.show { display: flex; }
 .banner .btn { background: #374151; color: #fff; border-color: #4b5563; }
+
+/* ---------- presentation mode: the editing chrome hidden, a few floating controls ---------- */
+.present-ui { display: none; }
+body.present-mode .present-ui { display: block; }
+body.present-mode .topleft, body.present-mode .topright, body.present-mode .side, body.present-mode .bottomrow { display: none !important; }
+.present-badge { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 45; background: rgba(17,24,39,.86); color: #fff; font-size: 12.5px; font-weight: 600; padding: 6px 12px; border-radius: 999px; white-space: nowrap; pointer-events: none; }
+.present-badge::before { content: "●"; color: #ff2d55; margin-right: 6px; }
+.present-fs { position: fixed; top: 50px; left: 50%; transform: translateX(-50%); z-index: 46; border: 0; border-radius: 10px; padding: 10px 16px; background: var(--blue); color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; box-shadow: 0 6px 20px rgba(0,0,0,.25); white-space: nowrap; }
+.present-fs[hidden] { display: none; }
+.present-controls { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 45; display: flex; align-items: center; gap: 2px; padding: 6px; background: rgba(17,24,39,.88); border-radius: 14px; box-shadow: 0 6px 20px rgba(0,0,0,.25); }
+.present-controls .tool { color: #e5e7eb; }
+.present-controls .tool:hover { background: rgba(255,255,255,.12); }
+.present-controls .tool.on { background: #ff2d55; color: #fff; }
+.present-controls .sep { background: rgba(255,255,255,.25); }
+.present-controls .exit { font-size: 16px; }
 
 /* ---------- narrow screens (phones) ---------- */
 @media (max-width: 760px) {
