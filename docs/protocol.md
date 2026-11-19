@@ -115,7 +115,8 @@ still (`mode`, §3) so it scrolls on its own, links and buttons work as with the
 and the annotations, toolbar and panels are hidden. A small pill, "✏️ Canvas · 3" (the
 annotations in the room), opens the canvas; next to it, "2 personas anotando" (other people with
 the canvas shown) and "Ver original". The connection stays, so the count is live, but a hidden
-canvas is quiet: its presence has no cursor, viewport, laser or status, and it follows nobody.
+canvas is quiet: its presence has no cursor, viewport, laser, status or presentation, and its
+camera follows nobody (its presence still has its identity and the presenter it would follow).
 A link to another page keeps `canvas=` when the URL had it.
 
 ## 3. Frame: the artifact, isolated
@@ -173,6 +174,11 @@ does it for the user, in `client/src/artifact/links.ts`:
   riding on a click made elsewhere on the canvas, gets nothing (`client/e2e/links.spec.ts`,
   `links-forge.html`). Nothing is fetched: the outcome is a navigation of this tab, a new tab or
   nothing. The wrapper CSP is unchanged.
+- The gate cannot tell a click on a real link from any other gesture: after a user click or key
+  press inside the artifact (the interact tool, or the canvas hidden), or a plain select-tool
+  click on the page, the artifact's own script can open one external http(s) tab or navigate this
+  tab to another canvas page of the same host, like any click-gated popup (one per gesture,
+  `noopener,noreferrer`). It cannot do either without such a gesture.
 
 **Background.** The board takes the artifact's own background, so the area around and beyond the
 page is the page's colour, and a dark page sits on a dark board. The reporter posts the computed
@@ -327,6 +333,32 @@ interface Identity {
 - Any other sync type closes the connection with `1003` (`unknown sync type`).
 - The ledger is sent as a full state on join and then as each stamper transaction's update, to
   every connection (the sender included). It has no client → server direction.
+
+### 4.2 Awareness (who sends what)
+
+- **A tab sends its own awareness state and nothing else** (`client/src/collab/connection.ts`
+  `sendOwnAwarenessOnly`): its changes, its renewals (y-protocols renews an unchanged state every
+  15 s) and, when a remote update removes its state, the same state at a higher clock (y-protocols'
+  re-announcement, so the others see it again). Its answer to QUERY_AWARENESS is its own state.
+  The stock y-websocket 3.1.0 client sends every awareness update event, the ones fired by states
+  it received included, so every tab sent every other tab's states back: the room's awareness
+  traffic grew with the square of its size, the echoes counted against each tab's message bucket
+  (§10), and a presentation of 10 tabs closed every tab `4429`.
+- **The server relays each update once to every other member.** The sender does not get its own
+  change back. A renewal (the same state at a newer clock) goes back to it as well: a stock client
+  alone in its room hears nothing else, and y-websocket closes a socket that heard nothing for 30 s.
+- **What the room relayed is not charged to the members it was sent to.** An AWARENESS message
+  whose entries are all client ids the connection does not hold, at clocks the room already has
+  (`isAwarenessEcho`, `shared/src/awareness.ts`: a stock client, or a tab still running an older
+  canvas bundle, sending back what it received), is dropped like any foreign state and takes no
+  token of the connection's message bucket, at most once per update relayed to that connection
+  (the allowance is capped at its burst); `canvas_ws_awareness_echoes_total` counts them. Beyond
+  that allowance such messages are charged as usual.
+- **A tab sends presence only when it changed**, at most `SEND_HZ` times a second (§10): a patch
+  that changes nothing is not set (y-protocols would send it with a newer clock). A follower's
+  camera moves with the presenter's, and the follower publishes its own viewport once that camera
+  stood still for 500 ms (`FOLLOW_SETTLE_MS`), not at the presenter's pace: a presentation adds
+  the presenter's stream to the room, not one stream per member (`client/e2e-server/presence.spec.ts`).
 
 ## 5. Attribution: server-stamped, never client-written
 
@@ -520,10 +552,11 @@ presenting tab on its own, the presenter's own other tabs and devices included (
 client id, not by person; the tab itself is never a candidate). A follower that stops following
 is left alone until that presenter stops; when the presenter stops or its state goes away (it
 disconnected), its followers are released. Two presenters at once: followers keep the one they
-follow, newcomers take the lowest client id. The viewport a presenter publishes goes out at the
-awareness pace like cursors, so presenting adds no messages; while the laser is held still its
-last point is sent again every 300 ms (at most about 3 messages/s) so it does not fade for the
-others.
+follow, newcomers take the lowest client id. The presenter's viewport and laser go out at the
+awareness pace like cursors; a follower sends nothing while the presenter's laser moves, and its
+own viewport only once its camera stood still for 500 ms (§4.2), so a presentation adds one stream
+to the room whatever its size. While the laser is held still its last point is sent again every
+300 ms (at most about 3 messages/s) so it does not fade for the others.
 
 ## 7. AuthZ: the core contract (matches core `gate/gate.py` + `docs/plugins.md` §1)
 
@@ -662,11 +695,12 @@ switch (§1) does not apply to it: with anonymous drawing off it still asks the 
   whatever pongs it sends.
 - **Awareness hardening** (§5.4): the `user` field is overwritten with the verified
   identity; states for clientIds already owned by another connection are dropped; every state
-  is reduced to the presence schema.
+  is reduced to the presence schema. Each update is relayed once to the other members; a member
+  that sends back what the room relayed to it is not charged for it, up to what was relayed (§4.2).
 - **Limits** (anonymous gets the stricter set): messages `120/s` burst 240 (anon 30/60) →
   `4429` (the client keeps under it at any display rate: it merges its content updates into at
-  most 30 messages/s and sends awareness at most 30 times/s, 12/s each anonymous, never once per
-  animation frame; the batches of a big delete stay separate messages, `client/src/collab/pacer.ts`); message size 4 MiB (anon 1 MiB) → `4413`; room size 5 MiB (anon 1.25 MiB), **content
+  most 30 messages/s and sends its own awareness, never another tab's, at most 30 times/s, 12/s
+  each anonymous, never once per animation frame; the batches of a big delete stay separate messages, `client/src/collab/pacer.ts`); message size 4 MiB (anon 1 MiB) → `4413`; room size 5 MiB (anon 1.25 MiB), **content
   plus ledger** → `4413` (all of them lowered at start to what the memory budget holds, see
   "Loaded rooms" below; the ledger an update will add is counted ahead, `ledgerBound` §11),
   where every **cut** an update makes in an item counts `SPLIT_COST_BYTES` (32) on top of its
