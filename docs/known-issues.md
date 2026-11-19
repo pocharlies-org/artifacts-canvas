@@ -10,8 +10,7 @@ on every key the core opened to them, and now accepts them nowhere.
 ## Live test of a deployment
 
 An end-to-end pass on a deployed canvas (a real browser on a 120 Hz screen, two tabs) found these.
-Regressions: `client/e2e-server/rate.spec.ts`, `client/tests/pacer.test.ts`,
-`client/tests/rate-limit.test.ts`.
+Each fixed entry names its regression tests.
 
 - [x] **L-1 — Drawing on a 120 Hz screen closed the connection after about 2 s, for good (High).**
   The editor sent one content update and one awareness update per animation frame, so the message
@@ -28,7 +27,8 @@ Regressions: `client/e2e-server/rate.spec.ts`, `client/tests/pacer.test.ts`,
   banner says so (protocol §4). The server's limits are unchanged. Measured in a real browser
   against the real server with its default limits, the display simulated: a 120 Hz stroke peaked at
   60 messages/s and a 240 Hz one at 60 (before: 248/s and `4429`), a 240 Hz drag at 60/s (before:
-  379/s and `4429`).
+  379/s and `4429`). Tests: `client/e2e-server/rate.spec.ts`, `client/tests/pacer.test.ts`,
+  `client/tests/rate-limit.test.ts`.
 - [x] **L-2 — Export left the artifact out when one of its images failed to load, and said nothing
   (Medium).** The reporter's snapshot (html-to-image) rejected as a whole when one `<img>` of the page
   could not be read, and the export then drew the annotations on a blank page with no warning. Now a
@@ -54,6 +54,20 @@ Regressions: `client/e2e-server/rate.spec.ts`, `client/tests/pacer.test.ts`,
   delete, 1 KiB once the data is deleted with it). Tests: `client/tests/assets.test.ts`,
   `client/e2e-server/assets.spec.ts`. Left: a copy pasted by one user while another deletes the last
   shape naming the same data (concurrently) names data that is gone, and shows an empty image.
+- [ ] **L-4 — Relative images and other subresources of signed-in artifacts do not load (Medium; the
+  core's design, not a canvas defect).** A `u/` or `g/` page that loads a file next to it
+  (`<img src="chart.png">`, a stylesheet, a script, a `url(...)` in CSS) shows it broken, on the plain
+  artifact link and in the canvas alike. The core serves artifacts with
+  `Content-Security-Policy: sandbox allow-scripts` and the canvas frame is `sandbox="allow-scripts"`:
+  either gives the page an opaque origin, the browser treats its subresource requests as cross-site
+  and does not send the login session cookie (`SameSite=Lax`), and the request reaches the core (plain
+  link) or the canvas frame route as anonymous and is refused. In the canvas frame even a `pub/`
+  page's relative files fail while anonymous drawing is off (a request with no credential is refused
+  before the core is asked), although the plain `pub/` link loads them. The sandbox stays: it keeps an
+  artifact's scripts away from the viewer's session. Contract: a signed-in artifact is one
+  self-contained HTML file, with images inline as `data:` URLs (or from a public third-party host); a
+  URL on the artifacts host itself fails the same way. Export leaves such images blank and says so
+  (L-2).
 - [x] **L-5 — A signed-in user outside the ACL got a bare "forbidden" (Low).** The wrapper answered
   `403 text/plain` "forbidden", while the plain artifact link answers with the core's access-required
   page and its request-access form. Now the wrapper's `403` is an HTML page that says the canvas is not
