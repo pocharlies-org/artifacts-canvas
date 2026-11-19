@@ -516,10 +516,12 @@ export async function runHonestFuzz(runs: number, seed: number, steps = 400, mod
       }
       await tick();
       // done when every tab is online, its server connection finished joining (join() awaits
-      // the room load: on a busy host that takes more than one tick), and nothing is in flight
+      // the room load: on a busy host that takes more than one tick), and nothing is in flight:
+      // not on the link, and not in the canvas client's send queue (its connection merges local
+      // updates per send interval, client/src/collab/pacer.ts)
       const settled = () => {
         const conns = [...(manager.get(KEY)?.conns.values() ?? [])];
-        return tabs.every((t) => t.link && t.link.server && conns.some((c) => c.ws === (t.link!.server as unknown) && !c.joining) && t.provider.synced && !t.link.c2s.length && !t.link.s2c.length);
+        return tabs.every((t) => t.link && t.link.server && conns.some((c) => c.ws === (t.link!.server as unknown) && !c.joining) && t.provider.synced && !t.link.c2s.length && !t.link.s2c.length && !t.conn?.queuedUpdates);
       };
       if (!moved && settled()) {
         // fv9: the room's worker answered everything it was sent

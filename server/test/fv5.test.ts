@@ -658,7 +658,9 @@ describe('fv5 M-2: an honest reconnect is never refused', () => {
 
   it('honest-edit fuzz (CI slice): real y-websocket and the canvas client, offline, undo/redo, 2-3 tabs: 0 refusals, 0 divergence', async () => {
     for (const mode of ['ywebsocket', 'client'] as const) {
-      const r = await runHonestFuzz(60, 11, 400, mode);
+      // the canvas client merges its local updates per send interval (client/src/collab/pacer.ts):
+      // the same edits arrive in fewer messages, so it gets more runs for the same floor
+      const r = await runHonestFuzz(mode === 'client' ? 80 : 60, 11, 400, mode);
       expect(r.refusals).toEqual({});
       expect(r.refused + r.diverged).toBe(0);
       expect(r.updates).toBeGreaterThan(500);

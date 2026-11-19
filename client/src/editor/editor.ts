@@ -5,6 +5,7 @@ import { encodeImage, roomBytes, wouldOverfill } from './images';
 import { attachStamper } from '../model/stamper';
 import { DEFAULT_STYLE, STYLE_KEYS, type Identity, type Shape, type Style, type GeoKind } from '../model/types';
 import { Connection, type Status } from '../collab/connection';
+import { Throttle, sendIntervalMs } from '../collab/pacer';
 import { peers, setPresence, type LaserPoint, type PresenceState } from '../collab/presence';
 import type { Notice } from '../collab/protocol';
 import { ArtifactFrame } from '../artifact/frame';
@@ -69,7 +70,8 @@ export class Editor {
   private clipboard: { shapes: Shape[]; assets: Record<string, string> } | null = null;
   private listeners = new Map<Topic, Set<() => void>>();
   activeTool: Tool;
-  private presenceFrame = 0;
+  /** Awareness goes out at the send rate, not once per animation frame (collab/pacer.ts). */
+  private readonly presencePace = new Throttle(() => this.sendIntervalMs());
   private pendingPresence: Partial<PresenceState> = {};
   private laserAnim = 0;
   private stamperDetach: (() => void) | null = null;
@@ -144,8 +146,9 @@ export class Editor {
     if (conn) {
       conn.onStatus((s) => {
         this.status = s;
-        // a notice that only meant "reconnecting" ends once the tab is synced again
-        if (s === 'synced' && this.notice && (this.notice.kind === 'busy' || this.notice.kind === 'shutdown')) {
+        // a notice that only meant "reconnecting" ends once the tab is synced again (a rate
+        // limit too: the connection waits a moment and reconnects, see Connection)
+        if (s === 'synced' && this.notice && (this.notice.kind === 'busy' || this.notice.kind === 'shutdown' || this.notice.kind === 'rate-limited')) {
           this.notice = null;
           this.emit('notice');
         }
@@ -216,20 +219,19 @@ export class Editor {
     return this.status === 'closed';
   }
 
+  /** Milliseconds between two awareness messages (collab/pacer.ts; the connection paces content). */
+  sendIntervalMs(): number {
+    return sendIntervalMs(!!this.me?.anonymous);
+  }
+
   publishPresence(patch: Partial<PresenceState>, immediate = false) {
     if (!this.conn) return;
     Object.assign(this.pendingPresence, patch);
-    if (immediate) {
-      this.flushPresence();
-      return;
-    }
-    if (this.presenceFrame) return;
-    this.presenceFrame = requestAnimationFrame(() => this.flushPresence());
+    this.presencePace.schedule(() => this.flushPresence());
+    if (immediate) this.presencePace.flush();
   }
 
   private flushPresence() {
-    if (this.presenceFrame) cancelAnimationFrame(this.presenceFrame);
-    this.presenceFrame = 0;
     if (!this.conn || !this.me) {
       return;
     }

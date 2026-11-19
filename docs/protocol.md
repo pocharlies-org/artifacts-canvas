@@ -187,7 +187,8 @@ interface Identity {
   connections are accepted only while `ANON_ENABLED` is on (§1: off, they are closed `4403` and
   never get a cookie) and only for keys inside `ANON_ALLOWED_PREFIXES` (default `pub/`);
   anything else is denied with reason `anon_outside_pub` (§7).
-- Close codes (RFC 6455 private range; the client does not reconnect on 44xx): `4403`
+- Close codes (RFC 6455 private range; the client does not reconnect on 44xx, except `4429`,
+  see below): `4403`
   forbidden (authz denied, revoked, or a forbidden write, §5), `4404` artifact gone, `4410`
   artifact expired, `4413` document/message too large (also a stored room that costs more than
   the joining principal's whole memory share, §10), `4429` rate-limited, `4503`
@@ -196,6 +197,13 @@ interface Identity {
   with backoff — a join is never refused with the terminal `4429`, fv5 M-6). `4401`
   (unauthenticated) is reserved and unused in v1 — the gate denies unauthenticated visitors
   as `4403`/`4404`. Send a NOTICE before closing when there is something to tell the user.
+- After a `4429` the client waits and joins again (`client/src/collab/connection.ts`
+  `RATE_LIMIT_BACKOFF`): 2 s, doubled on each `4429` in a row up to 30 s, plus up to 0.5 s of
+  jitter; the streak ends once a connection stayed synced for 60 s. The tab stays editable while
+  it waits (status `disconnected`, never read-only), and its edits go out with the step-2 answer
+  of the next join. A rate limit is not a decision against the user: before this, one honest
+  stroke on a 120 Hz screen left the tab read-only until a reload. Each retry is a join, so the
+  join rate and the CPU budget still bound a client that keeps flooding.
 - Re-check authz every `AUTHZ_RECHECK_SECONDS` (default 300; the chart ships 300) and on ACL
   change; on a deny send NOTICE `revoked`/`expired` and close 4403/4410. When the core could not
   answer (`core_error`: timeout, network error, 5xx; `malformed`) nothing was decided: the
@@ -567,7 +575,9 @@ switch (§1) does not apply to it: with anonymous drawing off it still asks the 
   identity; states for clientIds already owned by another connection are dropped; every state
   is reduced to the presence schema.
 - **Limits** (anonymous gets the stricter set): messages `120/s` burst 240 (anon 30/60) →
-  `4429`; message size 4 MiB (anon 1 MiB) → `4413`; room size 5 MiB (anon 1.25 MiB), **content
+  `4429` (the client keeps under it at any display rate: it merges its content updates into at
+  most 30 messages/s and sends awareness at most 30 times/s, 12/s each anonymous, never once per
+  animation frame; the batches of a big delete stay separate messages, `client/src/collab/pacer.ts`); message size 4 MiB (anon 1 MiB) → `4413`; room size 5 MiB (anon 1.25 MiB), **content
   plus ledger** → `4413` (all of them lowered at start to what the memory budget holds, see
   "Loaded rooms" below; the ledger an update will add is counted ahead, `ledgerBound` §11),
   where every **cut** an update makes in an item counts `SPLIT_COST_BYTES` (32) on top of its

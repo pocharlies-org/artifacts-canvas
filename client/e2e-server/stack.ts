@@ -174,8 +174,11 @@ export async function openAs(
   browser: import('@playwright/test').Browser,
   user: string | null,
   key: string,
+  /** Runs on the fresh context before the page opens (extra init scripts). */
+  prepare?: (ctx: import('@playwright/test').BrowserContext) => Promise<void>,
 ): Promise<{ page: import('@playwright/test').Page; close: () => Promise<void> }> {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  if (prepare) await prepare(ctx);
   if (user) {
     await ctx.addCookies([{ name: 'canvas_e2e_user', value: user, url: stack.serverUrl }]);
   }

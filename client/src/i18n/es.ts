@@ -26,7 +26,7 @@ export const es = {
   'app.notice.revoked': 'Ya no tienes acceso a este artifact.',
   'app.notice.expired': 'El artifact ha caducado; sus anotaciones se han borrado.',
   'app.notice.readonly': 'Solo puedes ver las anotaciones.',
-  'app.notice.rate-limited': 'Demasiados cambios seguidos; espera un momento.',
+  'app.notice.rate-limited': 'Demasiados cambios seguidos: el servidor ha pausado la conexión. Se reconecta sola en unos segundos y tus cambios se conservan.',
   'app.notice.too-large': 'El lienzo ha llegado a su tamaño máximo.',
   'app.notice.too-costly': 'Ese cambio era demasiado grande para aplicarlo de una vez; borra menos formas cada vez.',
   'app.notice.shutdown': 'El servidor se está reiniciando; reconectando…',

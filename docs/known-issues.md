@@ -7,6 +7,29 @@ anonymous principal exists. `ANON_ALLOWED_PREFIXES` cannot turn it off (an empty
 default `pub/`); before the switch, a list that parsed to no prefix (`,`) accepted anonymous visitors
 on every key the core opened to them, and now accepts them nowhere.
 
+## Live test of a deployment
+
+An end-to-end pass on a deployed canvas (a real browser on a 120 Hz screen, two tabs) found these.
+Regressions: `client/e2e-server/rate.spec.ts`, `client/tests/pacer.test.ts`,
+`client/tests/rate-limit.test.ts`.
+
+- [x] **L-1 — Drawing on a 120 Hz screen closed the connection after about 2 s, for good (High).**
+  The editor sent one content update and one awareness update per animation frame, so the message
+  rate followed the display: about 240 messages/s on a 120 Hz screen, 480 on a 240 Hz one, against
+  the server's 120/s (burst 240) per connection. One continuous stroke was closed `4429` after about
+  2.2 s, the stroke was left unfinished in the room, and the tab stayed read-only until a reload
+  (y-websocket treats every 44xx close as final). Dragging a note at the display rate did the same:
+  the select tool wrote on every pointermove. Now the tab still edits its own document frame by frame,
+  but the connection merges the content updates of each send interval into one message, and awareness
+  is published at most once per interval: 30/s each (12/s anonymous, under its 30/s), whatever the
+  display (`client/src/collab/pacer.ts`). Every point is kept, and the batches of a big delete stay
+  separate messages. After a `4429` the client waits 2 s
+  (doubled per `4429` in a row, up to 30 s), joins again and sends what it drew meanwhile; the
+  banner says so (protocol §4). The server's limits are unchanged. Measured in a real browser
+  against the real server with its default limits, the display simulated: a 120 Hz stroke peaked at
+  60 messages/s and a 240 Hz one at 60 (before: 248/s and `4429`), a 240 Hz drag at 60/s (before:
+  379/s and `4429`).
+
 ## Review of the fv9 branch (security and QA)
 
 The security review and the independent QA verification of the room-isolation branch found one

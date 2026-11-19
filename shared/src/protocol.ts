@@ -34,7 +34,10 @@ export interface Notice {
   message?: string;
 }
 
-/** Close codes (RFC 6455 private range; 44xx = do not reconnect, as y-websocket does). */
+/**
+ * Close codes (RFC 6455 private range; 44xx = do not reconnect, as y-websocket does, except
+ * 4429: the client joins again after a backoff, docs/protocol.md §4).
+ */
 export const CLOSE = {
   unauthenticated: 4401,
   forbidden: 4403,

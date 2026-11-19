@@ -28,7 +28,7 @@ export const en: Record<MessageKey, string> = {
   'app.notice.revoked': 'You no longer have access to this artifact.',
   'app.notice.expired': 'The artifact has expired; its annotations were deleted.',
   'app.notice.readonly': 'You can only view the annotations.',
-  'app.notice.rate-limited': 'Too many changes at once; wait a moment.',
+  'app.notice.rate-limited': 'Too many changes in a row: the server paused the connection. It reconnects by itself in a few seconds, and your changes are kept.',
   'app.notice.too-large': 'The canvas reached its maximum size.',
   'app.notice.too-costly': 'That change was too large to apply at once; delete fewer shapes at a time.',
   'app.notice.shutdown': 'The server is restarting; reconnecting…',

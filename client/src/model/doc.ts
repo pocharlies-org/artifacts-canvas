@@ -2,6 +2,7 @@ import * as Y from 'yjs';
 import {
   MAX_TEXT_LENGTH, ROOT, SHAPE_FIELDS, STYLE_ENUMS, assetValueOk, keyOk, shapeFieldProblem, shapeRecordProblem, type ShapeFieldKind,
 } from '@pocharlies/artifacts-canvas-shared/model';
+import { SEND_ALONE } from '../collab/pacer';
 import {
   DEFAULT_STYLE, STYLE_KEYS,
   type Attribution, type HistoryEntry, type Shape, type ShapeType, type Style, type UserInfo,
@@ -435,7 +436,9 @@ export class CanvasDoc {
     if (!all.length) return;
     const set = new Set(all);
     for (let i = 0; i < all.length; i += DELETE_BATCH) {
-      this.transact(() => {
+      this.doc.transact((tr) => {
+        // the batches stay apart on the wire too (the connection merges small updates)
+        if (all.length > DELETE_BATCH) tr.meta.set(SEND_ALONE, true);
         if (i === 0) {
           // Arrows bound to deleted shapes keep their last position, unbound.
           for (const sid of this.shapes.keys()) {
@@ -449,7 +452,7 @@ export class CanvasDoc {
           }
         }
         for (const id of all.slice(i, i + DELETE_BATCH)) this.shapes.delete(id);
-      });
+      }, this.origin);
     }
   }
 
