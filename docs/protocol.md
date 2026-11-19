@@ -99,8 +99,24 @@ inline element in the wrapper HTML (JSON, HTML-escaped):
 Fields: `artifactPath`, `room`, `frameUrl`, `wsUrl`, `vendorUrl`, `shareUrl`, `pageWidth`,
 `title`, `lang` (`es` default, `en`), `maxImageBytes`, `maxDocBytes` (the visitor's room cap:
 `MAX_DOC_BYTES`, `ANON_MAX_DOC_BYTES` for an anonymous visitor; the editor says the canvas is
-full before an image would pass it, fv8 U1), `dev` (never `true` in production: it enables a
-local identity and the `?as=` / `?room=` / `?artifact=` query parameters).
+full before an image would pass it, fv8 U1), `artifactUrl` (the plain artifact on this host,
+path only: the path of `ARTIFACT_BASE_URL` plus the key, the same link the access-required page
+gives; "Ver original" opens it with `?raw=1`, which the core serves without the canvas), `dev`
+(never `true` in production: it enables a local identity and the `?as=` / `?room=` /
+`?artifact=` query parameters).
+
+**Visibility** (`client/src/ui/canvas-pref.ts`, `ui/visibility.ts`). The canvas opens shown or
+hidden: `?present=1` shown, in presentation mode; `?canvas=1` shown and `?canvas=0` hidden for
+this visit; else the user's last choice of the toggle ("Mostrar canvas" / "Ocultar canvas"),
+kept in `localStorage` per user (`artifacts-canvas:canvas:<user id>`), not per artifact; else,
+on a first visit, hidden. Query parameters are never remembered. Hidden, the artifact looks
+like the original page: the frame takes the whole view, the reporter stops holding the page
+still (`mode`, §3) so it scrolls on its own, links and buttons work as with the interact tool,
+and the annotations, toolbar and panels are hidden. A small pill, "✏️ Canvas · 3" (the
+annotations in the room), opens the canvas; next to it, "2 personas anotando" (other people with
+the canvas shown) and "Ver original". The connection stays, so the count is live, but a hidden
+canvas is quiet: its presence has no cursor, viewport, laser or status, and it follows nobody.
+A link to another page keeps `canvas=` when the URL had it.
 
 ## 3. Frame: the artifact, isolated
 
@@ -158,6 +174,18 @@ does it for the user, in `client/src/artifact/links.ts`:
   `links-forge.html`). Nothing is fetched: the outcome is a navigation of this tab, a new tab or
   nothing. The wrapper CSP is unchanged.
 
+**Background.** The board takes the artifact's own background, so the area around and beyond the
+page is the page's colour, and a dark page sits on a dark board. The reporter posts the computed
+`background-color` of `html`, else of `body` when `html` is transparent, else white; a colour
+in another form (`oklch()`, `color()`) goes through a 1x1 canvas and is posted as `rgba()`. It
+checks again when an attribute of the page changes (a theme toggle), when
+`prefers-color-scheme` changes, and once a second (a transition, a late stylesheet), at most 4
+times a second, and posts only a change. The wrapper takes only `rgb()`, `rgba()` and hex
+colours of at most 64 characters (`client/src/ui/theme.ts`), composites a translucent one over
+white, and writes the result as `rgb(r, g, b)` from the numbers: nothing the artifact wrote
+reaches a style. Under a relative luminance of 0.4 the chrome goes dark (`body.theme-dark`) and
+the default stroke colour is white instead of black, unless the user picked a colour.
+
 **postMessage.** Only the following, validated on both sides (`event.source` is checked, and
 the wrapper also requires the opaque origin `"null"` of the sandboxed frame; payloads are
 clamped):
@@ -173,6 +201,8 @@ clamped):
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'key', key:'Escape'}` Escape pressed in the artifact |
 | wrapper → frame | `{source:'artifacts-canvas', type:'probe', id, x, y}` is there a link at (x, y)? Answered `{source:'artifacts-canvas-reporter', type:'probe', id, link}` |
 | wrapper → frame | `{source:'artifacts-canvas', type:'click', x, y, newTab}` follow the link at (x, y), if any (the select tool's click) |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'bg', color}` the page's background colour (see "Background") |
+| wrapper → frame | `{source:'artifacts-canvas', type:'mode', native}` `native: true` while the canvas is hidden: the page scrolls on its own (and same-document anchors scroll it) instead of being held still; sent on the frame's first message and on every load |
 | wrapper → frame | `{source:'artifacts-canvas', type:'snapshot', id, rect:{x,y,w,h}, scale, lib}` export request; `lib` is the `vendorUrl` |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'snapshot', id, dataUrl, partial}` a `data:image/png` of `rect`, or `null` when the page could not be captured; `partial: true` when part of it could not be read (an image or a background that did not load is left blank) |
 

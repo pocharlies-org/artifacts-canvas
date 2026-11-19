@@ -84,6 +84,9 @@ arrowheads, opacity, bring to front / send to back, group / ungroup, lock / unlo
   hidden behind a few floating controls, the laser as the tool, Esc to leave. The others get a banner, "<name> está
   presentando", with a "Dejar de seguir" button; the presenter's own other tabs and devices follow too.
   `?present=1` on a canvas link opens it in presentation mode.
+- **The canvas can step aside.** A first visit opens it hidden: the artifact looks like the original page (its
+  background, its scrolling, its links), with a small pill that counts the annotations and opens the canvas. The
+  board always takes the artifact's background; a dark page gets dark chrome and a light default stroke.
 - **Seguir a <persona>.** I follow one participant's viewport until I pan or zoom myself.
 - Two people who edit the same shape at the same moment converge to the same result without losing either stroke.
   This is the reason for a CRDT.
