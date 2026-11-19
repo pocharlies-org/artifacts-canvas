@@ -33,6 +33,12 @@ export interface Conn {
   anonNum?: string;
   /** awareness clientIds this connection has claimed (protocol §5.4 hardening) */
   clientIds: Set<number>;
+  /**
+   * Awareness updates the room relayed to this connection that it may still send back unchanged
+   * without paying for them (protocol §4.2, ws.ts): a stock y-websocket client echoes every state it
+   * receives. At most its message burst.
+   */
+  awarenessEchoes: number;
   rate: TokenBucket;
   /** bytes of sync step-2 answers after the first one (fv4 H1) */
   syncBytes: TokenBucket;
@@ -261,9 +267,17 @@ export class Room {
     private readonly deps: RoomDeps,
   ) {
     this.awareness.setLocalState(null);
+    // y-protocols emits 'change' right before 'update' when a state changed (not for a renewal:
+    // the same state at a newer clock)
+    let stateChanged = false;
+    this.awareness.on('change', () => {
+      stateChanged = true;
+    });
     this.awareness.on(
       'update',
       ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }, origin: unknown) => {
+        const changedState = stateChanged;
+        stateChanged = false;
         const changed = [...added, ...updated, ...removed];
         const c = origin as Conn | undefined;
         if (c?.clientIds) {
@@ -274,7 +288,17 @@ export class Room {
         encoding.writeVarUint(e, 1 /* MSG_AWARENESS */);
         encoding.writeVarUint8Array(e, awarenessProtocol.encodeAwarenessUpdate(this.awareness, changed));
         const msg = encoding.toUint8Array(e);
-        for (const conn of this.conns.values()) sendConn(conn, msg);
+        // protocol §4.2: once to every other member. The sender already has its change; a renewal
+        // goes back to it, because in a room where it is alone that is all a stock client hears,
+        // and y-websocket closes a socket that heard nothing for 30 s.
+        for (const conn of this.conns.values()) {
+          if (conn === c) {
+            if (!changedState) sendConn(conn, msg);
+            continue;
+          }
+          sendConn(conn, msg);
+          countRelayed(conn);
+        }
       },
     );
   }
@@ -1192,6 +1216,11 @@ export function limitBuffered(ws: WebSocket, cap: number, onOver: () => void): v
 export function underBufferCap(ws: WebSocket): boolean {
   const l = bufferLimits.get(ws);
   return !l || ws.bufferedAmount <= l.cap;
+}
+
+/** One more awareness update relayed to `c` that it may echo for free (Conn.awarenessEchoes). */
+export function countRelayed(c: Conn): void {
+  if (c.awarenessEchoes < c.rate.burst) c.awarenessEchoes++;
 }
 
 /**

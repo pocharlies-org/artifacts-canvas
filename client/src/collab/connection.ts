@@ -3,13 +3,22 @@ import { WebsocketProvider } from 'y-websocket';
 import * as decoding from 'lib0/decoding';
 import * as encodingRt from 'lib0/encoding';
 import * as syncProtocol from 'y-protocols/sync';
+import * as awarenessProtocol from 'y-protocols/awareness';
 import type { Awareness } from 'y-protocols/awareness';
-import { CLOSE, MSG_IDENTITY, MSG_LEDGER, MSG_NOTICE, parseIdentity, type Notice } from './protocol';
+import { CLOSE, MSG_AWARENESS, MSG_IDENTITY, MSG_LEDGER, MSG_NOTICE, MSG_QUERY_AWARENESS, parseIdentity, type Notice } from './protocol';
 import type { Identity } from '../model/types';
 import { personColor } from '../model/colors';
 import { SEND_ALONE, UpdateBatcher, sendIntervalMs } from './pacer';
 
 export type Status = 'connecting' | 'connected' | 'synced' | 'disconnected' | 'closed';
+
+/** An awareness `update` event: the client ids it added, updated and removed. */
+interface AwarenessChange {
+  added: number[];
+  updated: number[];
+  removed: number[];
+}
+type AwarenessHandler = (changed: AwarenessChange, origin: unknown) => void;
 
 export interface ConnectionOptions {
   wsUrl: string;
@@ -97,6 +106,7 @@ export class Connection {
     this.awareness = this.provider.awareness;
     this.rateLimitBackoffMs = opts.rateLimitBackoffMs ?? RATE_LIMIT_BACKOFF.firstMs;
     this.holdLocalUpdates();
+    this.sendOwnAwarenessOnly();
 
     this.provider.messageHandlers[MSG_IDENTITY] = (_enc: encodingRt.Encoder, dec: decoding.Decoder) => {
       const id = parseIdentity(decoding.readVarString(dec));
@@ -196,6 +206,39 @@ export class Connection {
   }
 
   private serverSv: Uint8Array | null = null;
+
+  /**
+   * Awareness on the wire: this tab's own state, never the others'. y-websocket 3.1.0 sends every
+   * awareness `update` event, and applying a state received from the server fires one too (origin:
+   * the provider), so every tab sent every other tab's states back to the server: each update
+   * crossed the wire once per member, the room's traffic grew with the square of its size, and a
+   * presentation of 10 tabs closed every tab 4429 (the server dropped the echoes, as foreign ids,
+   * but counted them against the sender's message bucket). Now the sender passes on only the
+   * entries of this tab's client id, whatever the origin: its own changes and renewals, and the
+   * re-announcement y-protocols makes when a remote update removes this tab's state (it raises the
+   * clock so the others see the tab again). The answer to a QUERY_AWARENESS is this tab's state too.
+   * `_awarenessUpdateHandler` is private to y-websocket; client/tests/awareness.test.ts fails if a
+   * bump renames it.
+   */
+  private sendOwnAwarenessOnly() {
+    const p = this.provider as WebsocketProvider & { _awarenessUpdateHandler: AwarenessHandler };
+    const send = p._awarenessUpdateHandler;
+    if (typeof send !== 'function') throw new Error('y-websocket: _awarenessUpdateHandler not found (see sendOwnAwarenessOnly)');
+    const aw = this.awareness;
+    this.awareness.off('update', send);
+    // the provider's destroy() unregisters `_awarenessUpdateHandler`: the wrapper takes its place
+    p._awarenessUpdateHandler = (changed, origin) => {
+      const own = (ids: number[]) => ids.filter((id) => id === aw.clientID);
+      const mine = { added: own(changed.added), updated: own(changed.updated), removed: own(changed.removed) };
+      if (mine.added.length || mine.updated.length || mine.removed.length) send(mine, origin);
+    };
+    this.awareness.on('update', p._awarenessUpdateHandler);
+    p.messageHandlers[MSG_QUERY_AWARENESS] = (enc: encodingRt.Encoder) => {
+      if (aw.getLocalState() === null) return; // nothing written: nothing sent
+      encodingRt.writeVarUint(enc, MSG_AWARENESS);
+      encodingRt.writeVarUint8Array(enc, awarenessProtocol.encodeAwarenessUpdate(aw, [aw.clientID]));
+    };
+  }
 
   /** Local updates waiting for the end of the current send interval (collab/pacer.ts). */
   get queuedUpdates(): number {

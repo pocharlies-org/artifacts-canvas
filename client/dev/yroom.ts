@@ -57,7 +57,14 @@ export class Room {
       const msg = encodeLedger(update);
       for (const c of this.conns.values()) send(c.ws, msg);
     });
+    // 'change' comes right before 'update' when a state changed (not for a renewal)
+    let stateChanged = false;
+    this.awareness.on('change', () => {
+      stateChanged = true;
+    });
     this.awareness.on('update', ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }, origin: unknown) => {
+      const changedState = stateChanged;
+      stateChanged = false;
       const changed = [...added, ...updated, ...removed];
       const c = origin as Conn | undefined;
       if (c?.clientIds) {
@@ -68,7 +75,9 @@ export class Room {
       encoding.writeVarUint(e, MSG_AWARENESS);
       encoding.writeVarUint8Array(e, awarenessProtocol.encodeAwarenessUpdate(this.awareness, changed));
       const msg = encoding.toUint8Array(e);
-      for (const conn of this.conns.values()) send(conn.ws, msg);
+      // as the production server (protocol §4.2): once to every other member; the sender gets
+      // only its renewals back (y-websocket closes a socket that heard nothing for 30 s)
+      for (const conn of this.conns.values()) if (conn !== c || !changedState) send(conn.ws, msg);
     });
   }
 

@@ -11,13 +11,13 @@ import type { Metrics } from './metrics.js';
 import type { AuthzClient } from './authz.js';
 import { artifactState } from './expiry.js';
 import { TokenBucket, clientIp } from './limits.js';
-import { composeIdentity, sanitizeAwarenessUpdate } from './identity.js';
+import { composeIdentity, isAwarenessEcho, sanitizeAwarenessUpdate } from './identity.js';
 import { AnonIssuer, assignNum } from './anon.js';
 import { INFLIGHT_MIN_COST, applyEstimateMs, incomingDeadlineMs, inflightConnBytes, normalizeOrigin, wsMaxPayload } from './config.js';
 import { IncomingFrames } from './incoming.js';
 import { stripBucketSegment, validateArtifactKey } from './paths.js';
 import { ledgerBound, type RoomManager } from './rooms.js';
-import { BusyError, Room, RoomGone, bufferCap, limitBuffered, sendConn, sendWs, sentBytes, underBufferCap, type Conn } from './room.js';
+import { BusyError, Room, RoomGone, bufferCap, countRelayed, limitBuffered, sendConn, sendWs, sentBytes, underBufferCap, type Conn } from './room.js';
 import { WorkerFault } from './worker-host.js';
 import {
   CLOSE,
@@ -769,6 +769,7 @@ export class WsServer {
       anonVisitor: anonVisitor?.nonce,
       anonNum,
       clientIds: new Set(),
+      awarenessEchoes: 0,
       rate: identity.anonymous
         ? new TokenBucket(cfg.anonMsgRatePerSec, cfg.anonMsgBurst)
         : new TokenBucket(cfg.msgRatePerSec, cfg.msgBurst),
@@ -935,6 +936,7 @@ export class WsServer {
       encoding.writeVarUint(a, MSG_AWARENESS);
       encoding.writeVarUint8Array(a, awarenessProtocol.encodeAwarenessUpdate(room.awareness, Array.from(states.keys())));
       sendWs(ws, encoding.toUint8Array(a));
+      countRelayed(conn);
     }
     // what the room broadcast meanwhile, in order (older than the frames above: Yjs skips it)
     conn.joining = false;
@@ -991,13 +993,21 @@ export class WsServer {
 
   private onMessage(conn: Conn, room: Room, buf: Uint8Array): void {
     const { cfg } = this.deps;
+    const maxMsg = conn.identity.anonymous ? cfg.anonMaxMessageBytes : cfg.maxMessageBytes;
+    if (conn.awarenessEchoes > 0 && buf[0] === MSG_AWARENESS && buf.byteLength <= maxMsg && this.isEcho(conn, room, buf)) {
+      // protocol §4.2: an update the room relayed to this connection, sent back unchanged (a stock
+      // y-websocket client). Dropped like any foreign state, and not charged to its message rate:
+      // the room's traffic must not close the members it was sent to.
+      conn.awarenessEchoes--;
+      this.deps.metrics.awarenessEchoes.inc();
+      return;
+    }
     if (!conn.rate.take()) {
       sendWs(conn.ws, encodeNotice({ kind: 'rate-limited' }));
       this.closeConn(conn, CLOSE.rateLimited, 'rate limited');
       this.deps.metrics.wsRejected.inc({ reason: 'rate_limited' });
       return;
     }
-    const maxMsg = conn.identity.anonymous ? cfg.anonMaxMessageBytes : cfg.maxMessageBytes;
     if (buf.byteLength > maxMsg) {
       sendWs(conn.ws, encodeNotice({ kind: 'too-large' }));
       this.closeConn(conn, CLOSE.tooLarge, 'message too large');
@@ -1069,6 +1079,18 @@ export class WsServer {
       return;
     }
     this.closeConn(conn, 1003, 'unknown message type');
+  }
+
+  /** An AWARENESS message that only repeats the room's own states (shared isAwarenessEcho). */
+  private isEcho(conn: Conn, room: Room, buf: Uint8Array): boolean {
+    try {
+      const dec = decoding.createDecoder(buf);
+      decoding.readVarUint(dec);
+      const update = decoding.readVarUint8Array(dec);
+      return !decoding.hasContent(dec) && isAwarenessEcho(update, conn.clientIds, room.awareness);
+    } catch {
+      return false;
+    }
   }
 
   /**
