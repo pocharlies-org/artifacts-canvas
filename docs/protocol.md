@@ -121,18 +121,58 @@ scope for v1; the service may wrap them in a minimal HTML page.
 (`pageWidth`, stored in the document so every participant gets the same layout) and sized to
 the artifact's full content height. It never scrolls; the canvas camera pans and zooms the
 iframe and the drawings together, so world coordinates are artifact CSS pixels and
-annotations stay on the element they were drawn on. Wheel and touch go to the canvas; the
-artifact is view-only inside the wrapper (the plain artifact link still works for interacting
-with it).
+annotations stay on the element they were drawn on. Wheel and touch go to the canvas, except
+with the interact tool (below), where the artifact takes the pointer.
 
-**postMessage.** Only the following, validated on both sides (`event.source` is checked;
-payloads are clamped):
+**Links.** The sandbox stays as it is: no `allow-same-origin`, no `allow-top-navigation`, no
+`allow-popups`. The frame cannot navigate the wrapper or open a window by itself; the wrapper
+does it for the user, in `client/src/artifact/links.ts`:
+
+- With the interact tool (I) the iframe takes the pointer: the artifact's links, buttons and
+  inner scrolling work, and nothing is drawn. Outside the page a drag pans. With the select
+  tool, a plain click on the bare page (no shape under it, nothing selected) follows the link
+  there, and the cursor is a pointer over a link (`probe`). The pen and the other drawing tools
+  never reach the artifact: they draw over links.
+- The reporter stops the frame's own navigation for a link click and posts the URL the frame
+  resolved. A same-document anchor (`#id`, `#top`, `#`) never leaves the frame as a link: the
+  reporter posts the target's position and the camera brings it under the top panels.
+  `javascript:` links are left to the frame (the browser does not run them in a sandboxed frame).
+- The wrapper takes only `http:` and `https:` URLs without credentials, at most 4096
+  characters. Another file of this host (a relative link resolves to the frame route
+  `/_canvas/_/frame/<key>`; a plain artifact URL `/<bucket>/<key>` or a canvas URL works too)
+  opens that file's canvas in this tab: `/_canvas/[<bucket>/]<key>` as the current wrapper URL
+  has it, keeping `lang`, with `present=1` while presenting, so annotations follow per page. The
+  key is sanitised (`sanitizePath`); the server gates it like any other. The canvas's own routes
+  (`/_canvas/_/…` other than the frame) open nothing. Any other http(s) URL opens in a new tab
+  with `noopener,noreferrer`; so does an internal link clicked with ⌘/ctrl/shift, the middle
+  button or `target="_blank"`. Everything else (`data:`, `blob:`, `file:`, `mailto:`, …) is
+  blocked with a toast.
+- The artifact's own scripts share the frame with the reporter and can post the same messages,
+  so the wrapper checks more than their shape. A `link` or `anchor` message is taken only with
+  a user gesture on the wrapper (`navigator.userActivation.isActive`: a click in the frame
+  activates its ancestors too) **and** either within 1.5 s of the select tool's own `click`
+  request, or with the interact tool while the focus is in the frame (the user clicked in it).
+  A `wheel` is taken only with the interact tool while the pointer is over the frame, a `key`
+  only with the interact tool while the focus is in the frame. A script posting on its own, or
+  riding on a click made elsewhere on the canvas, gets nothing (`client/e2e/links.spec.ts`,
+  `links-forge.html`). Nothing is fetched: the outcome is a navigation of this tab, a new tab or
+  nothing. The wrapper CSP is unchanged.
+
+**postMessage.** Only the following, validated on both sides (`event.source` is checked, and
+the wrapper also requires the opaque origin `"null"` of the sandboxed frame; payloads are
+clamped):
 
 | Direction | Message |
 |---|---|
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'size', w, h}` content size, on load and on every resize |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'title', title}` |
-| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'scroll', x, y}` the artifact tried to scroll (anchor link): the wrapper pans there |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'scroll', x, y}` the artifact tried to scroll: the wrapper pans there |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'link', href, newTab}` a link was clicked (`href` absolute, as the frame resolved it; `''` when over 4096 characters); see "Links" |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'anchor', x, y}` a same-document anchor was followed: its target's position in artifact px |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'wheel', dx, dy, mode, zoom, shift, x, y}` a wheel over the artifact that no element of the page scrolled (interact tool) |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'key', key:'Escape'}` Escape pressed in the artifact |
+| wrapper → frame | `{source:'artifacts-canvas', type:'probe', id, x, y}` is there a link at (x, y)? Answered `{source:'artifacts-canvas-reporter', type:'probe', id, link}` |
+| wrapper → frame | `{source:'artifacts-canvas', type:'click', x, y, newTab}` follow the link at (x, y), if any (the select tool's click) |
 | wrapper → frame | `{source:'artifacts-canvas', type:'snapshot', id, rect:{x,y,w,h}, scale, lib}` export request; `lib` is the `vendorUrl` |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'snapshot', id, dataUrl, partial}` a `data:image/png` of `rect`, or `null` when the page could not be captured; `partial: true` when part of it could not be read (an image or a background that did not load is left blank) |
 
@@ -436,13 +476,24 @@ never in the document:
 interface PresenceState {
   user: {id, name, color, anonymous};          // overwritten by the server (§5.4)
   cursor?: {x, y} | null;                      // world coordinates
-  status?: 'cursor.typingNote' | 'cursor.typing' | null;
+  status?: 'cursor.typingNote' | 'cursor.typing' | 'cursor.laser' | null;  // 'cursor.laser': drawn as a laser dot
   laser?: {pts: [x, y, tMs][], now: tMs} | null;  // last ~1 s of the trail
   viewport?: {x, y, w, h} | null;              // the world rectangle this person sees
   presenting?: boolean;
   following?: string | null;                   // user id
 }
 ```
+
+Presenting and following are decided in each tab from these states
+(`client/src/collab/follow.ts`). A presenting tab follows nobody. Every other tab follows a
+presenting tab on its own, the presenter's own other tabs and devices included (by awareness
+client id, not by person; the tab itself is never a candidate). A follower that stops following
+is left alone until that presenter stops; when the presenter stops or its state goes away (it
+disconnected), its followers are released. Two presenters at once: followers keep the one they
+follow, newcomers take the lowest client id. The viewport a presenter publishes goes out at the
+awareness pace like cursors, so presenting adds no messages; while the laser is held still its
+last point is sent again every 300 ms (at most about 3 messages/s) so it does not fade for the
+others.
 
 ## 7. AuthZ: the core contract (matches core `gate/gate.py` + `docs/plugins.md` §1)
 

@@ -9,10 +9,16 @@ Miro-style, and the canvas keeps who drew what. It is the first plugin of
 - **The full toolset**: select / move / resize / rotate / marquee, hand and space-pan, freehand pen with
   pressure-like smoothing, highlighter, eraser, arrows that bind to shapes and follow them, line, text, sticky
   notes, rectangle, ellipse and 17 more shapes, frames, pasted or dropped images, and a laser pointer that is
-  never stored. Style panel with 12 colours, fills, strokes (solid, dashed, dotted, sketchy), sizes, fonts,
+  never stored (a red-dot cursor; under a finger or a pen a dot shows where it points). An interact tool hands
+  the pointer to the artifact: its links, buttons and inner scrolling work, and a link to another file of the
+  artifact opens that file's canvas, so annotations follow per page. Style panel with 12 colours, fills, strokes (solid, dashed, dotted, sketchy), sizes, fonts,
   arrowheads, opacity, order, group and lock. Per-user undo, zoom, zoom to fit, minimap.
 - **Live**: strokes appear on every screen while they are drawn; live cursors with names; presence avatars;
-  *Presentar* (everyone follows the presenter) and *Seguir a* (follow one person).
+  *Presentar*, a presentation mode: fullscreen (an in-page view where the browser has none or refuses it), the
+  artifact as wide as the screen, the editing chrome hidden behind a few floating controls (laser, pen, interact,
+  undo, exit), the laser as the tool, and Esc to leave; everyone else follows the presenter's view with a banner
+  and a "Dejar de seguir" button, the presenter's own other tabs and devices too. `?present=1` on a canvas link
+  opens it straight in presentation mode. *Seguir a* follows one person.
 - **Attribution**: every shape records who created and last edited it, and when. Name tags, a hover card, an
   authors panel with counts and a per-person show/hide toggle, and a history timeline. Attribution is stamped by
   the server from the verified identity into a separate **ledger** document that clients only receive, never
@@ -79,9 +85,9 @@ side that still hides tools pages it (`docs/screenshots/phone-390x844.png`,
 `phone-390x844-toolbar-end.png`, `phone-360x780.png`; `client/e2e/phone.spec.ts` clicks every tool at
 390 and 360 px through the chevrons).
 
-Keyboard: V select, H hand (or hold Space), D pen, ⇧D highlighter, E eraser, A arrow, L line, T text, N note,
+Keyboard: V select, H hand (or hold Space), I interact (use the artifact), D pen, ⇧D highlighter, E eraser, A arrow, L line, T text, N note,
 R rectangle, O ellipse, F frame, K laser, ⌘Z / ⇧⌘Z undo/redo, ⌘A, ⌘D duplicate, ⌘G / ⇧⌘G group, ⇧L lock,
-[ / ] back/front, ⇧1 zoom to fit, ⇧0 100%, Delete, Esc.
+[ / ] back/front, ⇧1 zoom to fit, ⇧0 100%, Delete, Esc (also leaves presentation mode).
 
 ## Full system: the canvas as a plugin of the core (Docker Compose)
 

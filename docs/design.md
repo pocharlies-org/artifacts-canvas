@@ -51,6 +51,7 @@ Check every licence before you add the dependency.
 |---|---|---|
 | Select | V | Click, marquee, shift-add; move, resize, rotate |
 | Hand / pan | H | Space-drag pans from any tool |
+| Interact | I | The artifact takes the pointer: its links, buttons and inner scrolling work; nothing is drawn |
 | Freehand pen | D | Pressure-like smoothing (perfect-freehand style) |
 | Highlighter | ⇧D | Translucent marker under the other strokes |
 | Eraser | E | Erases whole shapes it touches |
@@ -63,7 +64,7 @@ Check every licence before you add the dependency.
 | More shapes | — | Triangle, diamond, star, cloud, check, cross, and the rest of tldraw's geo set |
 | Frame | F | Named area that groups content |
 | Image | — | Paste or drop a screenshot or image |
-| Laser pointer | K | Fading trail. Visible to everyone, never stored |
+| Laser pointer | K | Fading trail. Visible to everyone, never stored. A red-dot cursor; a dot under a finger or a pen |
 
 **Style panel**, applies to the selection or to the next shape: colour (12 swatches), fill (none / semi / solid /
 pattern), stroke (solid / dashed / dotted / sketchy), size (S / M / L / XL), font (hand / sans / serif / mono),
@@ -78,7 +79,11 @@ arrowheads, opacity, bring to front / send to back, group / ungroup, lock / unlo
 - Strokes appear on every connected screen while they are drawn, not only when the stroke ends.
 - Every participant has a **live cursor** labelled with their name, or with the anonymous pseudonym.
 - Presence avatars sit top right.
-- **Presentar.** The presenter's viewport (scroll and zoom) becomes the one the others follow.
+- **Presentar.** The presenter's viewport (scroll and zoom) becomes the one the others follow. For the presenter it is a
+  presentation mode: fullscreen where the browser allows it, the artifact as wide as the screen, the editing chrome
+  hidden behind a few floating controls, the laser as the tool, Esc to leave. The others get a banner, "<name> está
+  presentando", with a "Dejar de seguir" button; the presenter's own other tabs and devices follow too.
+  `?present=1` on a canvas link opens it in presentation mode.
 - **Seguir a <persona>.** I follow one participant's viewport until I pan or zoom myself.
 - Two people who edit the same shape at the same moment converge to the same result without losing either stroke.
   This is the reason for a CRDT.
