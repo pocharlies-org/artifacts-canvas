@@ -1,4 +1,5 @@
 import type { Awareness } from 'y-protocols/awareness';
+import { equalityDeep } from 'lib0/function';
 import { cleanPresenceState } from '@pocharlies/artifacts-canvas-shared/awareness';
 import { personColor } from '../model/colors';
 import type { Box } from '../geometry/vec';
@@ -54,7 +55,15 @@ export function people(aw: Awareness): PresenceUser[] {
   return Array.from(seen.values());
 }
 
-export function setPresence(aw: Awareness, patch: Partial<PresenceState>) {
-  const cur = (aw.getLocalState() as PresenceState | null) ?? {};
-  aw.setLocalState({ ...cur, ...patch });
+/**
+ * Merge `patch` into this tab's presence. A patch that changes nothing is not set: every
+ * setLocalState goes on the wire (y-protocols raises the clock even for an equal state), and a
+ * follower used to republish its unchanged viewport on every awareness update of the presenter.
+ * Returns whether the state changed. y-protocols renews an unchanged state by itself (every 15 s).
+ */
+export function setPresence(aw: Awareness, patch: Partial<PresenceState>): boolean {
+  const cur = aw.getLocalState() as Record<string, unknown> | null;
+  if (cur && Object.entries(patch).every(([k, v]) => k in cur && equalityDeep(cur[k], v))) return false;
+  aw.setLocalState({ ...(cur ?? {}), ...patch });
+  return true;
 }

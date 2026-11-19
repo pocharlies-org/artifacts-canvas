@@ -4,7 +4,7 @@
  * y-websocket 3.1.0 sends every awareness update event, the ones a remote state fires included, so
  * every tab used to send every other tab's states back: wire traffic grew with the square of the
  * room, and a presentation of 10 tabs closed every tab 4429. Plus the y-websocket pin the wrapper
- * depends on.
+ * depends on, and the presence patch that changes nothing (collab/presence.ts setPresence).
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
@@ -15,6 +15,7 @@ import type { AddressInfo } from 'node:net';
 import * as Y from 'yjs';
 import * as decoding from 'lib0/decoding';
 import * as encoding from 'lib0/encoding';
+import * as awarenessProtocol from 'y-protocols/awareness';
 import { WebsocketProvider } from 'y-websocket';
 import WebSocket, { WebSocketServer } from 'ws';
 import { devIdentity, getRoom } from '../dev/yroom';
@@ -161,5 +162,20 @@ describe('the y-websocket pin of sendOwnAwarenessOnly', () => {
     const p = new WebsocketProvider('ws://127.0.0.1:1', 'pin', new Y.Doc(), { connect: false, WebSocketPolyfill: WebSocket as never, disableBc: true });
     expect(typeof (p as unknown as { _awarenessUpdateHandler: unknown })._awarenessUpdateHandler).toBe('function');
     p.destroy();
+  });
+});
+
+describe('setPresence', () => {
+  it('a patch that changes nothing is not set (no clock raised, nothing sent); a change is', () => {
+    const aw = new awarenessProtocol.Awareness(new Y.Doc());
+    const updates: number[] = [];
+    aw.on('update', () => updates.push(aw.meta.get(aw.clientID)!.clock));
+    expect(setPresence(aw, { viewport: { x: 0, y: 0, w: 10, h: 10 }, cursor: null })).toBe(true);
+    expect(setPresence(aw, { viewport: { x: 0, y: 0, w: 10, h: 10 } })).toBe(false);
+    expect(setPresence(aw, { cursor: null })).toBe(false);
+    expect(setPresence(aw, { viewport: { x: 0, y: 1, w: 10, h: 10 } })).toBe(true);
+    expect(setPresence(aw, { laser: null })).toBe(true); // a field it did not have yet
+    expect(updates).toEqual([1, 2, 3]);
+    aw.destroy();
   });
 });

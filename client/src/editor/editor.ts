@@ -37,6 +37,8 @@ export interface EditorDom {
 const LASER_TTL = 1000;
 /** While the laser is held still, its point is sent again this often, so it does not fade for the others. */
 const LASER_HOLD_MS = 300;
+/** A follower publishes its viewport once its camera stood still this long (publishFollowedViewport). */
+export const FOLLOW_SETTLE_MS = 500;
 /** Presentation mode: the artifact page fills the screen width, up to this zoom. */
 const PRESENT_MAX_ZOOM = 2;
 /** Presentation mode: screen px above the page top, under the "Presentando" badge. */
@@ -379,7 +381,10 @@ export class Editor {
     if (!target) return;
     const vp = peers(this.conn.awareness).find((p) => p.clientId === target.clientId)?.state.viewport;
     if (!vp) return;
-    this.setCamera(matchViewport(vp, this.viewW, this.viewH), 'follow');
+    const next = matchViewport(vp, this.viewW, this.viewH);
+    // every awareness update of the room comes here (a laser, a cursor): the camera moves only when the viewport did
+    if (next.tx === this.camera.tx && next.ty === this.camera.ty && clampZoom(next.z) === this.camera.z) return;
+    this.setCamera(next, 'follow');
   }
 
   /**
@@ -654,9 +659,34 @@ export class Editor {
     if (source === 'user' && this.followingUserId) this.stopFollowing();
     this.camera = { tx: c.tx, ty: c.ty, z: clampZoom(c.z) };
     this.world.style.transform = `translate(${this.camera.tx}px, ${this.camera.ty}px) scale(${this.camera.z})`;
-    this.publishPresence({ viewport: this.visibleWorld() });
+    if (source === 'follow') this.publishFollowedViewport();
+    else {
+      this.clearFollowSettle();
+      this.publishPresence({ viewport: this.visibleWorld() });
+    }
     if (this.editingId) this.positionTextarea();
     this.emit('camera');
+  }
+
+  private followSettle: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * A follower's camera moves with the presenter's: its own viewport goes out once that camera
+   * stood still for FOLLOW_SETTLE_MS, not at the presenter's pace. Otherwise every follower became
+   * a sender as soon as the presenter scrolled, and the room carried one stream per member instead
+   * of the presenter's alone.
+   */
+  private publishFollowedViewport() {
+    this.clearFollowSettle();
+    this.followSettle = setTimeout(() => {
+      this.followSettle = null;
+      this.publishPresence({ viewport: this.visibleWorld() });
+    }, FOLLOW_SETTLE_MS);
+  }
+
+  private clearFollowSettle() {
+    if (this.followSettle) clearTimeout(this.followSettle);
+    this.followSettle = null;
   }
 
   visibleWorld(): Box {
