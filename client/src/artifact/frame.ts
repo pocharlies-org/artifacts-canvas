@@ -79,7 +79,8 @@ export class ArtifactFrame {
    * as the plain artifact does. Otherwise it is laid out at the page width and full height.
    */
   native = false;
-  private modeSent = false;
+  /** The reporter of the current document knows the mode (it starts in canvas mode). */
+  private reporterTold = false;
   private pending = new Map<string, (snap: FrameSnapshot | null) => void>();
   private growthStreak = 0;
   private probes = new Map<string, (link: boolean) => void>();
@@ -101,8 +102,8 @@ export class ArtifactFrame {
     f.src = src;
     f.addEventListener('load', () => {
       this.loaded = true;
-      this.modeSent = false;
       this.sendMode();
+      this.reporterTold = true;
     });
     f.addEventListener('pointerenter', () => {
       this.hovered = true;
@@ -121,8 +122,11 @@ export class ArtifactFrame {
     if (e.origin !== 'null') return;
     const d = e.data as Record<string, unknown> | null;
     if (!d || typeof d !== 'object' || d.source !== REPORTER_SOURCE) return;
-    // the reporter starts in canvas mode: tell it the mode as soon as it speaks
-    if (!this.modeSent) this.sendMode();
+    // the reporter starts in canvas mode: tell it the mode as soon as it speaks (before its load event)
+    if (!this.reporterTold) {
+      this.reporterTold = true;
+      this.sendMode();
+    }
     switch (d.type) {
       case 'bg': {
         const c = parseColor(d.color);
@@ -252,7 +256,6 @@ export class ArtifactFrame {
   private sendMode() {
     const win = this.el.contentWindow;
     if (!win) return;
-    this.modeSent = true;
     win.postMessage({ source: 'artifacts-canvas', type: 'mode', native: this.native }, '*');
   }
 
