@@ -116,7 +116,12 @@ export function buildPresentation(ed: Editor, root: HTMLElement) {
     if (on) document.body.dataset.present = fs ? 'fullscreen' : 'fallback';
     else delete document.body.dataset.present;
     fsBtn.hidden = !on || fs || !refused || !fullscreenEnabled();
-    if (!on && fs && wasFullscreen) exitFullscreen();
+    if (!on && fs && wasFullscreen) {
+      // this exit is the mode's own (it ended first): its fullscreenchange comes later, maybe after
+      // a new presentation started (Esc, then "Presentar" at once), and must not end that one
+      wasFullscreen = false;
+      exitFullscreen();
+    }
     if (!on) refused = false;
     // the URL says it too, on every change: a reload presents again, and after the mode ends it does not
     if (on !== lastOn) {
@@ -137,6 +142,10 @@ export function buildPresentation(ed: Editor, root: HTMLElement) {
       wasFullscreen = false;
       // Esc in fullscreen (the browser takes that key) or the browser's own exit: the mode ends
       if (ed.presenting) ed.setPresenting(false);
+    } else if (ed.presenting) {
+      // the mode's own exit finished after a new presentation started (it could not ask for
+      // fullscreen while the exit was under way): it stays in the page, with the one-click prompt
+      refused = true;
     }
     sync();
   };

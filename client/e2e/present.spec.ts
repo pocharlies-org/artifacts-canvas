@@ -147,6 +147,29 @@ test('Presentar enters presentation mode: fullscreen, chrome hidden, laser, badg
   await A.close();
 });
 
+test('Esc then "Presentar" at once: the end of the old fullscreen does not end the new presentation', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('present-again'));
+  const p = A.page;
+  await p.getByTestId('present').click();
+  await expect.poll(async () => (await presentState(p)).how).toBe('fullscreen');
+  // the mode ends (it starts leaving fullscreen) and "Presentar" is clicked in the same task, so the
+  // fullscreenchange of that exit comes after the new presentation started (CI saw this order once)
+  await p.evaluate(() => {
+    (window as any).__canvas.editor.setPresenting(false);
+    (document.querySelector('[data-testid="present"]') as HTMLElement).click();
+  });
+  await expect.poll(async () => (await presentState(p)).fullscreen).toBe(false);
+  await p.waitForTimeout(300);
+  const st = await presentState(p);
+  expect(st.presenting).toBe(true);
+  expect(st.how).toBe('fallback');
+  // fullscreen is one click away
+  await expect(p.getByTestId('present-fullscreen')).toBeVisible();
+  await p.getByTestId('present-fullscreen').click();
+  await expect.poll(async () => (await presentState(p)).how).toBe('fullscreen');
+  await A.close();
+});
+
 test('presentation mode falls back to an in-page view where fullscreen is refused or missing', async ({ browser }) => {
   // refused (a policy, no gesture): the in-page view and a one-click prompt
   const refuse = 'Element.prototype.requestFullscreen = function () { return Promise.reject(new TypeError("denied")); };';
