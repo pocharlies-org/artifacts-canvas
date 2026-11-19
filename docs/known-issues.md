@@ -29,6 +29,14 @@ Regressions: `client/e2e-server/rate.spec.ts`, `client/tests/pacer.test.ts`,
   against the real server with its default limits, the display simulated: a 120 Hz stroke peaked at
   60 messages/s and a 240 Hz one at 60 (before: 248/s and `4429`), a 240 Hz drag at 60/s (before:
   379/s and `4429`).
+- [x] **L-2 — Export left the artifact out when one of its images failed to load, and said nothing
+  (Medium).** The reporter's snapshot (html-to-image) rejected as a whole when one `<img>` of the page
+  could not be read, and the export then drew the annotations on a blank page with no warning. Now a
+  failed image becomes a transparent placeholder and the rest of the page is captured; the reporter
+  tells the wrapper when part of the page could not be read (a broken image in the page, a failed
+  fetch, an undecodable image), and the export says so after the download, as it does when the page
+  could not be captured at all (`client/public/reporter.js`, `client/src/export/export.ts`; test
+  `client/e2e/export.spec.ts` with `client/dev/artifacts/broken-image.html`).
 
 ## Review of the fv9 branch (security and QA)
 

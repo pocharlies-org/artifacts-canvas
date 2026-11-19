@@ -769,9 +769,10 @@ export class Editor {
 
   // ------------------------------------------------------------------ misc UI hooks
 
-  toastFn: ((msg: string) => void) | null = null;
-  toast(msg: string) {
-    this.toastFn?.(msg);
+  toastFn: ((msg: string, ms?: number) => void) | null = null;
+  /** Show `msg` for `ms` milliseconds (the UI's default when omitted). */
+  toast(msg: string, ms?: number) {
+    this.toastFn?.(msg, ms);
   }
 
   setAnnotationsVisible(v: boolean) {

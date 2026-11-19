@@ -25,6 +25,8 @@ export const en: Record<MessageKey, string> = {
   'app.export.pdfFull': 'PDF · whole artifact',
   'app.export.working': 'Exporting…',
   'app.export.failed': 'Export failed: {error}',
+  'app.export.noArtifact': 'Exported without the artifact page: it could not be captured. The file has the annotations only.',
+  'app.export.partial': 'Exported, but part of the page could not be captured (images that do not load): it is left blank.',
   'app.notice.revoked': 'You no longer have access to this artifact.',
   'app.notice.expired': 'The artifact has expired; its annotations were deleted.',
   'app.notice.readonly': 'You can only view the annotations.',

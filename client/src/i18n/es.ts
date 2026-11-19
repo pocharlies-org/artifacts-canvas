@@ -23,6 +23,8 @@ export const es = {
   'app.export.pdfFull': 'PDF · artifact completo',
   'app.export.working': 'Exportando…',
   'app.export.failed': 'No se pudo exportar: {error}',
+  'app.export.noArtifact': 'Exportado sin la página del artifact: no se ha podido capturar. El archivo solo tiene las anotaciones.',
+  'app.export.partial': 'Exportado, pero parte de la página no se ha podido capturar (imágenes que no cargan): queda en blanco.',
   'app.notice.revoked': 'Ya no tienes acceso a este artifact.',
   'app.notice.expired': 'El artifact ha caducado; sus anotaciones se han borrado.',
   'app.notice.readonly': 'Solo puedes ver las anotaciones.',

@@ -4,7 +4,8 @@
  * sandboxed, opaque-origin iframe and only:
  *   - posts the content size and title to the parent (the canvas wrapper),
  *   - turns internal scrolling (anchor links) into a pan request for the parent,
- *   - renders a PNG snapshot of the page on the parent's request (export).
+ *   - renders a PNG snapshot of the page on the parent's request (export), and says whether
+ *     part of it could not be captured (an image or a background that did not load).
  * It reads no cookies or storage (it has none) and sends nothing anywhere else.
  * Copyright 2026 Daniel Ibáñez. Licensed under the Apache License, Version 2.0.
  */
@@ -64,6 +65,49 @@
     }
   });
 
+  // A 1x1 transparent PNG. It stands in for an image the snapshot cannot read: without it, one
+  // image that failed to load (a relative image of a gated artifact, a dead link) made
+  // html-to-image reject, and the export came out with no artifact at all.
+  var PLACEHOLDER = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=';
+  // Resources of this page a snapshot could not read. Kept across snapshots: html-to-image caches
+  // the placeholder it used, so a later snapshot does not fetch (or fail) the same URL again.
+  var missed = 0;
+
+  /** Images of the page that are broken in the page itself (they render as nothing in a snapshot). */
+  function brokenImages() {
+    var n = 0;
+    var imgs = document.images || [];
+    for (var i = 0; i < imgs.length; i++) {
+      var im = imgs[i];
+      if ((im.currentSrc || im.getAttribute('src')) && im.complete && im.naturalWidth === 0) n++;
+    }
+    return n;
+  }
+
+  /** window.fetch that counts the requests that fail, for the time of one snapshot. */
+  function countingFetch(real) {
+    return function () {
+      return real.apply(this, arguments).then(function (res) {
+        if (!res || !res.ok) missed++;
+        return res;
+      }, function (err) {
+        missed++;
+        throw err;
+      });
+    };
+  }
+
+  /** An image the snapshot could not decode: count it and put the placeholder in its place. */
+  function onImageError(ev) {
+    missed++;
+    var t = ev && ev.target;
+    if (!t) return;
+    try {
+      if (t.href && t.href.baseVal !== undefined) t.href.baseVal = PLACEHOLDER;
+      else if (t.src !== PLACEHOLDER) t.src = PLACEHOLDER;
+    } catch (e) { /* ignore */ }
+  }
+
   var libPromise = null;
   function loadLib(url) {
     if (window.htmlToImage) return Promise.resolve(window.htmlToImage);
@@ -91,7 +135,13 @@
     var fullW = Math.max(root.scrollWidth, 1);
     var fullH = Math.max(root.scrollHeight, 1);
     var scale = Math.max(0.1, Math.min(4, Number(d.scale) || 1, 16000 / fullH, 16000 / fullW));
+    var broken = brokenImages();
+    var realFetch = window.fetch;
+    var restore = function () {
+      if (realFetch && window.fetch !== realFetch) window.fetch = realFetch;
+    };
     loadLib(lib).then(function (H) {
+      if (realFetch) window.fetch = countingFetch(realFetch);
       return H.toCanvas(root, {
         width: fullW,
         height: fullH,
@@ -99,9 +149,12 @@
         skipFonts: true,
         cacheBust: false,
         backgroundColor: '#ffffff',
+        imagePlaceholder: PLACEHOLDER,
+        onImageErrorHandler: onImageError,
         filter: function (node) { return !(node.tagName === 'SCRIPT'); },
       });
     }).then(function (full) {
+      restore();
       var x = Math.max(0, Number(r.x) || 0);
       var y = Math.max(0, Number(r.y) || 0);
       var w = Math.max(1, Math.min(Number(r.w) || fullW, fullW - x));
@@ -110,8 +163,9 @@
       out.width = Math.max(1, Math.round(w * scale));
       out.height = Math.max(1, Math.round(h * scale));
       out.getContext('2d').drawImage(full, x * scale, y * scale, w * scale, h * scale, 0, 0, out.width, out.height);
-      post({ type: 'snapshot', id: d.id, dataUrl: out.toDataURL('image/png') });
+      post({ type: 'snapshot', id: d.id, dataUrl: out.toDataURL('image/png'), partial: broken > 0 || missed > 0 });
     }).catch(function () {
+      restore();
       post({ type: 'snapshot', id: d.id, dataUrl: null });
     });
   });

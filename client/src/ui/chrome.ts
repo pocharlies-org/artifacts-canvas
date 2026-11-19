@@ -17,11 +17,11 @@ export function buildChrome(ed: Editor, root: HTMLElement) {
   const toastEl = h('div', { class: 'toast', 'data-testid': 'toast', role: 'status' });
   root.append(toastEl);
   let toastTimer = 0;
-  ed.toastFn = (msg) => {
+  ed.toastFn = (msg, ms = 2600) => {
     toastEl.textContent = msg;
     toastEl.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = window.setTimeout(() => toastEl.classList.remove('show'), 2600);
+    toastTimer = window.setTimeout(() => toastEl.classList.remove('show'), ms);
   };
 
   // The three bottom panels share one flex row (zoom | toolbar | minimap) so they can
@@ -164,8 +164,11 @@ function topRight(ed: Editor): HTMLElement {
         exportMenu.classList.remove('open');
         ed.toast(t('app.export.working'));
         try {
-          const { blob, filename } = await exportCanvas(ed, fmt, scope);
+          const { blob, filename, artifact } = await exportCanvas(ed, fmt, scope);
           download(blob, filename);
+          // the file is there, but say what it lacks: a silent export with no page is a wrong export
+          if (artifact === 'missing') ed.toast(t('app.export.noArtifact'), 8000);
+          else if (artifact === 'partial') ed.toast(t('app.export.partial'), 8000);
         } catch (err) {
           ed.toast(t('app.export.failed', { error: String((err as Error)?.message ?? err) }));
         }

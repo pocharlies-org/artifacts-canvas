@@ -232,3 +232,49 @@ test('bundled hand font loads under the wrapper CSP and is embedded in exports',
   expect(violations).toEqual([]);
   await A.close();
 });
+
+// An image of the artifact that does not load (a relative image of a gated artifact, a dead link)
+// made the snapshot library reject, and every export came out with the annotations on a blank
+// page and no warning. Now the image is left blank, the page is exported, and the toast says so.
+test('export keeps the artifact when one of its images fails to load, and warns that part of it is missing', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('export-broken'), { artifact: 'broken-image.html' });
+  const page = A.page;
+  // the image is broken in the page itself
+  const broken = await page.frameLocator('iframe.artifact-frame').locator('img').evaluate((im: HTMLImageElement) => im.complete && im.naturalWidth === 0);
+  expect(broken).toBe(true);
+  await page.getByTestId('export').click();
+  const dl = page.waitForEvent('download', { timeout: 30000 });
+  await page.getByTestId('export-png-full').click();
+  const file = await (await dl).path();
+  const buf = fs.readFileSync(file!);
+  fs.copyFileSync(file!, 'test-results/export-png-full-broken-image.png');
+  // the artifact is in the export: its solid green block (#2b8a3e, 600 x 300 px at 1.5 px per px)
+  const green = await colorBox(page, buf, [0x2b, 0x8a, 0x3e], 4);
+  expect(green.n).toBeGreaterThan(600 * 300 * 1.5 * 1.5 * 0.9);
+  expect(green.x1 - green.x0).toBeGreaterThan(600 * 1.5 - 6);
+  await expect(page.getByTestId('toast')).toHaveText('Exportado, pero parte de la página no se ha podido capturar (imágenes que no cargan): queda en blanco.');
+  await A.close();
+});
+
+test('an export whose artifact could not be captured at all says so', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('export-missing'), { lang: 'en' });
+  const page = A.page;
+  // the reporter never answers (a page that blocks it, a snapshot that fails): the frame resolves null
+  await page.evaluate(() => {
+    (window as any).__canvas.editor.frame.snapshot = async () => null;
+  });
+  await page.getByTestId('export').click();
+  const dl = page.waitForEvent('download', { timeout: 30000 });
+  await page.getByTestId('export-png-view').click();
+  await dl;
+  await expect(page.getByTestId('toast')).toHaveText('Exported without the artifact page: it could not be captured. The file has the annotations only.');
+  // a page that is captured whole says nothing more than "Exporting…"
+  await page.reload();
+  await page.waitForFunction(() => (window as any).__canvas?.editor?.status === 'synced');
+  await page.getByTestId('export').click();
+  const dl2 = page.waitForEvent('download', { timeout: 30000 });
+  await page.getByTestId('export-png-view').click();
+  await dl2;
+  await expect(page.getByTestId('toast')).toHaveText('Exporting…');
+  await A.close();
+});

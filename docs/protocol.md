@@ -129,11 +129,14 @@ payloads are clamped):
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'title', title}` |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'scroll', x, y}` the artifact tried to scroll (anchor link): the wrapper pans there |
 | wrapper → frame | `{source:'artifacts-canvas', type:'snapshot', id, rect:{x,y,w,h}, scale, lib}` export request; `lib` is the `vendorUrl` |
-| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'snapshot', id, dataUrl}` a `data:image/png` of `rect`, or `null` |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'snapshot', id, dataUrl, partial}` a `data:image/png` of `rect`, or `null` when the page could not be captured; `partial: true` when part of it could not be read (an image or a background that did not load is left blank) |
 
 The snapshot uses `html-to-image` (SVG `foreignObject`, no extra iframe, so it works in the
 sandbox). Images the artifact loads from other origins cannot be captured from an opaque
-origin and appear blank in exports.
+origin and appear blank in exports. An image that cannot be read (that origin rule, a broken
+image of the page, a relative image of a gated artifact: `docs/known-issues.md`) becomes a
+transparent placeholder instead of failing the whole snapshot, and the reply says `partial`;
+the wrapper then tells the user what the file lacks.
 
 ## 4. WebSocket room
 

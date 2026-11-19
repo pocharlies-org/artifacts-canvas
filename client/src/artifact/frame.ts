@@ -15,6 +15,12 @@ import type { Box } from '../geometry/vec';
 export const REPORTER_SOURCE = 'artifacts-canvas-reporter';
 const MAX_HEIGHT = 100000;
 
+/** A snapshot of the artifact; `partial`: some of it (an image, a background) could not be read. */
+export interface FrameSnapshot {
+  img: HTMLImageElement;
+  partial: boolean;
+}
+
 export interface FrameEvents {
   size?: (w: number, h: number) => void;
   title?: (t: string) => void;
@@ -27,7 +33,7 @@ export class ArtifactFrame {
   height: number;
   title = '';
   loaded = false;
-  private pending = new Map<string, (img: HTMLImageElement | null) => void>();
+  private pending = new Map<string, (snap: FrameSnapshot | null) => void>();
   private growthStreak = 0;
 
   constructor(parent: HTMLElement, src: string, width: number, initialHeight: number, private vendorUrl: string, private ev: FrameEvents = {}) {
@@ -93,8 +99,9 @@ export class ArtifactFrame {
           cb(null);
           return;
         }
+        const partial = d.partial === true;
         const img = new Image();
-        img.onload = () => cb(img);
+        img.onload = () => cb({ img, partial });
         img.onerror = () => cb(null);
         img.src = url;
         return;
@@ -103,7 +110,7 @@ export class ArtifactFrame {
   };
 
   /** Ask the artifact for a PNG of `rect` (artifact px) at `scale`. Resolves null on failure. */
-  snapshot(rect: Box, scale: number, timeoutMs = 20000): Promise<HTMLImageElement | null> {
+  snapshot(rect: Box, scale: number, timeoutMs = 20000): Promise<FrameSnapshot | null> {
     const win = this.el.contentWindow;
     if (!win) return Promise.resolve(null);
     const id = Math.random().toString(36).slice(2);
@@ -112,9 +119,9 @@ export class ArtifactFrame {
         this.pending.delete(id);
         resolve(null);
       }, timeoutMs);
-      this.pending.set(id, (img) => {
+      this.pending.set(id, (snap) => {
         clearTimeout(timer);
-        resolve(img);
+        resolve(snap);
       });
       // The frame has an opaque origin, so '*' is the only usable target origin; the
       // message carries nothing secret (a rectangle and the public vendor URL).
