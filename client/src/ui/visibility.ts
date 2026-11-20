@@ -1,4 +1,5 @@
 import type { Editor } from '../editor/editor';
+import type { Audience } from '../collab/presence';
 import { encodePath } from '../config';
 import { t } from '../i18n';
 import { h } from './dom';
@@ -7,7 +8,7 @@ import { decideVisibility, readLastUser, readPref, writeLastUser, writePref, typ
 /**
  * Canvas shown or hidden (ui/canvas-pref.ts decides which at load). Hidden, the artifact looks
  * like the original page; a small pill opens the canvas ("✏️ Canvas · 3": the annotations in the
- * room), says who is annotating, and links to the original (`?raw=1`, which the core serves
+ * room), says who else is viewing and annotating, and links to the original (`?raw=1`, which the core serves
  * without the canvas). Shown, the full editor, with "Ocultar canvas" in the top bar. The body
  * carries `canvas-hidden` while hidden.
  */
@@ -15,6 +16,30 @@ export interface VisibilityControl {
   /** Show or hide; `remember`: the user's choice (the toggle), kept for their next visits. */
   set(visible: boolean, remember: boolean): void;
   readonly initial: Visibility;
+}
+
+/**
+ * "👁 5 viendo · 2 anotando": other people with the artifact open, and those of them with the canvas
+ * shown (collab/presence.ts audienceOf: by person, never this user). Hidden when nobody else is here.
+ * The pill and the top bar show the same text.
+ */
+export function audienceText(a: Audience): string {
+  if (!a.viewing) return '';
+  const viewing = t('audience.viewing', { n: a.viewing });
+  return a.annotating ? `${viewing} · ${t('audience.annotating', { n: a.annotating })}` : viewing;
+}
+
+export function showAudience(el: HTMLElement, a: Audience, short?: HTMLElement) {
+  el.hidden = a.viewing === 0;
+  el.dataset.viewing = String(a.viewing);
+  el.dataset.annotating = String(a.annotating);
+  el.title = a.viewing ? t('audience.title', { v: a.viewing, a: a.annotating }) : '';
+  el.setAttribute('aria-label', el.title);
+  const full = audienceText(a);
+  if (short) {
+    (el.querySelector('.lbl-full') as HTMLElement).textContent = full;
+    short.textContent = a.viewing ? t('audience.short', { n: a.viewing }) : '';
+  } else el.textContent = full;
 }
 
 /** The plain artifact URL with `?raw=1`, or null when this page cannot know it. */
@@ -57,16 +82,13 @@ export function buildVisibility(ed: Editor, root: HTMLElement, storage: Storage 
     const n = ed.annotationCount();
     count.textContent = n ? ` · ${n}` : '';
   };
-  const syncPeople = () => {
-    const n = ed.othersDrawing();
-    people.hidden = n === 0;
-    people.textContent = n === 1 ? t('canvas.people.one') : t('canvas.people.many', { n });
-  };
+  const syncPeople = () => showAudience(people, ed.audience());
   const syncBody = () => document.body.classList.toggle('canvas-hidden', ed.hidden);
 
   ed.on('doc', syncCount);
   ed.on('history', syncCount);
   ed.on('presence', syncPeople);
+  ed.on('identity', syncPeople);
   ed.on('canvas', syncBody);
   // the user is known: their own stored choice applies (unless this visit already decided)
   let knownUser: string | null = null;

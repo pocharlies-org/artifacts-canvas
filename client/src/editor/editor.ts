@@ -6,7 +6,7 @@ import { attachStamper } from '../model/stamper';
 import { DEFAULT_STYLE, STYLE_KEYS, type Identity, type Shape, type Style, type GeoKind } from '../model/types';
 import { Connection, type Status } from '../collab/connection';
 import { Throttle, sendIntervalMs } from '../collab/pacer';
-import { peers, setPresence, type LaserPoint, type PresenceState } from '../collab/presence';
+import { VIEWING_STATUS, audienceOf, peers, setPresence, type Audience, type LaserPoint, type PresenceState } from '../collab/presence';
 import {
   INITIAL_FOLLOW, currentPresenter, followPresenter, followUser, onPeers, startPresenting, stopFollowing, stopPresenting,
   targetPeer, type FollowPeer, type FollowState,
@@ -285,9 +285,11 @@ export class Editor {
   publishPresence(patch: Partial<PresenceState>, immediate = false) {
     if (!this.conn) return;
     if (this.hidden) {
-      // a hidden canvas is quiet: no cursor, viewport, laser, status or presentation for the others
-      patch = { ...patch };
-      for (const k of ['cursor', 'viewport', 'laser', 'status'] as const) if (k in patch) patch[k] = null;
+      // a hidden canvas only views: its presence is the user and VIEWING_STATUS, with no cursor,
+      // viewport, laser, presentation or following. It is set when the canvas hides and then left
+      // alone (setPresence skips an unchanged patch): renewals only, every 15 s.
+      patch = { ...patch, status: VIEWING_STATUS, following: null };
+      for (const k of ['cursor', 'viewport', 'laser'] as const) if (k in patch) patch[k] = null;
       if ('presenting' in patch) patch.presenting = false;
     }
     if ('status' in patch) this.publishedStatus = patch.status ?? null;
@@ -463,8 +465,8 @@ export class Editor {
       this.laser = [];
       this.cameraBeforeHiding = { ...this.camera };
       this.hidden = true;
-      // what the others had of this tab goes away (publishPresence keeps it quiet from now on)
-      this.publishPresence({ cursor: null, viewport: null, laser: null, status: null }, true);
+      // what the others had of this tab goes away; it views (publishPresence keeps it so from now on)
+      this.publishPresence({ cursor: null, viewport: null, laser: null, presenting: false }, true);
       this.frame.setInteractive(true);
       this.layoutHidden();
     } else {
@@ -477,7 +479,7 @@ export class Editor {
       this.cameraBeforeHiding = null;
       if (cam && this.initialCameraSet) this.setCamera(cam, 'system');
       else this.resetCamera();
-      this.publishPresence({ status: this.tool === 'laser' ? 'cursor.laser' : null, viewport: this.visibleWorld() });
+      this.publishPresence({ status: this.tool === 'laser' ? 'cursor.laser' : null, viewport: this.visibleWorld(), following: this.fstate.target?.userId ?? null });
       if (this.fstate.target) this.applyFollow();
     }
     this.emit('canvas');
@@ -498,15 +500,9 @@ export class Editor {
     return this.doc.all().length;
   }
 
-  /** Other people with the canvas shown (their viewport is in their presence), by person. */
-  othersDrawing(): number {
-    if (!this.conn) return 0;
-    const ids = new Set<string>();
-    for (const p of peers(this.conn.awareness)) {
-      const u = p.state.user;
-      if (u && u.id !== this.me?.id && p.state.viewport) ids.add(u.id);
-    }
-    return ids.size;
+  /** Other people here, by person: viewing (any session) and annotating (canvas shown), never this user. */
+  audience(): Audience {
+    return audienceOf(this.conn ? peers(this.conn.awareness) : [], this.me?.id ?? null);
   }
 
   // ------------------------------------------------------------------ the artifact's background

@@ -171,8 +171,13 @@ body.canvas-hidden .page { border-radius: 0; box-shadow: none; }
 body.canvas-hidden .quiet-bar { display: flex; position: fixed; right: 12px; bottom: 12px; z-index: 40; align-items: center; gap: 8px; padding: 4px; border-radius: 999px; background: rgba(255,255,255,.92); box-shadow: 0 2px 12px rgba(0,0,0,.18); font-size: 12.5px; }
 .quiet-pill { border: 0; border-radius: 999px; padding: 6px 12px; background: var(--blue); color: #fff; font-weight: 600; cursor: pointer; white-space: nowrap; }
 .quiet-people { display: inline-flex; align-items: center; gap: 5px; color: #374151; white-space: nowrap; }
-.quiet-people::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #16a34a; }
 .quiet-people[hidden] { display: none; }
+/* who else is here, in the top bar: the same text as the hidden canvas's pill */
+.audience { display: inline-flex; align-items: center; padding: 0 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.audience[hidden] { display: none; }
+.prow .tag { color: var(--muted); font-size: 11px; }
+.prow.viewing .dot { background: transparent; border: 2px solid; box-sizing: border-box; }
+.prow.annotating .tag { color: #15803d; font-weight: 600; }
 .quiet-link { color: #374151; padding: 0 10px 0 2px; white-space: nowrap; }
 
 /* ---------- dark artifacts: dark chrome (body.theme-dark, from the artifact's background) ---------- */
@@ -207,6 +212,7 @@ body.theme-dark .toast { background: #f3f4f6; color: #111827; }
 body.theme-dark .present-badge, body.theme-dark .present-controls { border: 1px solid rgba(255,255,255,.18); }
 body.theme-dark.canvas-hidden .quiet-bar { background: rgba(31,41,55,.94); box-shadow: 0 2px 12px rgba(0,0,0,.6); border: 1px solid #4b5563; }
 body.theme-dark .quiet-people, body.theme-dark .quiet-link { color: #e5e7eb; }
+body.theme-dark .prow.annotating .tag { color: #4ade80; }
 
 /* ---------- narrow screens (phones) ---------- */
 @media (max-width: 760px) {

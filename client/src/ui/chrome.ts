@@ -11,7 +11,7 @@ import { geoOutline } from '../geometry/geo';
 import { polyPath } from '../render/shapeSvg';
 import { clear, h, installPopoverDismiss } from './dom';
 import { buildPresentation, startPresentation, stopPresentation } from './present';
-import type { VisibilityControl } from './visibility';
+import { showAudience, type VisibilityControl } from './visibility';
 
 /** Builds the panels of the approved mockup around the canvas and keeps them in sync. */
 export function buildChrome(ed: Editor, root: HTMLElement, visibility?: VisibilityControl) {
@@ -83,6 +83,9 @@ function topLeft(ed: Editor): HTMLElement {
 
 function topRight(ed: Editor, visibility?: VisibilityControl): HTMLElement {
   const avatars = h('div', { class: 'avatars', 'data-testid': 'avatars' });
+  // who else is here, as on the hidden canvas's pill: "👁 5 viendo · 2 anotando" ("👁 5" on a phone)
+  const audienceShort = h('span', { class: 'lbl-short' });
+  const audience = h('span', { class: 'audience', 'data-testid': 'audience', hidden: true }, h('span', { class: 'lbl-full' }), audienceShort);
   // the canvas off: the artifact as the plain page, with a pill to bring the canvas back (ui/visibility.ts)
   const hideBtn = h('button', { class: 'btn', 'data-testid': 'canvas-hide', title: t('canvas.hide'), 'aria-label': t('canvas.hide') },
     h('span', { class: 'lbl-full' }, t('canvas.hide')), h('span', { class: 'lbl-short' }, t('canvas.hide.short')));
@@ -130,6 +133,7 @@ function topRight(ed: Editor, visibility?: VisibilityControl): HTMLElement {
       followBtn.title = '';
     }
     followBtn.disabled = !o.length && !ed.followingUserId;
+    showAudience(audience, ed.audience(), audienceShort);
     presentBtn.textContent = ed.presenting ? t('app.present.stop') : t('app.present');
     presentBtn.classList.toggle('on', ed.presenting);
   };
@@ -190,7 +194,7 @@ function topRight(ed: Editor, visibility?: VisibilityControl): HTMLElement {
   ed.on('present', update);
   ed.on('identity', update);
   update();
-  return h('div', { class: 'panel topright' }, hideBtn, avatars,
+  return h('div', { class: 'panel topright' }, hideBtn, avatars, audience,
     h('span', { class: 'anchor' }, followBtn, followMenu), presentBtn, shareBtn,
     h('span', { class: 'anchor' }, exportBtn, exportMenu));
 }
@@ -198,6 +202,20 @@ function topRight(ed: Editor, visibility?: VisibilityControl): HTMLElement {
 // ------------------------------------------------------------------ left: who drew + history
 
 function peoplePanel(ed: Editor): HTMLElement {
+  // who else is here now, viewers apart from annotators (collab/presence.ts audienceOf)
+  const here = h('div', { class: 'rows', 'data-testid': 'here-now' });
+  const renderHere = () => {
+    clear(here);
+    const a = ed.audience();
+    if (!a.members.length) here.append(h('div', { class: 'empty' }, t('people.now.empty')));
+    for (const m of a.members) {
+      const kind = m.annotating ? 'annotating' : 'viewing';
+      here.append(h('div', { class: `prow ${kind}`, 'data-testid': 'here-row', 'data-activity': kind, 'data-user': m.user.name },
+        h('span', { class: 'dot', style: `${m.annotating ? 'background' : 'border-color'}:${m.user.color}` }),
+        h('span', { class: 'n' }, m.user.name),
+        h('span', { class: 'tag' }, m.annotating ? t('people.now.annotating') : t('people.now.viewing'))));
+    }
+  };
   const rows = h('div', { class: 'rows', 'data-testid': 'authors' });
   const hist = h('div', { class: 'history-list', 'data-testid': 'history' });
   let frame = 0;
@@ -235,8 +253,21 @@ function peoplePanel(ed: Editor): HTMLElement {
   ed.on('history', update);
   ed.on('visibility', update);
   ed.on('identity', update);
+  // presence changes at the awareness pace (a laser, a cursor): the list redraws once per frame at most
+  let hereFrame = 0;
+  const updateHere = () => {
+    if (hereFrame) return;
+    hereFrame = requestAnimationFrame(() => {
+      hereFrame = 0;
+      renderHere();
+    });
+  };
+  ed.on('presence', updateHere);
+  ed.on('identity', updateHere);
   render();
-  return h('div', { class: 'panel people side' }, h('h4', {}, t('people.title')), rows,
+  renderHere();
+  return h('div', { class: 'panel people side' }, h('h4', {}, t('people.now')), here,
+    h('h4', { style: 'margin-top:10px' }, t('people.title')), rows,
     h('div', { class: 'history' }, h('h4', { style: 'margin-top:10px' }, t('history.title')), hist));
 }
 

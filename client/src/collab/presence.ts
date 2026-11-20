@@ -67,3 +67,51 @@ export function setPresence(aw: Awareness, patch: Partial<PresenceState>): boole
   aw.setLocalState({ ...(cur ?? {}), ...patch });
   return true;
 }
+
+/**
+ * The status of a session whose canvas is hidden: it views the artifact and annotates nothing.
+ * Its presence has the user (forced by the server), this status, and nothing else (no cursor,
+ * viewport, laser, presentation or following). A key of the `cursor.<word>` form the presence
+ * schema already accepts (shared/src/awareness.ts), so no server change was needed.
+ */
+export const VIEWING_STATUS = 'cursor.viewing';
+
+/** A person in the room, other than this user, and whether any of their sessions annotates. */
+export interface AudienceMember {
+  user: PresenceUser;
+  annotating: boolean;
+}
+
+/** Who else is here (docs/protocol.md §6, "Viewing and annotating"). */
+export interface Audience {
+  /** Other people with the artifact open, in any session: annotating ones included. */
+  viewing: number;
+  /** Of those, the people with the canvas shown in at least one session. */
+  annotating: number;
+  /** Annotating first, then by name. */
+  members: AudienceMember[];
+}
+
+/** Does this session annotate (its canvas shown)? A hidden one publishes no viewport and VIEWING_STATUS. */
+export function sessionAnnotates(state: PresenceState): boolean {
+  return !!state.viewport && state.status !== VIEWING_STATUS;
+}
+
+/**
+ * Count people, not sessions: several tabs or devices of one user count once, and a user is
+ * annotating when any of their sessions is. This user (`meId`, all of their sessions) is never
+ * counted. Before the identity is known (`meId` null) only this session is left out (peers()).
+ */
+export function audienceOf(list: readonly Peer[], meId: string | null): Audience {
+  const byUser = new Map<string, AudienceMember>();
+  for (const p of list) {
+    const u = p.state.user;
+    if (!u || u.id === meId) continue;
+    const m = byUser.get(u.id);
+    const annotating = sessionAnnotates(p.state);
+    if (m) m.annotating ||= annotating;
+    else byUser.set(u.id, { user: u, annotating });
+  }
+  const members = [...byUser.values()].sort((a, b) => Number(b.annotating) - Number(a.annotating) || a.user.name.localeCompare(b.user.name));
+  return { viewing: members.length, annotating: members.filter((m) => m.annotating).length, members };
+}
