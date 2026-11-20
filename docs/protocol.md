@@ -113,10 +113,12 @@ on a first visit, hidden. Query parameters are never remembered. Hidden, the art
 like the original page: the frame takes the whole view, the reporter stops holding the page
 still (`mode`, §3) so it scrolls on its own, links and buttons work as with the interact tool,
 and the annotations, toolbar and panels are hidden. A small pill, "✏️ Canvas · 3" (the
-annotations in the room), opens the canvas; next to it, "2 personas anotando" (other people with
-the canvas shown) and "Ver original". The connection stays, so the count is live, but a hidden
-canvas is quiet: its presence has no cursor, viewport, laser, status or presentation, and its
-camera follows nobody (its presence still has its identity and the presenter it would follow).
+annotations in the room), opens the canvas; next to it, "👁 5 viendo · 2 anotando" (who else is
+here, §6 "Viewing and annotating") and "Ver original". The connection stays, so the counts are
+live, but a hidden canvas only views: its presence is its user (forced by the server) and the
+status `cursor.viewing`, with no cursor, viewport, laser, presentation or following, and its
+camera follows nobody. That state is set when the canvas hides; after it only y-protocols'
+renewal goes out (every 15 s, §4.2).
 A link to another page keeps `canvas=` when the URL had it.
 
 ## 3. Frame: the artifact, isolated
@@ -538,13 +540,24 @@ never in the document:
 interface PresenceState {
   user: {id, name, color, anonymous};          // overwritten by the server (§5.4)
   cursor?: {x, y} | null;                      // world coordinates
-  status?: 'cursor.typingNote' | 'cursor.typing' | 'cursor.laser' | null;  // 'cursor.laser': drawn as a laser dot
+  status?: 'cursor.typingNote' | 'cursor.typing' | 'cursor.laser' | 'cursor.viewing' | null;  // 'cursor.laser': drawn as a laser dot; 'cursor.viewing': the canvas is hidden
   laser?: {pts: [x, y, tMs][], now: tMs} | null;  // last ~1 s of the trail
   viewport?: {x, y, w, h} | null;              // the world rectangle this person sees
   presenting?: boolean;
   following?: string | null;                   // user id
 }
 ```
+
+**Viewing and annotating** (`client/src/collab/presence.ts` `audienceOf`). A session
+*annotates* when its canvas is shown: its presence has a viewport and its status is not
+`cursor.viewing` (a hidden tab of an older bundle publishes neither, and counts as viewing). A
+person is *viewing* when any of their sessions is in the room, and *annotating* when any of them
+annotates; the annotating people are counted among the viewing ones. People are counted by user
+id, so several tabs or devices of one person count once, and this user, in all of their
+sessions, is never counted: every number is about the others. The hidden canvas's pill and the
+shown canvas's top bar say "👁 5 viendo · 2 anotando" ("👁 5 viewing · 2 annotating"; "👁 5" on a
+phone), and nothing when nobody else is here; the left panel lists them under "Ahora aquí",
+annotators first.
 
 Presenting and following are decided in each tab from these states
 (`client/src/collab/follow.ts`). A presenting tab follows nobody. Every other tab follows a

@@ -33,8 +33,9 @@ Miro-style, and the canvas keeps who drew what. It is the first plugin of
 - **Looks like the page**: the board takes the artifact's background, a theme toggle in the page included; on a dark
   page the chrome goes dark and the default stroke is white. A first visit opens the canvas **hidden**: the artifact
   as the original page (its own scrolling, links and buttons), with a small "✏️ Canvas · 3" pill that counts the
-  annotations, says who is annotating and opens the canvas, and a "Ver original" link. The choice of the "Mostrar
-  canvas" / "Ocultar canvas" toggle is remembered per user; `?canvas=1` / `?canvas=0` force a visit.
+  annotations, says who else is viewing and annotating ("👁 5 viendo · 2 anotando") and opens the canvas, and a
+  "Ver original" link. The choice of the "Mostrar canvas" / "Ocultar canvas" toggle is remembered per user;
+  `?canvas=1` / `?canvas=0` force a visit.
 - Spanish UI by default, English with `?lang=en` (or the server config).
 
 This is a re-implementation of the behaviour of tools like tldraw, written from scratch. It contains no tldraw
