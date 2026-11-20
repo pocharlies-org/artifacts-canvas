@@ -63,11 +63,13 @@ svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-e
 .pill.live::before { content: "●"; margin-right: 4px; }
 .pill.off { background: #f3f4f6; color: #6b7280; }
 .panels-btn { display: none; }
-.lbl-short { display: none; }
+.lbl-short, .lbl-icon { display: none; }
 .topright { z-index: 31; top: 12px; right: 12px; padding: 7px 10px; display: flex; gap: 8px; align-items: center; font-size: 13px; }
 .avatars { display: flex; padding-left: 6px; }
 .av { width: 28px; height: 28px; border-radius: 50%; color: #fff; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; border: 2px solid #fff; margin-left: -6px; cursor: pointer; padding: 0; }
 .av.more { background: #9ca3af; }
+/* the phone's avatar stack (ui/chrome.ts topRight): 3 of the others and a "+N" chip */
+.av.phone-only { display: none; }
 .btn { border: 1px solid var(--line); background: #fff; border-radius: 8px; padding: 6px 10px; font-size: 12.5px; cursor: pointer; white-space: nowrap; }
 .btn:disabled { opacity: .45; cursor: default; }
 .btn.primary { background: var(--blue); color: #fff; border-color: var(--blue); }
@@ -219,11 +221,16 @@ body.theme-dark .prow.annotating .tag { color: #4ade80; }
   .panels-btn { display: inline-block; }
   .topleft { right: 12px; padding: 6px 8px; gap: 6px; }
   .topleft .title { max-width: 34vw; font-size: 12.5px; }
-  .topright { top: 56px; left: 12px; right: auto; padding: 5px 6px; gap: 4px; flex-wrap: nowrap; max-width: calc(100vw - 24px); overflow-x: auto; }
-  .topright .btn { padding: 5px 7px; font-size: 11.5px; }
+  /* one row that fits a 360 px screen with "▶ Presentar" whole: 3 avatars and a "+N" chip, the
+     follow button as an icon, tighter spacing (e2e/phone.spec.ts, the top bar tests) */
+  .topright { top: 56px; left: 12px; right: auto; padding: 5px; gap: 3px; flex-wrap: nowrap; max-width: calc(100vw - 24px); overflow-x: auto; }
+  .topright .btn { padding: 5px 6px; font-size: 11.5px; }
+  .topright .audience { padding: 0 3px; }
   .topright .lbl-full { display: none; }
   .topright .lbl-short { display: inline; }
   .av { width: 26px; height: 26px; font-size: 10px; }
+  .avatars .desk-only { display: none; }
+  .avatars .av.phone-only { display: flex; }
   .side { display: none; }
   body.panels-open .side { display: block; }
   .people { top: 102px; width: calc(100vw - 24px); max-height: 40vh; }
@@ -241,4 +248,9 @@ body.theme-dark .prow.annotating .tag { color: #4ade80; }
   .bottomright { display: none; }
   .banner { top: 102px; max-width: calc(100vw - 24px); }
   .geo-grid.open { position: fixed; bottom: 70px; left: 12px; right: 12px; transform: none; grid-template-columns: repeat(6, 1fr); }
+}
+/* phones of 380 px and less (360 is common): the hide button is an icon too, its label in aria-label and title */
+@media (max-width: 380px) {
+  .topright .lbl-word { display: none; }
+  .topright .lbl-icon { display: inline; }
 }

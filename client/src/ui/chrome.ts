@@ -81,16 +81,29 @@ function topLeft(ed: Editor): HTMLElement {
 
 // ------------------------------------------------------------------ top right: avatars, follow, present, share, export
 
+/** A desktop's top bar shows the first 6 people, this user included, and "+N" for the rest. */
+const DESKTOP_AVATARS = 6;
+/**
+ * A phone's top bar shows 3 of the others (not this user) and a "+N" chip that names the rest, so
+ * the row fits the screen and "Presentar" is never cut; the audience count next to it adds up the same.
+ */
+const PHONE_AVATARS = 3;
+
 function topRight(ed: Editor, visibility?: VisibilityControl): HTMLElement {
   const avatars = h('div', { class: 'avatars', 'data-testid': 'avatars' });
   // who else is here, as on the hidden canvas's pill: "👁 5 viendo · 2 anotando" ("👁 5" on a phone)
   const audienceShort = h('span', { class: 'lbl-short' });
   const audience = h('span', { class: 'audience', 'data-testid': 'audience', hidden: true }, h('span', { class: 'lbl-full' }), audienceShort);
   // the canvas off: the artifact as the plain page, with a pill to bring the canvas back (ui/visibility.ts)
+  // the narrowest phones show it as an icon (styles.css, max-width 380px), as the people panel's 🙈
   const hideBtn = h('button', { class: 'btn', 'data-testid': 'canvas-hide', title: t('canvas.hide'), 'aria-label': t('canvas.hide') },
-    h('span', { class: 'lbl-full' }, t('canvas.hide')), h('span', { class: 'lbl-short' }, t('canvas.hide.short')));
+    h('span', { class: 'lbl-full' }, t('canvas.hide')), h('span', { class: 'lbl-short lbl-word' }, t('canvas.hide.short')),
+    h('span', { class: 'lbl-icon', 'aria-hidden': 'true' }, '🙈'));
   hideBtn.addEventListener('click', () => (visibility ? visibility.set(false, true) : ed.setCanvasVisible(false)));
-  const followBtn = h('button', { class: 'btn', id: 'follow-btn', 'data-testid': 'follow' });
+  // a phone shows the follow button as an icon (its label in aria-label and title): the row must fit
+  const followFull = h('span', { class: 'lbl-full' });
+  const followShort = h('span', { class: 'lbl-short', 'aria-hidden': 'true' });
+  const followBtn = h('button', { class: 'btn', id: 'follow-btn', 'data-testid': 'follow' }, followFull, followShort);
   const followMenu = h('div', { class: 'popover', 'data-owner': 'follow-btn', role: 'menu' });
   // the button says what presenting does: fullscreen with the laser, and the others follow
   const presentBtn = h('button', { class: 'btn primary', 'data-testid': 'present', title: t('app.present.title') });
@@ -113,25 +126,42 @@ function topRight(ed: Editor, visibility?: VisibilityControl): HTMLElement {
   const update = () => {
     clear(avatars);
     const ppl = ed.conn ? people(ed.conn.awareness) : [];
-    for (const p of ppl.slice(0, 6)) {
-      const av = h('button', { class: 'av', style: `background:${p.color}`, title: p.name + (p.id === ed.me?.id ? ` ${t('app.you')}` : ''), 'data-user': p.name },
+    // Both stacks are built on every presence change, so their "+N" stays right as people come
+    // and go; the stylesheet shows the one for the width (desk-only / phone-only), rotation included.
+    const notMe = ppl.filter((p) => p.id !== ed.me?.id);
+    const onPhone = new Set(notMe.slice(0, PHONE_AVATARS).map((p) => p.id));
+    ppl.forEach((p, i) => {
+      const desk = i < DESKTOP_AVATARS;
+      const phone = onPhone.has(p.id);
+      if (!desk && !phone) return;
+      const av = h('button', { class: 'av' + (desk ? '' : ' phone-only') + (phone ? '' : ' desk-only'), style: `background:${p.color}`, title: p.name + (p.id === ed.me?.id ? ` ${t('app.you')}` : ''), 'data-user': p.name },
         initials(p.name, p.anonymous));
       if (p.id !== ed.me?.id) av.addEventListener('click', () => ed.follow(p.id));
       avatars.append(av);
+    });
+    if (ppl.length > DESKTOP_AVATARS) avatars.append(h('span', { class: 'av more desk-only' }, `+${ppl.length - DESKTOP_AVATARS}`));
+    const rest = notMe.slice(PHONE_AVATARS);
+    if (rest.length) {
+      // the people it stands for, in its label; the full list is the people panel, which it opens
+      const label = t('app.avatars.more', { n: rest.length, names: rest.map((p) => p.name).join(', ') });
+      avatars.append(h('button', { class: 'av more phone-only', 'data-testid': 'avatars-more', title: label, 'aria-label': label,
+        onclick: () => document.body.classList.add('panels-open') }, `+${rest.length}`));
     }
-    if (ppl.length > 6) avatars.append(h('span', { class: 'av more' }, `+${ppl.length - 6}`));
     const o = others();
     const following = ed.followingUserId ? displayUser((u) => ed.doc.user(u), ed.followingUserId) : null;
     const followingName = following ? o.find((x) => x.id === ed.followingUserId)?.name ?? following.name : null;
     if (ed.followingUserId) {
-      followBtn.textContent = t('app.follow.stop');
+      followFull.textContent = t('app.follow.stop');
+      followShort.textContent = '◉';
       followBtn.classList.add('on');
       followBtn.title = t('app.following', { name: followingName ?? '' });
     } else {
       followBtn.classList.remove('on');
-      followBtn.textContent = o.length === 1 ? t('app.follow', { name: o[0].name.split(' ')[0] }) : t('app.follow.none');
-      followBtn.title = '';
+      followFull.textContent = o.length === 1 ? t('app.follow', { name: o[0].name.split(' ')[0] }) : t('app.follow.none');
+      followShort.textContent = '◎';
+      followBtn.title = followFull.textContent;
     }
+    followBtn.setAttribute('aria-label', followFull.textContent ?? '');
     followBtn.disabled = !o.length && !ed.followingUserId;
     showAudience(audience, ed.audience(), audienceShort);
     presentBtn.textContent = ed.presenting ? t('app.present.stop') : t('app.present');

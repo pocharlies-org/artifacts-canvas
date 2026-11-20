@@ -37,6 +37,7 @@ export const es = {
   'app.notice.shutdown': 'El servidor se está reiniciando; reconectando…',
   'app.notice.busy': 'El servidor está ocupado; reconectando…',
   'app.notice.closed': 'Conexión cerrada por el servidor ({code}).',
+  'app.avatars.more': 'Y {n} más: {names}',
   'app.panels.people': 'Personas y estilos',
   'app.you': '(tú)',
 

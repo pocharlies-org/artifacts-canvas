@@ -39,6 +39,7 @@ export const en: Record<MessageKey, string> = {
   'app.notice.shutdown': 'The server is restarting; reconnecting…',
   'app.notice.busy': 'The server is busy; reconnecting…',
   'app.notice.closed': 'Connection closed by the server ({code}).',
+  'app.avatars.more': 'And {n} more: {names}',
   'app.panels.people': 'People and styles',
   'app.you': '(you)',
 
