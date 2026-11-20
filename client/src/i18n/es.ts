@@ -187,7 +187,7 @@ export const es = {
   'audience.viewing': '👁 {n} viendo',
   'audience.annotating': '{n} anotando',
   'audience.short': '👁 {n}',
-  'audience.title': 'Otras personas con el artefacto abierto: {v}; de ellas, con el canvas a la vista: {a}. Tú no cuentas, y varias pestañas de una persona cuentan una vez.',
+  'audience.title': 'Otras personas con el artefacto abierto: {v}; de ellas, con el canvas a la vista: {a}. Tú no cuentas, y varias pestañas de una persona cuentan una vez. Los demás te ven como «viendo» mientras tengas abierto el artefacto, aunque ocultes el canvas.',
   'canvas.original': 'Ver original',
   'frame.defaultName': 'Marco {n}',
   'text.truncated': 'El texto admite como máximo {max} caracteres; el resto no se ha pegado.',

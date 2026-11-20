@@ -76,6 +76,19 @@ export function setPresence(aw: Awareness, patch: Partial<PresenceState>): boole
  */
 export const VIEWING_STATUS = 'cursor.viewing';
 
+/**
+ * What a session with the canvas hidden publishes of a presence patch: the viewing status and no
+ * following, always; a cursor, viewport or laser in the patch goes out as null, and presenting as
+ * false. With the user (forced by the server) that is the whole of a hidden tab's presence
+ * (docs/protocol.md §2). Editor.publishPresence passes every patch through here while hidden.
+ */
+export function hiddenPresence(patch: Partial<PresenceState>): Partial<PresenceState> {
+  const out: Partial<PresenceState> = { ...patch, status: VIEWING_STATUS, following: null };
+  for (const k of ['cursor', 'viewport', 'laser'] as const) if (k in out) out[k] = null;
+  if ('presenting' in out) out.presenting = false;
+  return out;
+}
+
 /** A person in the room, other than this user, and whether any of their sessions annotates. */
 export interface AudienceMember {
   user: PresenceUser;

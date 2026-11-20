@@ -6,7 +6,7 @@ import { attachStamper } from '../model/stamper';
 import { DEFAULT_STYLE, STYLE_KEYS, type Identity, type Shape, type Style, type GeoKind } from '../model/types';
 import { Connection, type Status } from '../collab/connection';
 import { Throttle, sendIntervalMs } from '../collab/pacer';
-import { VIEWING_STATUS, audienceOf, peers, setPresence, type Audience, type LaserPoint, type PresenceState } from '../collab/presence';
+import { audienceOf, hiddenPresence, peers, setPresence, type Audience, type LaserPoint, type PresenceState } from '../collab/presence';
 import {
   INITIAL_FOLLOW, currentPresenter, followPresenter, followUser, onPeers, startPresenting, stopFollowing, stopPresenting,
   targetPeer, type FollowPeer, type FollowState,
@@ -284,14 +284,9 @@ export class Editor {
 
   publishPresence(patch: Partial<PresenceState>, immediate = false) {
     if (!this.conn) return;
-    if (this.hidden) {
-      // a hidden canvas only views: its presence is the user and VIEWING_STATUS, with no cursor,
-      // viewport, laser, presentation or following. It is set when the canvas hides and then left
-      // alone (setPresence skips an unchanged patch): renewals only, every 15 s.
-      patch = { ...patch, status: VIEWING_STATUS, following: null };
-      for (const k of ['cursor', 'viewport', 'laser'] as const) if (k in patch) patch[k] = null;
-      if ('presenting' in patch) patch.presenting = false;
-    }
+    // a hidden canvas only views (collab/presence.ts hiddenPresence). Its state is set when the
+    // canvas hides and then left alone (setPresence skips an unchanged patch): renewals only, every 15 s.
+    if (this.hidden) patch = hiddenPresence(patch);
     if ('status' in patch) this.publishedStatus = patch.status ?? null;
     Object.assign(this.pendingPresence, patch);
     this.presencePace.schedule(() => this.flushPresence());

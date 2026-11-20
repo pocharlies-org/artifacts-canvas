@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import * as awarenessProtocol from 'y-protocols/awareness';
-import { VIEWING_STATUS, audienceOf, peers, sessionAnnotates, type Peer, type PresenceState } from '../src/collab/presence';
+import { VIEWING_STATUS, audienceOf, hiddenPresence, peers, sessionAnnotates, setPresence, type Peer, type PresenceState } from '../src/collab/presence';
 import { cleanPresenceState } from '@pocharlies/artifacts-canvas-shared/awareness';
 
 const user = (id: string, name = id) => ({ id, name, color: '#123456', anonymous: id.startsWith('anon:') });
@@ -76,5 +76,51 @@ describe('through awareness and the presence schema', () => {
     expect(a).toMatchObject({ viewing: 2, annotating: 1 });
     expect(a.members.map((m) => [m.user.id, m.annotating])).toEqual([['carl', true], ['bea', false]]);
     for (const aw of [...tabs, room]) aw.destroy();
+  });
+});
+
+describe('hiddenPresence: what a tab with the canvas hidden publishes (Editor.publishPresence while hidden)', () => {
+  /** A shown tab's patch with every field set: presenting with the laser, following someone, a cursor and a viewport. */
+  const everything = (): PresenceState => ({
+    user: user('bea'), cursor: { x: 10, y: 20 }, status: 'cursor.laser', laser: { pts: [[10, 20, 1000]], now: 1000 },
+    viewport: VP, presenting: true, following: 'ana',
+  });
+  const VIEWING = { user: user('bea'), cursor: null, viewport: null, laser: null, following: null, presenting: false, status: VIEWING_STATUS };
+
+  it('a patch with every field set goes out as the viewing state: cursor, viewport, laser and following null, presenting false', () => {
+    const patch = everything();
+    const out = hiddenPresence(patch);
+    expect(out.cursor).toBeNull();
+    expect(out.viewport).toBeNull();
+    expect(out.laser).toBeNull();
+    expect(out.following).toBeNull();
+    expect(out.presenting).toBe(false);
+    expect(out.status).toBe(VIEWING_STATUS);
+    expect(out).toEqual(VIEWING);
+    // the caller's patch is left as it was
+    expect(patch).toEqual(everything());
+  });
+
+  it('every single field, alone, is forced too; the status and following always are, and nothing else is added', () => {
+    expect(hiddenPresence({})).toEqual({ status: VIEWING_STATUS, following: null });
+    expect(hiddenPresence({ cursor: { x: 1, y: 2 } })).toEqual({ cursor: null, status: VIEWING_STATUS, following: null });
+    expect(hiddenPresence({ viewport: VP })).toEqual({ viewport: null, status: VIEWING_STATUS, following: null });
+    expect(hiddenPresence({ laser: { pts: [[1, 2, 3]], now: 3 } })).toEqual({ laser: null, status: VIEWING_STATUS, following: null });
+    expect(hiddenPresence({ presenting: true })).toEqual({ presenting: false, status: VIEWING_STATUS, following: null });
+    expect(hiddenPresence({ following: 'ana' })).toEqual({ status: VIEWING_STATUS, following: null });
+    expect(hiddenPresence({ status: 'cursor.typingNote' })).toEqual({ status: VIEWING_STATUS, following: null });
+  });
+
+  it('a shown tab that hides: its awareness state becomes the viewing state, passes the schema and only views', () => {
+    const aw = new awarenessProtocol.Awareness(new Y.Doc());
+    setPresence(aw, everything());
+    // the editor's hide, then whatever it is asked to publish while hidden
+    setPresence(aw, hiddenPresence({ cursor: null, viewport: null, laser: null, presenting: false }));
+    expect(aw.getLocalState()).toEqual(VIEWING);
+    expect(setPresence(aw, hiddenPresence(everything()))).toBe(false); // unchanged: nothing goes on the wire
+    expect(aw.getLocalState()).toEqual(VIEWING);
+    expect(cleanPresenceState(aw.getLocalState())).toMatchObject({ status: VIEWING_STATUS });
+    expect(sessionAnnotates(aw.getLocalState() as PresenceState)).toBe(false);
+    aw.destroy();
   });
 });

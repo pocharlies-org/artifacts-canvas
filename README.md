@@ -35,7 +35,8 @@ Miro-style, and the canvas keeps who drew what. It is the first plugin of
   as the original page (its own scrolling, links and buttons), with a small "✏️ Canvas · 3" pill that counts the
   annotations, says who else is viewing and annotating ("👁 5 viendo · 2 anotando") and opens the canvas, and a
   "Ver original" link. The choice of the "Mostrar canvas" / "Ocultar canvas" toggle is remembered per user;
-  `?canvas=1` / `?canvas=0` force a visit.
+  `?canvas=1` / `?canvas=0` force a visit. The counts never include you, but others see you by name as viewing
+  while you have the artifact open, even with the canvas hidden; the counts' tooltip says so.
 - Spanish UI by default, English with `?lang=en` (or the server config).
 
 This is a re-implementation of the behaviour of tools like tldraw, written from scratch. It contains no tldraw

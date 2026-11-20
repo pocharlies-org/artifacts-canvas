@@ -189,7 +189,7 @@ export const en: Record<MessageKey, string> = {
   'audience.viewing': '👁 {n} viewing',
   'audience.annotating': '{n} annotating',
   'audience.short': '👁 {n}',
-  'audience.title': 'Other people with the artifact open: {v}; of them, with the canvas shown: {a}. You are not counted, and several tabs of one person count once.',
+  'audience.title': 'Other people with the artifact open: {v}; of them, with the canvas shown: {a}. You are not counted, and several tabs of one person count once. Others see you as viewing while this artifact is open, even with the canvas hidden.',
   'canvas.original': 'View original',
   'frame.defaultName': 'Frame {n}',
   'text.truncated': 'Text is limited to {max} characters; the rest was not pasted.',
