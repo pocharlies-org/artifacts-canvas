@@ -108,12 +108,12 @@ test('?canvas=1, ?canvas=0 and ?present=1 decide the visit and are not remembere
   await P.ctx.close();
 });
 
-test('hidden: the pill counts the annotations live, says who is annotating, and this tab sends no cursor', async ({ browser }) => {
+test('hidden: the pill counts the annotations live, says who else is viewing and annotating, and this tab sends no cursor', async ({ browser }) => {
   const room = newRoom('vis-badge');
   const H = await open(browser, 'Ana', room, { query: { canvas: '0' } });
   const B = await open(browser, 'Marta', room);
   await expect(H.page.getByTestId('canvas-show')).toHaveText('✏️ Canvas');
-  await expect(H.page.getByTestId('canvas-people')).toHaveText('1 persona anotando');
+  await expect(H.page.getByTestId('canvas-people')).toHaveText('👁 1 viendo · 1 anotando');
   await B.page.keyboard.press('d');
   for (let i = 0; i < 3; i++) await drawStroke(B.page, wave(420, 300 + i * 80, 12, 14));
   await expect(H.page.getByTestId('canvas-show')).toHaveText('✏️ Canvas · 3');
@@ -127,11 +127,13 @@ test('hidden: the pill counts the annotations live, says who is annotating, and 
   });
   expect(fromAna).toEqual([{ cursor: null, viewport: null, laser: null }]);
   await expect(B.page.getByTestId('remote-cursor')).toHaveCount(0);
-  // Marta hides hers too: nobody is annotating
+  // Marta hides hers too: she still views, nobody annotates
   await B.page.getByTestId('canvas-hide').click();
+  await expect(H.page.getByTestId('canvas-people')).toHaveText('👁 1 viendo');
+  // she leaves: nobody else is here
+  await B.close();
   await expect(H.page.getByTestId('canvas-people')).toBeHidden();
   await H.close();
-  await B.close();
 });
 
 test('hidden: the page scrolls itself and its links work as on the plain page', async ({ browser }) => {
