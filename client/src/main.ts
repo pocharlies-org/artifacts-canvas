@@ -5,6 +5,8 @@ import { setLang } from './i18n';
 import { Connection, anonPseudonym } from './collab/connection';
 import { Editor } from './editor/editor';
 import { buildChrome } from './ui/chrome';
+import { presentFromUrl } from './ui/present';
+import { buildVisibility } from './ui/visibility';
 import { personColor } from './model/colors';
 import { loadHandFont } from './render/fonts';
 import type { Identity } from './model/types';
@@ -29,7 +31,11 @@ const devIdentity: Identity | null = cfg.dev
 const conn = new Connection(ydoc, { wsUrl: cfg.wsUrl, room: cfg.room, params, devIdentity }, ledger);
 const app = document.getElementById('app')!;
 const editor = new Editor(cfg, app, ydoc, conn, ledger);
-buildChrome(editor, app);
+// shown or hidden: ?present=1 / ?canvas=1|0, else the user's last choice, else hidden (ui/canvas-pref.ts)
+const visibility = buildVisibility(editor, app, safeStorage(), new URLSearchParams(location.search));
+buildChrome(editor, app, visibility);
+// ?present=1: straight into presentation mode once the page has loaded
+if (visibility.initial.present) presentFromUrl(editor);
 // the bundled hand font: lay text out again once it replaces the fallback
 void loadHandFont(() => editor.renderer.invalidateAll());
 

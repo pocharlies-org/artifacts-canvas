@@ -1,4 +1,6 @@
 import type { Box } from '../geometry/vec';
+import { MAX_LINK_LENGTH } from './links';
+import { parseColor, type Rgba } from '../ui/theme';
 
 /**
  * The artifact, rendered in a sandboxed iframe (`sandbox="allow-scripts"`, never
@@ -11,15 +13,56 @@ import type { Box } from '../geometry/vec';
  * annotations stay on the element they were drawn on. The content height comes from a tiny
  * reporter script (public/reporter.js) that the server injects into the artifact HTML; it only
  * posts {size, title, scroll} and, on request, a PNG snapshot for export.
+ *
+ * Interacting with the artifact (docs/protocol.md §3 "Links"): with the interact tool the frame
+ * takes the pointer, and the reporter turns a click on a link into a `link` message (the wrapper
+ * decides what it opens, artifact/links.ts), a same-document anchor into an `anchor` position,
+ * and a wheel that nothing inside the page scrolls into a `wheel` message (the camera pans).
+ * The select tool asks the reporter which element is under a point (`probe`) and to follow the
+ * link there (`click`). Every message is checked: it must come from this frame's window, with
+ * the opaque origin "null", the reporter's source tag and the right field types.
  */
 export const REPORTER_SOURCE = 'artifacts-canvas-reporter';
 const MAX_HEIGHT = 100000;
+
+/** A snapshot of the artifact; `partial`: some of it (an image, a background) could not be read. */
+export interface FrameSnapshot {
+  img: HTMLImageElement;
+  partial: boolean;
+}
+
+export interface FrameWheel {
+  dx: number;
+  dy: number;
+  /** WheelEvent.deltaMode: 0 pixels, 1 lines, 2 pages. */
+  mode: number;
+  /** ctrl or ⌘ held (a trackpad pinch arrives as ctrl + wheel): zoom. */
+  zoom: boolean;
+  shift: boolean;
+  /** Pointer position in artifact pixels (world coordinates). */
+  x: number;
+  y: number;
+}
 
 export interface FrameEvents {
   size?: (w: number, h: number) => void;
   title?: (t: string) => void;
   scroll?: (x: number, y: number) => void;
+  /** A link was clicked in the artifact: `href` as the frame resolved it, not checked yet. */
+  link?: (href: string, newTab: boolean) => void;
+  /** A same-document anchor was followed: its target is at (x, y) artifact px. */
+  anchor?: (x: number, y: number) => void;
+  /** A wheel over the artifact that no element of the page scrolled. */
+  wheel?: (w: FrameWheel) => void;
+  /** Escape pressed inside the artifact. */
+  escape?: () => void;
+  /** The artifact's background colour (checked: rgb(), rgba() or hex only). */
+  background?: (c: Rgba) => void;
 }
+
+/** Most a wheel delta may say (one event); anything bigger is clamped. */
+const MAX_WHEEL = 10000;
+const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
 export class ArtifactFrame {
   readonly el: HTMLIFrameElement;
@@ -27,8 +70,21 @@ export class ArtifactFrame {
   height: number;
   title = '';
   loaded = false;
-  private pending = new Map<string, (img: HTMLImageElement | null) => void>();
+  /** The pointer is over the frame (it only gets the pointer with the interact tool). */
+  hovered = false;
+  /** The artifact's background colour, once the reporter has said it. */
+  background: Rgba | null = null;
+  /**
+   * Native mode (the canvas hidden): the frame fills the view and the page scrolls on its own,
+   * as the plain artifact does. Otherwise it is laid out at the page width and full height.
+   */
+  native = false;
+  /** The reporter of the current document knows the mode (it starts in canvas mode). */
+  private reporterTold = false;
+  private pending = new Map<string, (snap: FrameSnapshot | null) => void>();
   private growthStreak = 0;
+  private probes = new Map<string, (link: boolean) => void>();
+  private probeSeq = 0;
 
   constructor(parent: HTMLElement, src: string, width: number, initialHeight: number, private vendorUrl: string, private ev: FrameEvents = {}) {
     this.width = width;
@@ -46,6 +102,14 @@ export class ArtifactFrame {
     f.src = src;
     f.addEventListener('load', () => {
       this.loaded = true;
+      this.sendMode();
+      this.reporterTold = true;
+    });
+    f.addEventListener('pointerenter', () => {
+      this.hovered = true;
+    });
+    f.addEventListener('pointerleave', () => {
+      this.hovered = false;
     });
     this.el = f;
     parent.appendChild(f);
@@ -54,9 +118,49 @@ export class ArtifactFrame {
 
   private onMessage = (e: MessageEvent) => {
     if (e.source !== this.el.contentWindow) return;
+    // the frame is sandboxed without allow-same-origin: its origin is opaque, serialised "null"
+    if (e.origin !== 'null') return;
     const d = e.data as Record<string, unknown> | null;
     if (!d || typeof d !== 'object' || d.source !== REPORTER_SOURCE) return;
+    // the reporter starts in canvas mode: tell it the mode as soon as it speaks (before its load event)
+    if (!this.reporterTold) {
+      this.reporterTold = true;
+      this.sendMode();
+    }
     switch (d.type) {
+      case 'bg': {
+        const c = parseColor(d.color);
+        if (!c) return;
+        const b = this.background;
+        if (b && b.r === c.r && b.g === c.g && b.b === c.b && b.a === c.a) return;
+        this.background = c;
+        this.ev.background?.(c);
+        return;
+      }
+      case 'link':
+        if (typeof d.href === 'string' && d.href.length <= MAX_LINK_LENGTH && typeof d.newTab === 'boolean') this.ev.link?.(d.href, d.newTab);
+        return;
+      case 'anchor': {
+        if (!finite(d.x) || !finite(d.y)) return;
+        this.ev.anchor?.(Math.max(0, Math.min(this.width, d.x)), Math.max(0, Math.min(this.height, d.y)));
+        return;
+      }
+      case 'wheel': {
+        if (!finite(d.dx) || !finite(d.dy) || !finite(d.x) || !finite(d.y) || (d.mode !== 0 && d.mode !== 1 && d.mode !== 2)) return;
+        const clamp = (v: number) => Math.max(-MAX_WHEEL, Math.min(MAX_WHEEL, v));
+        this.ev.wheel?.({ dx: clamp(d.dx), dy: clamp(d.dy), mode: d.mode, zoom: d.zoom === true, shift: d.shift === true, x: d.x, y: d.y });
+        return;
+      }
+      case 'key':
+        if (d.key === 'Escape') this.ev.escape?.();
+        return;
+      case 'probe': {
+        const cb = typeof d.id === 'string' ? this.probes.get(d.id) : undefined;
+        if (!cb) return;
+        this.probes.delete(d.id as string);
+        cb(d.link === true);
+        return;
+      }
       case 'size': {
         const h = Number(d.h);
         if (!isFinite(h) || h <= 0) return;
@@ -67,7 +171,8 @@ export class ArtifactFrame {
         else this.growthStreak = 0;
         if (this.growthStreak > 20) return;
         this.height = nh;
-        this.el.style.height = `${nh}px`;
+        // native mode: the page scrolls inside a frame the size of the view; only its height is noted
+        if (!this.native) this.el.style.height = `${nh}px`;
         this.ev.size?.(this.width, nh);
         return;
       }
@@ -93,8 +198,9 @@ export class ArtifactFrame {
           cb(null);
           return;
         }
+        const partial = d.partial === true;
         const img = new Image();
-        img.onload = () => cb(img);
+        img.onload = () => cb({ img, partial });
         img.onerror = () => cb(null);
         img.src = url;
         return;
@@ -102,8 +208,67 @@ export class ArtifactFrame {
     }
   };
 
+  /** Is there a link of the artifact at (x, y) artifact px? Resolves false when the frame does not say. */
+  probe(x: number, y: number, timeoutMs = 1000): Promise<boolean> {
+    const win = this.el.contentWindow;
+    if (!win || !this.loaded) return Promise.resolve(false);
+    const id = `p${++this.probeSeq}`;
+    // only the latest probe matters (the pointer moved on): forget the older ones
+    for (const [old, cb] of this.probes) {
+      this.probes.delete(old);
+      cb(false);
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.probes.delete(id)) resolve(false);
+      }, timeoutMs);
+      this.probes.set(id, (link) => {
+        clearTimeout(timer);
+        resolve(link);
+      });
+      win.postMessage({ source: 'artifacts-canvas', type: 'probe', id, x, y }, '*');
+    });
+  }
+
+  /** Follow the link of the artifact at (x, y) artifact px, if there is one (the select tool's click). */
+  clickAt(x: number, y: number, newTab: boolean) {
+    this.el.contentWindow?.postMessage({ source: 'artifacts-canvas', type: 'click', x, y, newTab }, '*');
+  }
+
+  /**
+   * Native mode on (the frame takes `w` x `h`, the view, and the page scrolls itself) or off
+   * (the page width, its full height, no scrolling: the canvas pans it).
+   */
+  setNative(on: boolean, w = 0, h = 0) {
+    this.native = on;
+    // the frame scrolls only in native mode (the canvas pans it otherwise)
+    this.el.setAttribute('scrolling', on ? 'auto' : 'no');
+    if (on) {
+      this.el.style.width = `${w}px`;
+      this.el.style.height = `${h}px`;
+    } else {
+      this.el.style.width = `${this.width}px`;
+      this.el.style.height = `${this.height}px`;
+    }
+    this.sendMode();
+  }
+
+  private sendMode() {
+    const win = this.el.contentWindow;
+    if (!win) return;
+    win.postMessage({ source: 'artifacts-canvas', type: 'mode', native: this.native }, '*');
+  }
+
+  /** With the interact tool the frame takes the pointer (links, buttons, inner scrolling). */
+  setInteractive(on: boolean) {
+    this.el.classList.toggle('interactive', on);
+    if (!on) this.hovered = false;
+    if (on) this.el.removeAttribute('aria-hidden');
+    else this.el.setAttribute('aria-hidden', 'true');
+  }
+
   /** Ask the artifact for a PNG of `rect` (artifact px) at `scale`. Resolves null on failure. */
-  snapshot(rect: Box, scale: number, timeoutMs = 20000): Promise<HTMLImageElement | null> {
+  snapshot(rect: Box, scale: number, timeoutMs = 20000): Promise<FrameSnapshot | null> {
     const win = this.el.contentWindow;
     if (!win) return Promise.resolve(null);
     const id = Math.random().toString(36).slice(2);
@@ -112,9 +277,9 @@ export class ArtifactFrame {
         this.pending.delete(id);
         resolve(null);
       }, timeoutMs);
-      this.pending.set(id, (img) => {
+      this.pending.set(id, (snap) => {
         clearTimeout(timer);
-        resolve(img);
+        resolve(snap);
       });
       // The frame has an opaque origin, so '*' is the only usable target origin; the
       // message carries nothing secret (a rectangle and the public vendor URL).

@@ -107,6 +107,13 @@ export function publish(audience: { users: string[] } | 'pub', run: string): Pub
 export async function newContext(browser: Browser, viewport = { width: 1440, height: 900 }): Promise<BrowserContext> {
   const ctx = await browser.newContext({ viewport });
   await ctx.addInitScript(() => {
+    // The suite draws on the canvas: every visitor opens it shown, as after choosing "Mostrar
+    // canvas" once (a first visit opens it hidden: client/src/ui/canvas-pref.ts).
+    const get = Storage.prototype.getItem;
+    Storage.prototype.getItem = function (this: Storage, k: string) {
+      const v = get.call(this, k);
+      return v === null && typeof k === 'string' && k.startsWith('artifacts-canvas:canvas:') ? '1' : v;
+    };
     const closes: number[] = [];
     (window as unknown as Record<string, unknown>).__wsCloses = closes;
     const Orig = window.WebSocket;

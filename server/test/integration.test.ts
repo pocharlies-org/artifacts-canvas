@@ -548,6 +548,9 @@ describe('http routes', () => {
     const html = await res.text();
     expect(html).toContain('id="artifacts-canvas-config"');
     expect(html).toContain('"artifactPath":"runs/w.html"');
+    // "Ver original": the plain artifact path on this host, the same the access-required page links to
+    const cfgJson = JSON.parse(/<script type="application\/json" id="artifacts-canvas-config">([^<]*)<\/script>/.exec(html)![1]);
+    expect(cfgJson.artifactUrl).toBe('/artifacts/runs/w.html');
     expect(res.headers.get('content-security-policy')).toContain("frame-ancestors 'self'");
     expect(res.headers.get('referrer-policy')).toBe('no-referrer');
     expect(res.headers.get('x-content-type-options')).toBe('nosniff');
@@ -575,6 +578,61 @@ describe('http routes', () => {
     core.rules.set('u/run/other.html', { allowed: false, reason: 'no-acl', user: { id: 'eve@corp', name: 'eve@corp', anonymous: false } } as never);
     const denied = await fetch(`http://127.0.0.1:${port}/_canvas/u/run/other.html`, { redirect: 'manual', headers: { cookie: 'sid=eve' } });
     expect(denied.status).toBe(403);
+  });
+
+  it('a signed-in visitor the artifact is not open to gets the access-required page (403, HTML) that links to the plain artifact; every refused key gets the same page', async () => {
+    const eve = { id: 'eve@corp', name: 'eve@corp', anonymous: false };
+    core.rules.set('u/run/other.html', { allowed: false, reason: 'not-listed', user: eve } as never);
+    // the gate answers a key that does not exist exactly like one that is not shared (no existence leak)
+    core.rules.set('u/gone/index.html', { allowed: false, reason: 'not-listed', user: eve } as never);
+    core.artifacts.set('u/run/other.html', '<html><head></head><body>secret</body></html>');
+    const app = await startApp({ LOGIN_URL: '/oauth2/sign_in?rd={rd}' });
+    const port = (app.server.address() as { port: number }).port;
+    const get = (p: string, init: RequestInit = {}) => fetch(`http://127.0.0.1:${port}${p}`, { redirect: 'manual', ...init, headers: { cookie: 'sid=eve', ...(init.headers ?? {}) } });
+
+    // the core link shape (/_canvas/<bucket>/<key>) and the client shape answer the same page
+    for (const path of ['/_canvas/canvas-test/u/run/other.html', '/_canvas/u/run/other.html']) {
+      const res = await get(path);
+      expect(res.status).toBe(403);
+      expect(res.headers.get('content-type')).toBe('text/html; charset=utf-8');
+      expect(res.headers.get('content-security-policy')).toBe("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'");
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(res.headers.get('referrer-policy')).toBe('no-referrer');
+      const html = await res.text();
+      expect(html).toContain('<h1>Acceso necesario</h1>');
+      // the plain artifact link (path of ARTIFACT_BASE_URL + key), where the core's request-access form is
+      expect(html).toContain('href="/artifacts/u/run/other.html"');
+      expect(html).toContain('Abrir el artifact y pedir acceso');
+      expect(html).not.toMatch(/<script|secret|not-listed|eve@corp/);
+    }
+    const en = await (await get('/_canvas/u/run/other.html?lang=en')).text();
+    expect(en).toContain('<h1>Access required</h1>');
+    expect(en).toContain('Open the artifact and request access');
+
+    // no existence leak: another refused key gets the same page but for its own link
+    const a = await (await get('/_canvas/u/run/other.html')).text();
+    const b = await (await get('/_canvas/u/gone/index.html')).text();
+    expect(b.replace('/artifacts/u/gone/index.html', 'LINK')).toBe(a.replace('/artifacts/u/run/other.html', 'LINK'));
+
+    // HEAD: the status, no body; a bearer caller: the 403, never a login redirect
+    const head = await get('/_canvas/u/run/other.html', { method: 'HEAD' });
+    expect(head.status).toBe(403);
+    expect(await head.text()).toBe('');
+    const bearer = await fetch(`http://127.0.0.1:${port}/_canvas/u/run/other.html`, { redirect: 'manual', headers: { authorization: 'Bearer x' } });
+    expect(bearer.status).toBe(403);
+
+    // the link is escaped and percent-encoded per segment
+    core.rules.set('u/run/a b&c.html', { allowed: false, reason: 'not-listed', user: eve } as never);
+    expect(await (await get('/_canvas/u/run/a%20b%26c.html')).text()).toContain('href="/artifacts/u/run/a%20b%26c.html"');
+
+    // the frame and the WebSocket keep their plain answers
+    const frame = await get('/_canvas/_/frame/u/run/other.html');
+    expect(frame.status).toBe(403);
+    expect(frame.headers.get('content-type')).toBe('text/plain; charset=utf-8');
+    // a session-less visitor is still sent to login, and gone/expired keep 404/410
+    core.rules.set('u/run/nologin.html', { allowed: false, reason: 'unauthenticated', user: { id: null, name: 'anonymous', anonymous: true } } as never);
+    expect((await fetch(`http://127.0.0.1:${port}/_canvas/u/run/nologin.html`, { redirect: 'manual' })).status).toBe(302);
+    expect((await get('/_canvas/runs/never-published.html')).status).toBe(404);
   });
 
   it('LOGIN_URL unset: unauthenticated stays a 403; invalid LOGIN_URL refuses to start', async () => {

@@ -69,6 +69,11 @@ export class Metrics {
     help: 'Client updates that would have left the room pending: dropped and answered with a sync step 1 (the client resends what the room lacks)',
     registers: [this.registry],
   });
+  readonly awarenessEchoes = new Counter({
+    name: 'canvas_ws_awareness_echoes_total',
+    help: 'Awareness updates a client sent back unchanged after the room relayed them (a stock y-websocket client, an older canvas bundle): dropped, not charged to its message rate',
+    registers: [this.registry],
+  });
   readonly outgoingBytes = new Gauge({
     name: 'canvas_ws_outgoing_bytes',
     help: 'Bytes held for all WebSocket peers (outgoing buffers; join payloads in flight counted once per room version)',

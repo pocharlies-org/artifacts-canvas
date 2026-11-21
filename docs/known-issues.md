@@ -7,6 +7,76 @@ anonymous principal exists. `ANON_ALLOWED_PREFIXES` cannot turn it off (an empty
 default `pub/`); before the switch, a list that parsed to no prefix (`,`) accepted anonymous visitors
 on every key the core opened to them, and now accepts them nowhere.
 
+## Live test of a deployment
+
+An end-to-end pass on a deployed canvas (a real browser on a 120 Hz screen, two tabs) found these.
+Each fixed entry names its regression tests.
+
+- [x] **L-1 — Drawing on a 120 Hz screen closed the connection after about 2 s, for good (High).**
+  The editor sent one content update and one awareness update per animation frame, so the message
+  rate followed the display: about 240 messages/s on a 120 Hz screen, 480 on a 240 Hz one, against
+  the server's 120/s (burst 240) per connection. One continuous stroke was closed `4429` after about
+  2.2 s, the stroke was left unfinished in the room, and the tab stayed read-only until a reload
+  (y-websocket treats every 44xx close as final). Dragging a note at the display rate did the same:
+  the select tool wrote on every pointermove. Now the tab still edits its own document frame by frame,
+  but the connection merges the content updates of each send interval into one message, and awareness
+  is published at most once per interval: 30/s each (12/s anonymous, under its 30/s), whatever the
+  display (`client/src/collab/pacer.ts`). Every point is kept, and the batches of a big delete stay
+  separate messages. After a `4429` the client waits 2 s
+  (doubled per `4429` in a row, up to 30 s), joins again and sends what it drew meanwhile; the
+  banner says so (protocol §4). The server's limits are unchanged. Measured in a real browser
+  against the real server with its default limits, the display simulated: a 120 Hz stroke peaked at
+  60 messages/s and a 240 Hz one at 60 (before: 248/s and `4429`), a 240 Hz drag at 60/s (before:
+  379/s and `4429`). Tests: `client/e2e-server/rate.spec.ts`, `client/tests/pacer.test.ts`,
+  `client/tests/rate-limit.test.ts`.
+- [x] **L-2 — Export left the artifact out when one of its images failed to load, and said nothing
+  (Medium).** The reporter's snapshot (html-to-image) rejected as a whole when one `<img>` of the page
+  could not be read, and the export then drew the annotations on a blank page with no warning. Now a
+  failed image becomes a transparent placeholder and the rest of the page is captured; the reporter
+  tells the wrapper when part of the page could not be read (a broken image in the page, a failed
+  fetch, an undecodable image), and the export says so after the download, as it does when the page
+  could not be captured at all (`client/public/reporter.js`, `client/src/export/export.ts`; test
+  `client/e2e/export.spec.ts` with `client/dev/artifacts/broken-image.html`).
+- [x] **L-3 — Deleted images kept filling the room; "delete something first" could not be satisfied
+  (Medium).** An image's data lives in `assets`, apart from the image shape that names it, and a delete
+  removed the shape only. Three images (2.1, 2.1 and 0.8 MB) pasted and deleted left the room at
+  5 087 137 of its 5 242 880 bytes, 5 041 037 of them data no shape named, saved and loaded on every
+  join; a new image was refused with "the canvas is full, delete something first", and deleting more
+  did not help. Now the data goes in the
+  transaction that deletes the last shape naming it, and comes back with an undo of that delete (the
+  undo scope covers `assets`); an image's data and its shape are written in one transaction too, so an
+  undo of the insert removes both. The editor measures the room as the server stores it (a copy without
+  the undo history), collects data no shape names (left by earlier clients) before it says the canvas
+  is full, and, for `FREED_GRACE_MS` after a delete, asks to try again in a few seconds: the server
+  counts every update at its size until its next save measures the room. The server needs no change:
+  Yjs drops the deleted data, and the next save measures the room again
+  (`server/test/fv8.test.ts` "L-3": 801 KiB with two 400 KiB images, 801 KiB after a shape-only
+  delete, 1 KiB once the data is deleted with it). Tests: `client/tests/assets.test.ts`,
+  `client/e2e-server/assets.spec.ts`. Left: a copy pasted by one user while another deletes the last
+  shape naming the same data (concurrently) names data that is gone, and shows an empty image.
+- [ ] **L-4 — Relative images and other subresources of signed-in artifacts do not load (Medium; the
+  core's design, not a canvas defect).** A `u/` or `g/` page that loads a file next to it
+  (`<img src="chart.png">`, a stylesheet, a script, a `url(...)` in CSS) shows it broken, on the plain
+  artifact link and in the canvas alike. The core serves artifacts with
+  `Content-Security-Policy: sandbox allow-scripts` and the canvas frame is `sandbox="allow-scripts"`:
+  either gives the page an opaque origin, the browser treats its subresource requests as cross-site
+  and does not send the login session cookie (`SameSite=Lax`), and the request reaches the core (plain
+  link) or the canvas frame route as anonymous and is refused. In the canvas frame even a `pub/`
+  page's relative files fail while anonymous drawing is off (a request with no credential is refused
+  before the core is asked), although the plain `pub/` link loads them. The sandbox stays: it keeps an
+  artifact's scripts away from the viewer's session. Contract: a signed-in artifact is one
+  self-contained HTML file, with images inline as `data:` URLs (or from a public third-party host); a
+  URL on the artifacts host itself fails the same way. Export leaves such images blank and says so
+  (L-2).
+- [x] **L-5 — A signed-in user outside the ACL got a bare "forbidden" (Low).** The wrapper answered
+  `403 text/plain` "forbidden", while the plain artifact link answers with the core's access-required
+  page and its request-access form. Now the wrapper's `403` is an HTML page that says the canvas is not
+  open to the visitor and links to the plain artifact URL, where the core takes the request. The status
+  stays `403`, a visitor without a session is still sent to login, gone and expired keys keep `404` and
+  `410`, frame and WebSocket keep their plain answers, and the page depends on the requested key only
+  (the same for a key that is not shared and one that does not exist). Tests:
+  `server/test/integration.test.ts` (access-required page), `e2e-system/system.spec.ts` (b).
+
 ## Review of the fv9 branch (security and QA)
 
 The security review and the independent QA verification of the room-isolation branch found one

@@ -34,9 +34,25 @@ export function smallestImage(candidates: (string | null | undefined)[]): string
   return best;
 }
 
-/** Bytes of the room as the server measures it: content + ledger, encoded. */
+/**
+ * Bytes of the room as the server measures it: content + ledger, encoded. The content is measured
+ * as a fresh copy encodes it, because this tab's undo history keeps the data of the images it
+ * deleted (an undo brings them back) and its own encoding still holds it; the server's document
+ * has no undo history and drops deleted content (Yjs garbage collection).
+ */
 export function roomBytes(doc: Y.Doc, ledger: Y.Doc): number {
-  return Y.encodeStateAsUpdate(doc).byteLength + Y.encodeStateAsUpdate(ledger).byteLength;
+  return storedBytes(doc) + Y.encodeStateAsUpdate(ledger).byteLength;
+}
+
+/** Encoded size of `doc` once its deleted content is collected, as a document without undo holds it. */
+export function storedBytes(doc: Y.Doc): number {
+  const copy = new Y.Doc();
+  try {
+    Y.applyUpdate(copy, Y.encodeStateAsUpdate(doc));
+    return Y.encodeStateAsUpdate(copy).byteLength;
+  } finally {
+    copy.destroy();
+  }
 }
 
 /**

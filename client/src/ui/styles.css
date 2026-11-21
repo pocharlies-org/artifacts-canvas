@@ -6,19 +6,23 @@
   --bg: #e9ebef;
   --blue: #2563eb;
   --red: #e03131;
+  /* the artifact's own background (the reporter says it; ui/theme.ts): the board takes it */
+  --board: #ffffff;
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; color: var(--ink); background: var(--bg); overscroll-behavior: none; }
+html, body { margin: 0; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; color: var(--ink); background: var(--board); overscroll-behavior: none; }
 #app { position: fixed; inset: 0; }
 button { font: inherit; color: inherit; }
 
 /* ---------- stage: the artifact page + the shared canvas ---------- */
-.stage { position: absolute; inset: 0; overflow: hidden; background: var(--bg); touch-action: none; user-select: none; -webkit-user-select: none; cursor: default; }
+.stage { position: absolute; inset: 0; overflow: hidden; background: var(--board); touch-action: none; user-select: none; -webkit-user-select: none; cursor: default; }
 .stage[data-tool="draw"], .stage[data-tool="highlight"], .stage[data-tool="arrow"], .stage[data-tool="line"],
 .stage[data-tool="geo"], .stage[data-tool="frame"], .stage[data-tool="note"] { cursor: crosshair; }
 .stage[data-tool="text"] { cursor: text; }
 .stage[data-tool="eraser"] { cursor: cell; }
-.stage[data-tool="laser"] { cursor: none; }
+.stage[data-tool="laser"] { cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='%23ff2d55' fill-opacity='0.28'/%3E%3Ccircle cx='12' cy='12' r='5' fill='%23ff2d55' stroke='%23ffffff' stroke-width='1.5'/%3E%3C/svg%3E") 12 12, crosshair; }
+.stage[data-tool="interact"] { cursor: default; }
+.stage[data-cursor="pointer"] { cursor: pointer; }
 .stage[data-tool="hand"], .stage.space { cursor: grab; }
 .stage.panning { cursor: grabbing; }
 .stage[data-cursor="move"] { cursor: move; }
@@ -28,14 +32,23 @@ button { font: inherit; color: inherit; }
 .stage[data-cursor="ns-resize"] { cursor: ns-resize; }
 .stage[data-cursor="ew-resize"] { cursor: ew-resize; }
 .world { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
-.page { position: absolute; left: 0; top: 0; background: #fff; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow: hidden; }
-.artifact-frame { display: block; border: 0; background: #fff; pointer-events: none; }
+.page { position: absolute; left: 0; top: 0; background: var(--board); border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow: hidden; }
+.artifact-frame { display: block; border: 0; background: var(--board); pointer-events: none; }
+/* the interact tool: the artifact takes the pointer (links, buttons, inner scrolling) */
+.artifact-frame.interactive { pointer-events: auto; }
 svg.shapes { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
 svg.shapes g.editing text { display: none; }
 svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
 .cursors { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
 .cursor { position: absolute; left: 0; top: 0; pointer-events: none; transition: transform 60ms linear; }
 .cursor .lbl { position: absolute; left: 14px; top: 14px; font-size: 11px; color: #fff; padding: 2px 7px; border-radius: 9px; white-space: nowrap; font-weight: 600; }
+/* another person's laser cursor: a red dot centred on the point */
+.cursor.laser svg { position: absolute; left: -11px; top: -11px; }
+.cursor.laser .lbl { left: 12px; top: 6px; }
+/* my laser under a finger or a pen, where there is no mouse cursor */
+.laser-pointer { position: absolute; left: -18px; top: -18px; width: 36px; height: 36px; border-radius: 50%; pointer-events: none; z-index: 7;
+  background: radial-gradient(circle, #ff2d55 0 6px, #fff 6px 7.5px, rgba(255,45,85,.45) 7.5px, rgba(255,45,85,0) 18px); }
+.laser-pointer[hidden] { display: none; }
 .hovercard { position: absolute; left: 0; top: 0; background: #111827; color: #fff; font-size: 12px; border-radius: 8px; padding: 8px 10px; box-shadow: 0 6px 18px rgba(0,0,0,.25); line-height: 1.45; pointer-events: none; max-width: 260px; z-index: 5; }
 .hovercard .dim { color: #9ca3af; }
 .text-editor { position: absolute; z-index: 6; border: 0; outline: 1px dashed rgba(37,99,235,.6); background: transparent; resize: none; overflow: hidden; line-height: 1.35; margin: 0; white-space: pre-wrap; word-break: break-word; }
@@ -50,11 +63,13 @@ svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-e
 .pill.live::before { content: "●"; margin-right: 4px; }
 .pill.off { background: #f3f4f6; color: #6b7280; }
 .panels-btn { display: none; }
-.lbl-short { display: none; }
+.lbl-short, .lbl-icon { display: none; }
 .topright { z-index: 31; top: 12px; right: 12px; padding: 7px 10px; display: flex; gap: 8px; align-items: center; font-size: 13px; }
 .avatars { display: flex; padding-left: 6px; }
 .av { width: 28px; height: 28px; border-radius: 50%; color: #fff; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; border: 2px solid #fff; margin-left: -6px; cursor: pointer; padding: 0; }
 .av.more { background: #9ca3af; }
+/* the phone's avatar stack (ui/chrome.ts topRight): 3 of the others and a "+N" chip */
+.av.phone-only { display: none; }
 .btn { border: 1px solid var(--line); background: #fff; border-radius: 8px; padding: 6px 10px; font-size: 12.5px; cursor: pointer; white-space: nowrap; }
 .btn:disabled { opacity: .45; cursor: default; }
 .btn.primary { background: var(--blue); color: #fff; border-color: var(--blue); }
@@ -133,16 +148,89 @@ svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-e
 .banner.show { display: flex; }
 .banner .btn { background: #374151; color: #fff; border-color: #4b5563; }
 
+/* ---------- presentation mode: the editing chrome hidden, a few floating controls ---------- */
+.present-ui { display: none; }
+body.present-mode .present-ui { display: block; }
+body.present-mode .topleft, body.present-mode .topright, body.present-mode .side, body.present-mode .bottomrow { display: none !important; }
+.present-badge { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 45; background: rgba(17,24,39,.86); color: #fff; font-size: 12.5px; font-weight: 600; padding: 6px 12px; border-radius: 999px; white-space: nowrap; pointer-events: none; }
+.present-badge::before { content: "●"; color: #ff2d55; margin-right: 6px; }
+.present-fs { position: fixed; top: 50px; left: 50%; transform: translateX(-50%); z-index: 46; border: 0; border-radius: 10px; padding: 10px 16px; background: var(--blue); color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; box-shadow: 0 6px 20px rgba(0,0,0,.25); white-space: nowrap; }
+.present-fs[hidden] { display: none; }
+.present-controls { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 45; display: flex; align-items: center; gap: 2px; padding: 6px; background: rgba(17,24,39,.88); border-radius: 14px; box-shadow: 0 6px 20px rgba(0,0,0,.25); }
+.present-controls .tool { color: #e5e7eb; }
+.present-controls .tool:hover { background: rgba(255,255,255,.12); }
+.present-controls .tool.on { background: #ff2d55; color: #fff; }
+.present-controls .sep { background: rgba(255,255,255,.25); }
+.present-controls .exit { font-size: 16px; }
+
+/* ---------- canvas hidden: the artifact as the plain page, and a small pill ---------- */
+body.canvas-hidden .topleft, body.canvas-hidden .topright, body.canvas-hidden .side, body.canvas-hidden .bottomrow,
+body.canvas-hidden .banner, body.canvas-hidden .present-ui { display: none !important; }
+body.canvas-hidden svg.shapes, body.canvas-hidden svg.overlay, body.canvas-hidden .cursors, body.canvas-hidden .hovercard,
+body.canvas-hidden .laser-pointer, body.canvas-hidden .text-editor { display: none !important; }
+body.canvas-hidden .page { border-radius: 0; box-shadow: none; }
+.quiet-bar { display: none; }
+body.canvas-hidden .quiet-bar { display: flex; position: fixed; right: 12px; bottom: 12px; z-index: 40; align-items: center; gap: 8px; padding: 4px; border-radius: 999px; background: rgba(255,255,255,.92); box-shadow: 0 2px 12px rgba(0,0,0,.18); font-size: 12.5px; }
+.quiet-pill { border: 0; border-radius: 999px; padding: 6px 12px; background: var(--blue); color: #fff; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.quiet-people { display: inline-flex; align-items: center; gap: 5px; color: #374151; white-space: nowrap; }
+.quiet-people[hidden] { display: none; }
+/* who else is here, in the top bar: the same text as the hidden canvas's pill */
+.audience { display: inline-flex; align-items: center; padding: 0 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.audience[hidden] { display: none; }
+.prow .tag { color: var(--muted); font-size: 11px; }
+.prow.viewing .dot { background: transparent; border: 2px solid; box-sizing: border-box; }
+.prow.annotating .tag { color: #15803d; font-weight: 600; }
+.quiet-link { color: #374151; padding: 0 10px 0 2px; white-space: nowrap; }
+
+/* ---------- dark artifacts: dark chrome (body.theme-dark, from the artifact's background) ---------- */
+body.theme-dark { --ink: #e5e7eb; --muted: #9ca3af; --line: #374151; --panel: #1f2937; }
+body.theme-dark .panel { box-shadow: 0 2px 12px rgba(0,0,0,.55); border: 1px solid #374151; }
+body.theme-dark .page { box-shadow: none; }
+body.theme-dark .pill { background: #374151; color: #e5e7eb; }
+body.theme-dark .pill.live { background: #7f1d1d; color: #fecaca; }
+body.theme-dark .pill.off { background: #374151; color: #9ca3af; }
+body.theme-dark .btn { background: #111827; color: #e5e7eb; border-color: #4b5563; }
+body.theme-dark .btn.primary { background: var(--blue); color: #fff; border-color: var(--blue); }
+body.theme-dark .btn.primary.on { background: #b91c1c; border-color: #b91c1c; }
+body.theme-dark .btn.on { background: #1e3a8a; color: #bfdbfe; border-color: #1d4ed8; }
+body.theme-dark .popover { background: #1f2937; box-shadow: 0 6px 24px rgba(0,0,0,.6); }
+body.theme-dark .menu-item:hover { background: #374151; }
+body.theme-dark .tool { color: #d1d5db; }
+body.theme-dark .tool:hover { background: #374151; }
+body.theme-dark .tool.on { background: #1e3a8a; color: #93c5fd; }
+body.theme-dark .tool .k { color: #6b7280; }
+body.theme-dark .tool[data-tip]:hover::after { background: #f3f4f6; color: #111827; }
+body.theme-dark .tb-nav.prev { background: linear-gradient(to right, var(--panel) 55%, rgba(31,41,55,0)); color: #93c5fd; }
+body.theme-dark .tb-nav.next { background: linear-gradient(to left, var(--panel) 55%, rgba(31,41,55,0)); color: #93c5fd; }
+body.theme-dark .seg button { color: #d1d5db; }
+body.theme-dark .seg button.on { background: #1e3a8a; color: #bfdbfe; }
+body.theme-dark .sw.on { outline-color: #e5e7eb; }
+body.theme-dark .av { border-color: #1f2937; }
+body.theme-dark .prow { border-bottom-color: #374151; }
+body.theme-dark .history { color: #d1d5db; }
+body.theme-dark .mini { background: #111827; }
+body.theme-dark .banner { background: #374151; border: 1px solid #4b5563; }
+body.theme-dark .toast { background: #f3f4f6; color: #111827; }
+body.theme-dark .present-badge, body.theme-dark .present-controls { border: 1px solid rgba(255,255,255,.18); }
+body.theme-dark.canvas-hidden .quiet-bar { background: rgba(31,41,55,.94); box-shadow: 0 2px 12px rgba(0,0,0,.6); border: 1px solid #4b5563; }
+body.theme-dark .quiet-people, body.theme-dark .quiet-link { color: #e5e7eb; }
+body.theme-dark .prow.annotating .tag { color: #4ade80; }
+
 /* ---------- narrow screens (phones) ---------- */
 @media (max-width: 760px) {
   .panels-btn { display: inline-block; }
   .topleft { right: 12px; padding: 6px 8px; gap: 6px; }
   .topleft .title { max-width: 34vw; font-size: 12.5px; }
-  .topright { top: 56px; left: 12px; right: auto; padding: 5px 6px; gap: 4px; flex-wrap: nowrap; max-width: calc(100vw - 24px); overflow-x: auto; }
-  .topright .btn { padding: 5px 7px; font-size: 11.5px; }
+  /* one row that fits a 360 px screen with "▶ Presentar" whole: 3 avatars and a "+N" chip, the
+     follow button as an icon, tighter spacing (e2e/phone.spec.ts, the top bar tests) */
+  .topright { top: 56px; left: 12px; right: auto; padding: 5px; gap: 3px; flex-wrap: nowrap; max-width: calc(100vw - 24px); overflow-x: auto; }
+  .topright .btn { padding: 5px 6px; font-size: 11.5px; }
+  .topright .audience { padding: 0 3px; }
   .topright .lbl-full { display: none; }
   .topright .lbl-short { display: inline; }
   .av { width: 26px; height: 26px; font-size: 10px; }
+  .avatars .desk-only { display: none; }
+  .avatars .av.phone-only { display: flex; }
   .side { display: none; }
   body.panels-open .side { display: block; }
   .people { top: 102px; width: calc(100vw - 24px); max-height: 40vh; }
@@ -160,4 +248,9 @@ svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-e
   .bottomright { display: none; }
   .banner { top: 102px; max-width: calc(100vw - 24px); }
   .geo-grid.open { position: fixed; bottom: 70px; left: 12px; right: 12px; transform: none; grid-template-columns: repeat(6, 1fr); }
+}
+/* phones of 380 px and less (360 is common): the hide button is an icon too, its label in aria-label and title */
+@media (max-width: 380px) {
+  .topright .lbl-word { display: none; }
+  .topright .lbl-icon { display: inline; }
 }

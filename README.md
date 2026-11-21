@@ -9,10 +9,16 @@ Miro-style, and the canvas keeps who drew what. It is the first plugin of
 - **The full toolset**: select / move / resize / rotate / marquee, hand and space-pan, freehand pen with
   pressure-like smoothing, highlighter, eraser, arrows that bind to shapes and follow them, line, text, sticky
   notes, rectangle, ellipse and 17 more shapes, frames, pasted or dropped images, and a laser pointer that is
-  never stored. Style panel with 12 colours, fills, strokes (solid, dashed, dotted, sketchy), sizes, fonts,
+  never stored (a red-dot cursor; under a finger or a pen a dot shows where it points). An interact tool hands
+  the pointer to the artifact: its links, buttons and inner scrolling work, and a link to another file of the
+  artifact opens that file's canvas, so annotations follow per page. Style panel with 12 colours, fills, strokes (solid, dashed, dotted, sketchy), sizes, fonts,
   arrowheads, opacity, order, group and lock. Per-user undo, zoom, zoom to fit, minimap.
 - **Live**: strokes appear on every screen while they are drawn; live cursors with names; presence avatars;
-  *Presentar* (everyone follows the presenter) and *Seguir a* (follow one person).
+  *Presentar*, a presentation mode: fullscreen (an in-page view where the browser has none or refuses it), the
+  artifact as wide as the screen, the editing chrome hidden behind a few floating controls (laser, pen, interact,
+  undo, exit), the laser as the tool, and Esc to leave; everyone else follows the presenter's view with a banner
+  and a "Dejar de seguir" button, the presenter's own other tabs and devices too. `?present=1` on a canvas link
+  opens it straight in presentation mode. *Seguir a* follows one person.
 - **Attribution**: every shape records who created and last edited it, and when. Name tags, a hover card, an
   authors panel with counts and a per-person show/hide toggle, and a history timeline. Attribution is stamped by
   the server from the verified identity into a separate **ledger** document that clients only receive, never
@@ -24,6 +30,13 @@ Miro-style, and the canvas keeps who drew what. It is the first plugin of
 - **Persistence**: two Yjs documents per artifact (content + ledger), stored as two S3/MinIO objects under
   `_plugins/canvas/`, saved debounced and flushed on last leave. Canvas data never outlives the artifact (expiry + orphan sweep).
 - **Export** to PNG and PDF, current view or the whole artifact.
+- **Looks like the page**: the board takes the artifact's background, a theme toggle in the page included; on a dark
+  page the chrome goes dark and the default stroke is white. A first visit opens the canvas **hidden**: the artifact
+  as the original page (its own scrolling, links and buttons), with a small "✏️ Canvas · 3" pill that counts the
+  annotations, says who else is viewing and annotating ("👁 5 viendo · 2 anotando") and opens the canvas, and a
+  "Ver original" link. The choice of the "Mostrar canvas" / "Ocultar canvas" toggle is remembered per user;
+  `?canvas=1` / `?canvas=0` force a visit. The counts never include you, but others see you by name as viewing
+  while you have the artifact open, even with the canvas hidden; the counts' tooltip says so.
 - Spanish UI by default, English with `?lang=en` (or the server config).
 
 This is a re-implementation of the behaviour of tools like tldraw, written from scratch. It contains no tldraw
@@ -79,9 +92,9 @@ side that still hides tools pages it (`docs/screenshots/phone-390x844.png`,
 `phone-390x844-toolbar-end.png`, `phone-360x780.png`; `client/e2e/phone.spec.ts` clicks every tool at
 390 and 360 px through the chevrons).
 
-Keyboard: V select, H hand (or hold Space), D pen, ⇧D highlighter, E eraser, A arrow, L line, T text, N note,
+Keyboard: V select, H hand (or hold Space), I interact (use the artifact), D pen, ⇧D highlighter, E eraser, A arrow, L line, T text, N note,
 R rectangle, O ellipse, F frame, K laser, ⌘Z / ⇧⌘Z undo/redo, ⌘A, ⌘D duplicate, ⌘G / ⇧⌘G group, ⇧L lock,
-[ / ] back/front, ⇧1 zoom to fit, ⇧0 100%, Delete, Esc.
+[ / ] back/front, ⇧1 zoom to fit, ⇧0 100%, Delete, Esc (also leaves presentation mode).
 
 ## Full system: the canvas as a plugin of the core (Docker Compose)
 
@@ -255,7 +268,7 @@ All values are environment variables; the chart maps them from `values.yaml`.
 | `ANON_ENABLED` | `true` (chart: `false`) | Anonymous drawing. `false`: a visitor who brings no credential (no `Authorization`, no cookie but the canvas's own `canvas_anon`) is refused before the core is asked (wrapper `302` to `LOGIN_URL`, else `403`; frame `403`; WebSocket `4403`), and so is any anonymous answer of the core; no visitor cookie is minted. Any value but `true`/`1` is off. Unset, the server keeps its earlier behaviour (on); the chart always renders it, from `anon.enabled`. |
 | `ANON_ALLOWED_PREFIXES` | `pub/` | Prefixes where anonymous access is accepted while `ANON_ENABLED` is on. An empty value is the default (`pub/`), and a list with no prefix in it (`,`) accepts anonymous nowhere: neither turns anonymous drawing off, `ANON_ENABLED` does. |
 | `MAX_CONNS_PER_ROOM` / `MAX_CONNS_PER_ROOM_ANON` / `MAX_CONNS_PER_ANON_VISITOR` | `50` / `10` / `2` | Room capacity (anon gets the stricter set); over capacity closes `1013`. |
-| `MSG_RATE_PER_SEC` / `MSG_BURST` | `120` / `240` | Per-connection message rate → `4429`. |
+| `MSG_RATE_PER_SEC` / `MSG_BURST` | `120` / `240` | Per-connection message rate → `4429`. The client merges its content updates into at most 30 messages/s and sends its own awareness (never another tab's) at most 30 times/s (12/s each anonymous), whatever the display's refresh rate, and after a `4429` joins again with a backoff (protocol §4). Awareness the room relayed and a client sends back is not charged (protocol §4.2). |
 | `ANON_MSG_RATE_PER_SEC` / `ANON_MSG_BURST` | `30` / `60` | Same for anonymous. |
 | `MAX_DOC_BYTES` / `ANON_MAX_DOC_BYTES` | `5 MiB` / `1.25 MiB` | Content **plus ledger**: an update that would grow the room past the sender's cap is refused and only that connection closes `4413`; the room stays open, and an update that only deletes always passes. Lowered at start (with a warning) when a full room does not fit one share of the room memory budget. |
 | `WS_MAX_BUFFERED_BYTES` | `8 MiB` | A peer that stops reading is dropped once the server holds this much unsent data for it (beyond the join burst). |

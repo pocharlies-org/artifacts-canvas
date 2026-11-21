@@ -18,4 +18,4 @@ export function composeIdentity(authz: AuthzResult, anonNum: string, visitorId =
 // Awareness hardening (the `user` field forced to the verified identity, foreign
 // clientIds dropped) lives in @pocharlies/artifacts-canvas-shared/awareness — the same
 // implementation the development room in client/dev/yroom.ts applies.
-export { awarenessUser, sanitizeAwarenessUpdate } from '@pocharlies/artifacts-canvas-shared/awareness';
+export { awarenessUser, isAwarenessEcho, sanitizeAwarenessUpdate } from '@pocharlies/artifacts-canvas-shared/awareness';

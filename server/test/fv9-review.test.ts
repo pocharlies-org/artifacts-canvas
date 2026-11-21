@@ -466,9 +466,19 @@ describe('F-6: the write-ahead log is bounded while saves fail', () => {
     // what the log holds beyond the room counts in the memory budget
     expect(room.walExcess).toBeGreaterThan(0);
     expect(app.manager.memory().total).toBeGreaterThanOrEqual(room.cost + room.walExcess);
-    // the refused edit (the tab's last) was not applied: the room and the tab differ by it
-    const accepted = (await room.inspect()).doc.getMap('shapes').toJSON();
-    expect(JSON.stringify(accepted)).not.toBe(JSON.stringify(shapes.toJSON()));
+    // the refused edit was not applied: the room lacks part of what the tab holds. Compared as Yjs
+    // snapshots (state vector and delete set), not as shapes: which update crosses the cap depends on
+    // timing, and when it is a note's creation the tab deletes that note again before it hears the
+    // close, so the shapes of the room and the tab can be equal while the room lacks the refused
+    // update and the tab's delete (CI saw that once)
+    const roomDoc = (await room.inspect()).doc;
+    const accepted = roomDoc.getMap('shapes').toJSON();
+    expect(Y.equalSnapshots(Y.snapshot(roomDoc), Y.snapshot(ana.doc))).toBe(false);
+    // and the room holds nothing the tab does not (it is the tab's own work, minus what was refused)
+    const merged = new Y.Doc();
+    Y.applyUpdate(merged, Y.encodeStateAsUpdate(ana.doc));
+    Y.applyUpdate(merged, Y.encodeStateAsUpdate(roomDoc));
+    expect(Y.equalSnapshots(Y.snapshot(merged), Y.snapshot(ana.doc))).toBe(true);
     // the room is idle now (its only tab was closed) but is not evicted with its changes unsaved
     await sleep(500);
     expect(app.manager.get(key)).toBe(room);

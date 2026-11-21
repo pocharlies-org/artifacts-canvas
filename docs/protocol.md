@@ -35,7 +35,12 @@ credentials (§7), and MUST answer exactly like the gate would for a denied arti
 otherwise (no existence leak). One exception mirrors the gate: when `LOGIN_URL` is set and
 the gate answers `unauthenticated` (no session; not a bearer caller), the **wrapper** answers
 `302` to `LOGIN_URL` with `{rd}` = the URL-encoded original path, so a visitor who opens a
-canvas link first logs in and comes back. Frame and ws never redirect.
+canvas link first logs in and comes back. Frame and ws never redirect. A visitor the gate refuses
+otherwise gets, on the **wrapper**, a `403` HTML page ("Acceso necesario" / "Access required",
+`?lang=en`) that links to the plain artifact URL (the path of `ARTIFACT_BASE_URL` plus the key),
+where the core explains the refusal and offers its request-access form; the page is built from
+the requested key only, so it is the same for every refused key. Frame and ws keep their plain
+`403` / `4403`.
 
 With anonymous drawing off (`ANON_ENABLED=false`, the chart's `anon.enabled: false` default) the
 canvas has no anonymous visitors at all. A request that brings no credential (no `Authorization`,
@@ -94,8 +99,27 @@ inline element in the wrapper HTML (JSON, HTML-escaped):
 Fields: `artifactPath`, `room`, `frameUrl`, `wsUrl`, `vendorUrl`, `shareUrl`, `pageWidth`,
 `title`, `lang` (`es` default, `en`), `maxImageBytes`, `maxDocBytes` (the visitor's room cap:
 `MAX_DOC_BYTES`, `ANON_MAX_DOC_BYTES` for an anonymous visitor; the editor says the canvas is
-full before an image would pass it, fv8 U1), `dev` (never `true` in production: it enables a
-local identity and the `?as=` / `?room=` / `?artifact=` query parameters).
+full before an image would pass it, fv8 U1), `artifactUrl` (the plain artifact on this host,
+path only: the path of `ARTIFACT_BASE_URL` plus the key, the same link the access-required page
+gives; "Ver original" opens it with `?raw=1`, which the core serves without the canvas), `dev`
+(never `true` in production: it enables a local identity and the `?as=` / `?room=` /
+`?artifact=` query parameters).
+
+**Visibility** (`client/src/ui/canvas-pref.ts`, `ui/visibility.ts`). The canvas opens shown or
+hidden: `?present=1` shown, in presentation mode; `?canvas=1` shown and `?canvas=0` hidden for
+this visit; else the user's last choice of the toggle ("Mostrar canvas" / "Ocultar canvas"),
+kept in `localStorage` per user (`artifacts-canvas:canvas:<user id>`), not per artifact; else,
+on a first visit, hidden. Query parameters are never remembered. Hidden, the artifact looks
+like the original page: the frame takes the whole view, the reporter stops holding the page
+still (`mode`, §3) so it scrolls on its own, links and buttons work as with the interact tool,
+and the annotations, toolbar and panels are hidden. A small pill, "✏️ Canvas · 3" (the
+annotations in the room), opens the canvas; next to it, "👁 5 viendo · 2 anotando" (who else is
+here, §6 "Viewing and annotating") and "Ver original". The connection stays, so the counts are
+live, but a hidden canvas only views: its presence is its user (forced by the server) and the
+status `cursor.viewing`, with no cursor, viewport, laser, presentation or following, and its
+camera follows nobody. That state is set when the canvas hides; after it only y-protocols'
+renewal goes out (every 15 s, §4.2).
+A link to another page keeps `canvas=` when the URL had it.
 
 ## 3. Frame: the artifact, isolated
 
@@ -116,24 +140,86 @@ scope for v1; the service may wrap them in a minimal HTML page.
 (`pageWidth`, stored in the document so every participant gets the same layout) and sized to
 the artifact's full content height. It never scrolls; the canvas camera pans and zooms the
 iframe and the drawings together, so world coordinates are artifact CSS pixels and
-annotations stay on the element they were drawn on. Wheel and touch go to the canvas; the
-artifact is view-only inside the wrapper (the plain artifact link still works for interacting
-with it).
+annotations stay on the element they were drawn on. Wheel and touch go to the canvas, except
+with the interact tool (below), where the artifact takes the pointer.
 
-**postMessage.** Only the following, validated on both sides (`event.source` is checked;
-payloads are clamped):
+**Links.** The sandbox stays as it is: no `allow-same-origin`, no `allow-top-navigation`, no
+`allow-popups`. The frame cannot navigate the wrapper or open a window by itself; the wrapper
+does it for the user, in `client/src/artifact/links.ts`:
+
+- With the interact tool (I) the iframe takes the pointer: the artifact's links, buttons and
+  inner scrolling work, and nothing is drawn. Outside the page a drag pans. With the select
+  tool, a plain click on the bare page (no shape under it, nothing selected) follows the link
+  there, and the cursor is a pointer over a link (`probe`). The pen and the other drawing tools
+  never reach the artifact: they draw over links.
+- The reporter stops the frame's own navigation for a link click and posts the URL the frame
+  resolved. A same-document anchor (`#id`, `#top`, `#`) never leaves the frame as a link: the
+  reporter posts the target's position and the camera brings it under the top panels.
+  `javascript:` links are left to the frame (the browser does not run them in a sandboxed frame).
+- The wrapper takes only `http:` and `https:` URLs without credentials, at most 4096
+  characters. Another file of this host (a relative link resolves to the frame route
+  `/_canvas/_/frame/<key>`; a plain artifact URL `/<bucket>/<key>` or a canvas URL works too)
+  opens that file's canvas in this tab: `/_canvas/[<bucket>/]<key>` as the current wrapper URL
+  has it, keeping `lang`, with `present=1` while presenting, so annotations follow per page. The
+  key is sanitised (`sanitizePath`); the server gates it like any other. The canvas's own routes
+  (`/_canvas/_/…` other than the frame) open nothing. Any other http(s) URL opens in a new tab
+  with `noopener,noreferrer`; so does an internal link clicked with ⌘/ctrl/shift, the middle
+  button or `target="_blank"`. Everything else (`data:`, `blob:`, `file:`, `mailto:`, …) is
+  blocked with a toast.
+- The artifact's own scripts share the frame with the reporter and can post the same messages,
+  so the wrapper checks more than their shape. A `link` or `anchor` message is taken only with
+  a user gesture on the wrapper (`navigator.userActivation.isActive`: a click in the frame
+  activates its ancestors too) **and** either within 1.5 s of the select tool's own `click`
+  request, or with the interact tool while the focus is in the frame (the user clicked in it).
+  A `wheel` is taken only with the interact tool while the pointer is over the frame, a `key`
+  only with the interact tool while the focus is in the frame. A script posting on its own, or
+  riding on a click made elsewhere on the canvas, gets nothing (`client/e2e/links.spec.ts`,
+  `links-forge.html`). Nothing is fetched: the outcome is a navigation of this tab, a new tab or
+  nothing. The wrapper CSP is unchanged.
+- The gate cannot tell a click on a real link from any other gesture: after a user click or key
+  press inside the artifact (the interact tool, or the canvas hidden), or a plain select-tool
+  click on the page, the artifact's own script can open one external http(s) tab or navigate this
+  tab to another canvas page of the same host, like any click-gated popup (one per gesture,
+  `noopener,noreferrer`). It cannot do either without such a gesture.
+
+**Background.** The board takes the artifact's own background, so the area around and beyond the
+page is the page's colour, and a dark page sits on a dark board. The reporter posts the computed
+`background-color` of `html`, else of `body` when `html` is transparent, else white; a colour
+in another form (`oklch()`, `color()`) goes through a 1x1 canvas and is posted as `rgba()`. It
+checks again when an attribute of the page changes (a theme toggle), when
+`prefers-color-scheme` changes, and once a second (a transition, a late stylesheet), at most 4
+times a second, and posts only a change. The wrapper takes only `rgb()`, `rgba()` and hex
+colours of at most 64 characters (`client/src/ui/theme.ts`), composites a translucent one over
+white, and writes the result as `rgb(r, g, b)` from the numbers: nothing the artifact wrote
+reaches a style. Under a relative luminance of 0.4 the chrome goes dark (`body.theme-dark`) and
+the default stroke colour is white instead of black, unless the user picked a colour.
+
+**postMessage.** Only the following, validated on both sides (`event.source` is checked, and
+the wrapper also requires the opaque origin `"null"` of the sandboxed frame; payloads are
+clamped):
 
 | Direction | Message |
 |---|---|
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'size', w, h}` content size, on load and on every resize |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'title', title}` |
-| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'scroll', x, y}` the artifact tried to scroll (anchor link): the wrapper pans there |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'scroll', x, y}` the artifact tried to scroll: the wrapper pans there |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'link', href, newTab}` a link was clicked (`href` absolute, as the frame resolved it; `''` when over 4096 characters); see "Links" |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'anchor', x, y}` a same-document anchor was followed: its target's position in artifact px |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'wheel', dx, dy, mode, zoom, shift, x, y}` a wheel over the artifact that no element of the page scrolled (interact tool) |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'key', key:'Escape'}` Escape pressed in the artifact |
+| wrapper → frame | `{source:'artifacts-canvas', type:'probe', id, x, y}` is there a link at (x, y)? Answered `{source:'artifacts-canvas-reporter', type:'probe', id, link}` |
+| wrapper → frame | `{source:'artifacts-canvas', type:'click', x, y, newTab}` follow the link at (x, y), if any (the select tool's click) |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'bg', color}` the page's background colour (see "Background") |
+| wrapper → frame | `{source:'artifacts-canvas', type:'mode', native}` `native: true` while the canvas is hidden: the page scrolls on its own (and same-document anchors scroll it) instead of being held still; sent on the frame's first message and on every load |
 | wrapper → frame | `{source:'artifacts-canvas', type:'snapshot', id, rect:{x,y,w,h}, scale, lib}` export request; `lib` is the `vendorUrl` |
-| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'snapshot', id, dataUrl}` a `data:image/png` of `rect`, or `null` |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'snapshot', id, dataUrl, partial}` a `data:image/png` of `rect`, or `null` when the page could not be captured; `partial: true` when part of it could not be read (an image or a background that did not load is left blank) |
 
 The snapshot uses `html-to-image` (SVG `foreignObject`, no extra iframe, so it works in the
 sandbox). Images the artifact loads from other origins cannot be captured from an opaque
-origin and appear blank in exports.
+origin and appear blank in exports. An image that cannot be read (that origin rule, a broken
+image of the page, a relative image of a gated artifact: `docs/known-issues.md`) becomes a
+transparent placeholder instead of failing the whole snapshot, and the reply says `partial`;
+the wrapper then tells the user what the file lacks.
 
 ## 4. WebSocket room
 
@@ -187,7 +273,8 @@ interface Identity {
   connections are accepted only while `ANON_ENABLED` is on (§1: off, they are closed `4403` and
   never get a cookie) and only for keys inside `ANON_ALLOWED_PREFIXES` (default `pub/`);
   anything else is denied with reason `anon_outside_pub` (§7).
-- Close codes (RFC 6455 private range; the client does not reconnect on 44xx): `4403`
+- Close codes (RFC 6455 private range; the client does not reconnect on 44xx, except `4429`,
+  see below): `4403`
   forbidden (authz denied, revoked, or a forbidden write, §5), `4404` artifact gone, `4410`
   artifact expired, `4413` document/message too large (also a stored room that costs more than
   the joining principal's whole memory share, §10), `4429` rate-limited, `4503`
@@ -196,6 +283,13 @@ interface Identity {
   with backoff — a join is never refused with the terminal `4429`, fv5 M-6). `4401`
   (unauthenticated) is reserved and unused in v1 — the gate denies unauthenticated visitors
   as `4403`/`4404`. Send a NOTICE before closing when there is something to tell the user.
+- After a `4429` the client waits and joins again (`client/src/collab/connection.ts`
+  `RATE_LIMIT_BACKOFF`): 2 s, doubled on each `4429` in a row up to 30 s, plus up to 0.5 s of
+  jitter; the streak ends once a connection stayed synced for 60 s. The tab stays editable while
+  it waits (status `disconnected`, never read-only), and its edits go out with the step-2 answer
+  of the next join. A rate limit is not a decision against the user: before this, one honest
+  stroke on a 120 Hz screen left the tab read-only until a reload. Each retry is a join, so the
+  join rate and the CPU budget still bound a client that keeps flooding.
 - Re-check authz every `AUTHZ_RECHECK_SECONDS` (default 300; the chart ships 300) and on ACL
   change; on a deny send NOTICE `revoked`/`expired` and close 4403/4410. When the core could not
   answer (`core_error`: timeout, network error, 5xx; `malformed`) nothing was decided: the
@@ -241,6 +335,32 @@ interface Identity {
 - Any other sync type closes the connection with `1003` (`unknown sync type`).
 - The ledger is sent as a full state on join and then as each stamper transaction's update, to
   every connection (the sender included). It has no client → server direction.
+
+### 4.2 Awareness (who sends what)
+
+- **A tab sends its own awareness state and nothing else** (`client/src/collab/connection.ts`
+  `sendOwnAwarenessOnly`): its changes, its renewals (y-protocols renews an unchanged state every
+  15 s) and, when a remote update removes its state, the same state at a higher clock (y-protocols'
+  re-announcement, so the others see it again). Its answer to QUERY_AWARENESS is its own state.
+  The stock y-websocket 3.1.0 client sends every awareness update event, the ones fired by states
+  it received included, so every tab sent every other tab's states back: the room's awareness
+  traffic grew with the square of its size, the echoes counted against each tab's message bucket
+  (§10), and a presentation of 10 tabs closed every tab `4429`.
+- **The server relays each update once to every other member.** The sender does not get its own
+  change back. A renewal (the same state at a newer clock) goes back to it as well: a stock client
+  alone in its room hears nothing else, and y-websocket closes a socket that heard nothing for 30 s.
+- **What the room relayed is not charged to the members it was sent to.** An AWARENESS message
+  whose entries are all client ids the connection does not hold, at clocks the room already has
+  (`isAwarenessEcho`, `shared/src/awareness.ts`: a stock client, or a tab still running an older
+  canvas bundle, sending back what it received), is dropped like any foreign state and takes no
+  token of the connection's message bucket, at most once per update relayed to that connection
+  (the allowance is capped at its burst); `canvas_ws_awareness_echoes_total` counts them. Beyond
+  that allowance such messages are charged as usual.
+- **A tab sends presence only when it changed**, at most `SEND_HZ` times a second (§10): a patch
+  that changes nothing is not set (y-protocols would send it with a newer clock). A follower's
+  camera moves with the presenter's, and the follower publishes its own viewport once that camera
+  stood still for 500 ms (`FOLLOW_SETTLE_MS`), not at the presenter's pace: a presentation adds
+  the presenter's stream to the room, not one stream per member (`client/e2e-server/presence.spec.ts`).
 
 ## 5. Attribution: server-stamped, never client-written
 
@@ -371,7 +491,7 @@ Never announce it in production.
 | Document | Root | Type | Written by | Content |
 |---|---|---|---|---|
 | content | `shapes` | `Y.Map<Y.Map>` | clients | one Y.Map per shape, key = shape id |
-| content | `assets` | `Y.Map<string>` | clients | pasted images as data URLs, key = asset id (client caps at `maxImageBytes`, default 2 MiB, downscaled to ≤1600 px) |
+| content | `assets` | `Y.Map<string>` | clients | pasted images as data URLs, key = asset id (client caps at `maxImageBytes`, default 2 MiB, downscaled to ≤1600 px). The client writes an asset in the transaction that creates the image shape naming it, and deletes it in the transaction that deletes the last shape naming it (an undo brings both back); the server drops deleted data (Yjs garbage collection) and measures the room again at its next save |
 | content | `meta` | `Y.Map` | clients | `pageWidth` (set once by the first client) |
 | ledger | `attribution` | `Y.Map<Attribution>` | server | §5 |
 | ledger | `users` | `Y.Map<UserInfo>` | server | §5 |
@@ -420,13 +540,36 @@ never in the document:
 interface PresenceState {
   user: {id, name, color, anonymous};          // overwritten by the server (§5.4)
   cursor?: {x, y} | null;                      // world coordinates
-  status?: 'cursor.typingNote' | 'cursor.typing' | null;
+  status?: 'cursor.typingNote' | 'cursor.typing' | 'cursor.laser' | 'cursor.viewing' | null;  // 'cursor.laser': drawn as a laser dot; 'cursor.viewing': the canvas is hidden
   laser?: {pts: [x, y, tMs][], now: tMs} | null;  // last ~1 s of the trail
   viewport?: {x, y, w, h} | null;              // the world rectangle this person sees
   presenting?: boolean;
   following?: string | null;                   // user id
 }
 ```
+
+**Viewing and annotating** (`client/src/collab/presence.ts` `audienceOf`). A session
+*annotates* when its canvas is shown: its presence has a viewport and its status is not
+`cursor.viewing` (a hidden tab of an older bundle publishes neither, and counts as viewing). A
+person is *viewing* when any of their sessions is in the room, and *annotating* when any of them
+annotates; the annotating people are counted among the viewing ones. People are counted by user
+id, so several tabs or devices of one person count once, and this user, in all of their
+sessions, is never counted: every number is about the others. The hidden canvas's pill and the
+shown canvas's top bar say "👁 5 viendo · 2 anotando" ("👁 5 viewing · 2 annotating"; "👁 5" on a
+phone), and nothing when nobody else is here; the left panel lists them under "Ahora aquí",
+annotators first.
+
+Presenting and following are decided in each tab from these states
+(`client/src/collab/follow.ts`). A presenting tab follows nobody. Every other tab follows a
+presenting tab on its own, the presenter's own other tabs and devices included (by awareness
+client id, not by person; the tab itself is never a candidate). A follower that stops following
+is left alone until that presenter stops; when the presenter stops or its state goes away (it
+disconnected), its followers are released. Two presenters at once: followers keep the one they
+follow, newcomers take the lowest client id. The presenter's viewport and laser go out at the
+awareness pace like cursors; a follower sends nothing while the presenter's laser moves, and its
+own viewport only once its camera stood still for 500 ms (§4.2), so a presentation adds one stream
+to the room whatever its size. While the laser is held still its last point is sent again every
+300 ms (at most about 3 messages/s) so it does not fade for the others.
 
 ## 7. AuthZ: the core contract (matches core `gate/gate.py` + `docs/plugins.md` §1)
 
@@ -565,9 +708,12 @@ switch (§1) does not apply to it: with anonymous drawing off it still asks the 
   whatever pongs it sends.
 - **Awareness hardening** (§5.4): the `user` field is overwritten with the verified
   identity; states for clientIds already owned by another connection are dropped; every state
-  is reduced to the presence schema.
+  is reduced to the presence schema. Each update is relayed once to the other members; a member
+  that sends back what the room relayed to it is not charged for it, up to what was relayed (§4.2).
 - **Limits** (anonymous gets the stricter set): messages `120/s` burst 240 (anon 30/60) →
-  `4429`; message size 4 MiB (anon 1 MiB) → `4413`; room size 5 MiB (anon 1.25 MiB), **content
+  `4429` (the client keeps under it at any display rate: it merges its content updates into at
+  most 30 messages/s and sends its own awareness, never another tab's, at most 30 times/s, 12/s
+  each anonymous, never once per animation frame; the batches of a big delete stay separate messages, `client/src/collab/pacer.ts`); message size 4 MiB (anon 1 MiB) → `4413`; room size 5 MiB (anon 1.25 MiB), **content
   plus ledger** → `4413` (all of them lowered at start to what the memory budget holds, see
   "Loaded rooms" below; the ledger an update will add is counted ahead, `ledgerBound` §11),
   where every **cut** an update makes in an item counts `SPLIT_COST_BYTES` (32) on top of its

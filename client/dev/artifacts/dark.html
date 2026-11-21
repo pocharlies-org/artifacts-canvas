@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8">
+<title>Dark test page</title>
+<style>
+  html.dark{background:#0b0b0f;color:#e5e7eb}
+  html.light{background:#fafafa;color:#111827}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif}
+  .wrap{padding:32px 48px;font-size:15px;line-height:1.6;min-height:1700px}
+  h1{margin:0 0 12px;font-size:26px}
+  .card{border:1px solid #2a2f3a;border-radius:10px;padding:16px 18px;margin:16px 0;background:#14161c}
+  html.light .card{border-color:#e5e7eb;background:#fff}
+  a{color:#93c5fd} html.light a{color:#1d4ed8}
+  button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid #3b4252;background:#1f2430;color:inherit;cursor:pointer}
+  html.light button{background:#f3f4f6;border-color:#d1d5db}
+  .kpi{display:inline-block;margin-right:28px}.kpi b{display:block;font-size:28px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Dark artifact</h1>
+  <p>A page with a black background and a theme toggle, as some published reports have.
+    <button id="theme" type="button" onclick="var h=document.documentElement;h.classList.toggle('dark');h.classList.toggle('light')">Theme</button>
+    <a id="internal" href="links-b.html">Page B</a></p>
+  <div class="card"><span class="kpi"><b>1 842</b>tests</span><span class="kpi"><b>37</b>failed</span><span class="kpi"><b>97.9 %</b>pass rate</span></div>
+  <div class="card">Failures cluster on one node since the 6th; the other suites are unchanged.</div>
+  <h2 id="details">Details</h2>
+  <div class="card">billing-core · InvoiceRoundingTest.testMultiCurrency: expected 104.31 but was 104.30</div>
+  <div class="card">catalog-sync · CatalogImportTest.testLargeFeed: OutOfMemoryError: Java heap space</div>
+</div>
+</body>
+</html>

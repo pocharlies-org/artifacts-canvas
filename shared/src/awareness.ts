@@ -170,3 +170,35 @@ export function sanitizeAwarenessUpdate(
   }
   return encoding.toUint8Array(enc);
 }
+
+/**
+ * An awareness update that only repeats what the room already has: every entry is for a client id
+ * the connection does not hold, at a clock the room has seen (a state, or the removal of one). The
+ * stock y-websocket client (3.1.0) sends back every awareness state it receives, so a tab that runs
+ * it (an older canvas bundle, another y-websocket client) answers each relayed update with this.
+ * It changes nothing: sanitizeAwarenessUpdate drops the foreign ids. The server takes it without
+ * charging the connection's message rate, at most once per update it relayed to that connection
+ * (server/src/ws.ts): the room's traffic must not count against the members it was sent to.
+ */
+export function isAwarenessEcho(
+  update: Uint8Array,
+  claimedClientIds: ReadonlySet<number>,
+  roomAwareness: awarenessProtocol.Awareness,
+): boolean {
+  try {
+    const dec = decoding.createDecoder(update);
+    const count = decoding.readVarUint(dec);
+    if (count === 0) return false;
+    for (let i = 0; i < count; i++) {
+      const clientId = decoding.readVarUint(dec);
+      const clock = decoding.readVarUint(dec);
+      decoding.readVarUint8Array(dec); // the state (a varString: length + bytes), not parsed
+      if (claimedClientIds.has(clientId)) return false;
+      const meta = roomAwareness.meta.get(clientId);
+      if (!meta || meta.clock < clock) return false;
+    }
+    return !decoding.hasContent(dec);
+  } catch {
+    return false;
+  }
+}

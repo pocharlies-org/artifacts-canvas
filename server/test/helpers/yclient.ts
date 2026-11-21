@@ -36,6 +36,14 @@ export class TestClient {
   answerStep1 = true;
   /** sync step 1 messages received from the server (the join's, plus any resync request) */
   step1Received = 0;
+  /**
+   * Send back every awareness state received, as the stock y-websocket 3.1.0 client does (the
+   * canvas client sends only its own: client/src/collab/connection.ts). false: own states only.
+   */
+  echoRemoteAwareness = true;
+  /** client ids of every awareness message received and sent, in order */
+  awarenessIn: number[][] = [];
+  awarenessOut: number[][] = [];
 
   constructor(
     private readonly url: string,
@@ -88,8 +96,10 @@ export class TestClient {
       });
       this.awareness.on('update', ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }) => {
         if (!this.open) return;
-        const changed = [...added, ...updated, ...removed];
+        let changed = [...added, ...updated, ...removed];
+        if (!this.echoRemoteAwareness) changed = changed.filter((id) => id === this.awareness.clientID);
         if (!changed.length) return;
+        this.awarenessOut.push(changed);
         const e = encoding.createEncoder();
         encoding.writeVarUint(e, 1);
         encoding.writeVarUint8Array(e, awarenessProtocol.encodeAwarenessUpdate(this.awareness, changed));
@@ -126,7 +136,9 @@ export class TestClient {
       return;
     }
     if (type === 1) {
-      awarenessProtocol.applyAwarenessUpdate(this.awareness, decoding.readVarUint8Array(dec), 'server');
+      const update = decoding.readVarUint8Array(dec);
+      this.awarenessIn.push(awarenessClientIds(update));
+      awarenessProtocol.applyAwarenessUpdate(this.awareness, update, 'server');
       return;
     }
     if (type === 100) {
@@ -153,6 +165,18 @@ export class TestClient {
   close(): void {
     if (this.open) this.ws.close();
   }
+}
+
+/** The client ids an awareness update carries (y-protocols wire format), in order. */
+export function awarenessClientIds(update: Uint8Array): number[] {
+  const dec = decoding.createDecoder(update);
+  const out: number[] = [];
+  for (let n = decoding.readVarUint(dec); n > 0; n--) {
+    out.push(decoding.readVarUint(dec));
+    decoding.readVarUint(dec);
+    decoding.readVarString(dec);
+  }
+  return out;
 }
 
 /** Resolve when `pred()` holds or reject after `ms`. */

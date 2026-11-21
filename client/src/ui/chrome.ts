@@ -10,18 +10,20 @@ import { download, exportCanvas, type ExportFormat, type ExportScope } from '../
 import { geoOutline } from '../geometry/geo';
 import { polyPath } from '../render/shapeSvg';
 import { clear, h, installPopoverDismiss } from './dom';
+import { buildPresentation, startPresentation, stopPresentation } from './present';
+import { showAudience, type VisibilityControl } from './visibility';
 
 /** Builds the panels of the approved mockup around the canvas and keeps them in sync. */
-export function buildChrome(ed: Editor, root: HTMLElement) {
+export function buildChrome(ed: Editor, root: HTMLElement, visibility?: VisibilityControl) {
   installPopoverDismiss();
   const toastEl = h('div', { class: 'toast', 'data-testid': 'toast', role: 'status' });
   root.append(toastEl);
   let toastTimer = 0;
-  ed.toastFn = (msg) => {
+  ed.toastFn = (msg, ms = 2600) => {
     toastEl.textContent = msg;
     toastEl.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = window.setTimeout(() => toastEl.classList.remove('show'), 2600);
+    toastTimer = window.setTimeout(() => toastEl.classList.remove('show'), ms);
   };
 
   // The three bottom panels share one flex row (zoom | toolbar | minimap) so they can
@@ -32,12 +34,13 @@ export function buildChrome(ed: Editor, root: HTMLElement) {
 
   root.append(
     topLeft(ed),
-    topRight(ed),
+    topRight(ed, visibility),
     peoplePanel(ed),
     stylePanel(ed),
     bottomRow,
     banner(ed),
   );
+  buildPresentation(ed, root);
 }
 
 // ------------------------------------------------------------------ top left: title, live, annotations
@@ -78,11 +81,32 @@ function topLeft(ed: Editor): HTMLElement {
 
 // ------------------------------------------------------------------ top right: avatars, follow, present, share, export
 
-function topRight(ed: Editor): HTMLElement {
+/** A desktop's top bar shows the first 6 people, this user included, and "+N" for the rest. */
+const DESKTOP_AVATARS = 6;
+/**
+ * A phone's top bar shows 3 of the others (not this user) and a "+N" chip that names the rest, so
+ * the row fits the screen and "Presentar" is never cut; the audience count next to it adds up the same.
+ */
+const PHONE_AVATARS = 3;
+
+function topRight(ed: Editor, visibility?: VisibilityControl): HTMLElement {
   const avatars = h('div', { class: 'avatars', 'data-testid': 'avatars' });
-  const followBtn = h('button', { class: 'btn', id: 'follow-btn', 'data-testid': 'follow' });
+  // who else is here, as on the hidden canvas's pill: "👁 5 viendo · 2 anotando" ("👁 5" on a phone)
+  const audienceShort = h('span', { class: 'lbl-short' });
+  const audience = h('span', { class: 'audience', 'data-testid': 'audience', hidden: true }, h('span', { class: 'lbl-full' }), audienceShort);
+  // the canvas off: the artifact as the plain page, with a pill to bring the canvas back (ui/visibility.ts)
+  // the narrowest phones show it as an icon (styles.css, max-width 380px), as the people panel's 🙈
+  const hideBtn = h('button', { class: 'btn', 'data-testid': 'canvas-hide', title: t('canvas.hide'), 'aria-label': t('canvas.hide') },
+    h('span', { class: 'lbl-full' }, t('canvas.hide')), h('span', { class: 'lbl-short lbl-word' }, t('canvas.hide.short')),
+    h('span', { class: 'lbl-icon', 'aria-hidden': 'true' }, '🙈'));
+  hideBtn.addEventListener('click', () => (visibility ? visibility.set(false, true) : ed.setCanvasVisible(false)));
+  // a phone shows the follow button as an icon (its label in aria-label and title): the row must fit
+  const followFull = h('span', { class: 'lbl-full' });
+  const followShort = h('span', { class: 'lbl-short', 'aria-hidden': 'true' });
+  const followBtn = h('button', { class: 'btn', id: 'follow-btn', 'data-testid': 'follow' }, followFull, followShort);
   const followMenu = h('div', { class: 'popover', 'data-owner': 'follow-btn', role: 'menu' });
-  const presentBtn = h('button', { class: 'btn primary', 'data-testid': 'present' });
+  // the button says what presenting does: fullscreen with the laser, and the others follow
+  const presentBtn = h('button', { class: 'btn primary', 'data-testid': 'present', title: t('app.present.title') });
   const shareBtn = h('button', { class: 'btn', 'data-testid': 'share', 'aria-label': t('app.share') },
     h('span', { class: 'lbl-full' }, t('app.share')), h('span', { class: 'lbl-short' }, '⤴'));
   const exportBtn = h('button', { class: 'btn', id: 'export-btn', 'data-testid': 'export', 'aria-label': t('app.export') },
@@ -102,26 +126,44 @@ function topRight(ed: Editor): HTMLElement {
   const update = () => {
     clear(avatars);
     const ppl = ed.conn ? people(ed.conn.awareness) : [];
-    for (const p of ppl.slice(0, 6)) {
-      const av = h('button', { class: 'av', style: `background:${p.color}`, title: p.name + (p.id === ed.me?.id ? ` ${t('app.you')}` : ''), 'data-user': p.name },
+    // Both stacks are built on every presence change, so their "+N" stays right as people come
+    // and go; the stylesheet shows the one for the width (desk-only / phone-only), rotation included.
+    const notMe = ppl.filter((p) => p.id !== ed.me?.id);
+    const onPhone = new Set(notMe.slice(0, PHONE_AVATARS).map((p) => p.id));
+    ppl.forEach((p, i) => {
+      const desk = i < DESKTOP_AVATARS;
+      const phone = onPhone.has(p.id);
+      if (!desk && !phone) return;
+      const av = h('button', { class: 'av' + (desk ? '' : ' phone-only') + (phone ? '' : ' desk-only'), style: `background:${p.color}`, title: p.name + (p.id === ed.me?.id ? ` ${t('app.you')}` : ''), 'data-user': p.name },
         initials(p.name, p.anonymous));
       if (p.id !== ed.me?.id) av.addEventListener('click', () => ed.follow(p.id));
       avatars.append(av);
+    });
+    if (ppl.length > DESKTOP_AVATARS) avatars.append(h('span', { class: 'av more desk-only' }, `+${ppl.length - DESKTOP_AVATARS}`));
+    const rest = notMe.slice(PHONE_AVATARS);
+    if (rest.length) {
+      // the people it stands for, in its label; the full list is the people panel, which it opens
+      const label = t('app.avatars.more', { n: rest.length, names: rest.map((p) => p.name).join(', ') });
+      avatars.append(h('button', { class: 'av more phone-only', 'data-testid': 'avatars-more', title: label, 'aria-label': label,
+        onclick: () => document.body.classList.add('panels-open') }, `+${rest.length}`));
     }
-    if (ppl.length > 6) avatars.append(h('span', { class: 'av more' }, `+${ppl.length - 6}`));
     const o = others();
     const following = ed.followingUserId ? displayUser((u) => ed.doc.user(u), ed.followingUserId) : null;
     const followingName = following ? o.find((x) => x.id === ed.followingUserId)?.name ?? following.name : null;
     if (ed.followingUserId) {
-      followBtn.textContent = t('app.follow.stop');
+      followFull.textContent = t('app.follow.stop');
+      followShort.textContent = '◉';
       followBtn.classList.add('on');
       followBtn.title = t('app.following', { name: followingName ?? '' });
     } else {
       followBtn.classList.remove('on');
-      followBtn.textContent = o.length === 1 ? t('app.follow', { name: o[0].name.split(' ')[0] }) : t('app.follow.none');
-      followBtn.title = '';
+      followFull.textContent = o.length === 1 ? t('app.follow', { name: o[0].name.split(' ')[0] }) : t('app.follow.none');
+      followShort.textContent = '◎';
+      followBtn.title = followFull.textContent;
     }
+    followBtn.setAttribute('aria-label', followFull.textContent ?? '');
     followBtn.disabled = !o.length && !ed.followingUserId;
+    showAudience(audience, ed.audience(), audienceShort);
     presentBtn.textContent = ed.presenting ? t('app.present.stop') : t('app.present');
     presentBtn.classList.toggle('on', ed.presenting);
   };
@@ -142,7 +184,8 @@ function topRight(ed: Editor): HTMLElement {
     }
     followMenu.classList.toggle('open');
   });
-  presentBtn.addEventListener('click', () => ed.setPresenting(!ed.presenting));
+  // fullscreen needs this click: startPresentation asks for it inside the gesture
+  presentBtn.addEventListener('click', () => (ed.presenting ? stopPresentation(ed) : startPresentation(ed)));
   shareBtn.addEventListener('click', async () => {
     try {
       await navigator.clipboard.writeText(ed.cfg.shareUrl);
@@ -164,8 +207,11 @@ function topRight(ed: Editor): HTMLElement {
         exportMenu.classList.remove('open');
         ed.toast(t('app.export.working'));
         try {
-          const { blob, filename } = await exportCanvas(ed, fmt, scope);
+          const { blob, filename, artifact } = await exportCanvas(ed, fmt, scope);
           download(blob, filename);
+          // the file is there, but say what it lacks: a silent export with no page is a wrong export
+          if (artifact === 'missing') ed.toast(t('app.export.noArtifact'), 8000);
+          else if (artifact === 'partial') ed.toast(t('app.export.partial'), 8000);
         } catch (err) {
           ed.toast(t('app.export.failed', { error: String((err as Error)?.message ?? err) }));
         }
@@ -175,9 +221,10 @@ function topRight(ed: Editor): HTMLElement {
   exportBtn.addEventListener('click', () => exportMenu.classList.toggle('open'));
   ed.on('presence', update);
   ed.on('follow', update);
+  ed.on('present', update);
   ed.on('identity', update);
   update();
-  return h('div', { class: 'panel topright' }, avatars,
+  return h('div', { class: 'panel topright' }, hideBtn, avatars, audience,
     h('span', { class: 'anchor' }, followBtn, followMenu), presentBtn, shareBtn,
     h('span', { class: 'anchor' }, exportBtn, exportMenu));
 }
@@ -185,6 +232,20 @@ function topRight(ed: Editor): HTMLElement {
 // ------------------------------------------------------------------ left: who drew + history
 
 function peoplePanel(ed: Editor): HTMLElement {
+  // who else is here now, viewers apart from annotators (collab/presence.ts audienceOf)
+  const here = h('div', { class: 'rows', 'data-testid': 'here-now' });
+  const renderHere = () => {
+    clear(here);
+    const a = ed.audience();
+    if (!a.members.length) here.append(h('div', { class: 'empty' }, t('people.now.empty')));
+    for (const m of a.members) {
+      const kind = m.annotating ? 'annotating' : 'viewing';
+      here.append(h('div', { class: `prow ${kind}`, 'data-testid': 'here-row', 'data-activity': kind, 'data-user': m.user.name },
+        h('span', { class: 'dot', style: `${m.annotating ? 'background' : 'border-color'}:${m.user.color}` }),
+        h('span', { class: 'n' }, m.user.name),
+        h('span', { class: 'tag' }, m.annotating ? t('people.now.annotating') : t('people.now.viewing'))));
+    }
+  };
   const rows = h('div', { class: 'rows', 'data-testid': 'authors' });
   const hist = h('div', { class: 'history-list', 'data-testid': 'history' });
   let frame = 0;
@@ -222,8 +283,21 @@ function peoplePanel(ed: Editor): HTMLElement {
   ed.on('history', update);
   ed.on('visibility', update);
   ed.on('identity', update);
+  // presence changes at the awareness pace (a laser, a cursor): the list redraws once per frame at most
+  let hereFrame = 0;
+  const updateHere = () => {
+    if (hereFrame) return;
+    hereFrame = requestAnimationFrame(() => {
+      hereFrame = 0;
+      renderHere();
+    });
+  };
+  ed.on('presence', updateHere);
+  ed.on('identity', updateHere);
   render();
-  return h('div', { class: 'panel people side' }, h('h4', {}, t('people.title')), rows,
+  renderHere();
+  return h('div', { class: 'panel people side' }, h('h4', {}, t('people.now')), here,
+    h('h4', { style: 'margin-top:10px' }, t('people.title')), rows,
     h('div', { class: 'history' }, h('h4', { style: 'margin-top:10px' }, t('history.title')), hist));
 }
 
@@ -342,6 +416,7 @@ function toolbar(ed: Editor): HTMLElement {
   const items: Item[] = [
     { id: 'select', icon: '⬉', key: 'V', tip: 'tool.select' },
     { id: 'hand', icon: '✋', key: 'H', tip: 'tool.hand' },
+    { id: 'interact', icon: '👆', key: 'I', tip: 'tool.interact' },
     'sep',
     { id: 'draw', icon: '✎', key: 'D', tip: 'tool.draw' },
     { id: 'highlight', icon: '🖍', key: '⇧D', tip: 'tool.highlight' },
@@ -452,19 +527,35 @@ function banner(ed: Editor): HTMLElement {
     let text = '';
     if (ed.notice) text = t(`app.notice.${ed.notice.kind}` as MessageKey);
     else if (ed.status === 'closed') text = t('app.notice.closed', { code: ed.conn?.closeCode ?? 0 });
-    else if (ed.followingUserId) {
-      const pres = ed.presenterName();
-      const u = displayUser((x) => ed.doc.user(x), ed.followingUserId);
-      const name = (ed.conn && peers(ed.conn.awareness).find((p) => p.state.user?.id === ed.followingUserId)?.state.user?.name) || u.name;
-      text = pres && pres === name ? t('app.presenting', { name: shortName(name) }) : t('app.following', { name: shortName(name) });
-      el.append(text, ' ', h('button', { class: 'btn small', onclick: () => ed.stopFollowing() }, t('app.follow.stop')));
-      el.classList.add('show');
-      return;
+    else if (!ed.presenting) {
+      const pres = ed.presenter();
+      const manual = ed.followingUserId && !ed.followingPresenter ? ed.followingUserId : null;
+      if (manual) {
+        const u = displayUser((x) => ed.doc.user(x), manual);
+        const name = (ed.conn && peers(ed.conn.awareness).find((p) => p.state.user?.id === manual)?.state.user?.name) || u.name;
+        show('following', t('app.following', { name: shortName(name) }), t('app.follow.stop'), () => ed.stopFollowing());
+        return;
+      }
+      if (pres) {
+        // someone presents: everyone else follows, this person's other tabs too; a follower may stop and follow again
+        const what = pres.self ? t('app.presenting.self') : t('app.presenting', { name: shortName(pres.name) });
+        if (ed.followingPresenter) show('presenting', what, t('app.follow.stop'), () => ed.stopFollowing());
+        else show('presenting', what, t('app.follow.again'), () => ed.followPresenter());
+        return;
+      }
     }
+    el.dataset.kind = text ? 'notice' : '';
     el.textContent = text;
     el.classList.toggle('show', !!text);
   };
+  const show = (kind: string, text: string, action: string, fn: () => void) => {
+    el.dataset.kind = kind;
+    el.append(h('span', { 'data-testid': 'banner-text' }, text), ' ',
+      h('button', { class: 'btn small', 'data-testid': 'banner-action', onclick: fn }, action));
+    el.classList.add('show');
+  };
   ed.on('follow', update);
+  ed.on('present', update);
   ed.on('notice', update);
   ed.on('status', update);
   ed.on('presence', update);

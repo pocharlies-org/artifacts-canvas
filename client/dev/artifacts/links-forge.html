@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Forged messages test page</title>
+<style>body{margin:0;font-family:sans-serif}.wrap{padding:32px 48px;min-height:1600px}</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Forged messages</h1>
+  <p>This page's own script posts the reporter's link, anchor, wheel and key messages to the canvas,
+  every 400 ms for 8 s, without the user acting on the page. The canvas must ignore them all.</p>
+  <p id="forged">0</p>
+</div>
+<script>
+  var n = 0;
+  var s = 'artifacts-canvas-reporter';
+  var to = location.href.replace('links-forge.html', 'links-b.html');
+  var timer = setInterval(function () {
+    parent.postMessage({ source: s, type: 'link', href: to, newTab: false }, '*');
+    parent.postMessage({ source: s, type: 'link', href: 'https://external.test/forged', newTab: true }, '*');
+    parent.postMessage({ source: s, type: 'anchor', x: 0, y: 1200 }, '*');
+    parent.postMessage({ source: s, type: 'wheel', dx: 0, dy: 900, mode: 0, zoom: false, shift: false, x: 10, y: 10 }, '*');
+    parent.postMessage({ source: s, type: 'key', key: 'Escape' }, '*');
+    document.getElementById('forged').textContent = String(++n);
+    if (n >= 20) clearInterval(timer);
+  }, 400);
+</script>
+</body>
+</html>

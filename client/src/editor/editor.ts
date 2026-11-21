@@ -5,9 +5,16 @@ import { encodeImage, roomBytes, wouldOverfill } from './images';
 import { attachStamper } from '../model/stamper';
 import { DEFAULT_STYLE, STYLE_KEYS, type Identity, type Shape, type Style, type GeoKind } from '../model/types';
 import { Connection, type Status } from '../collab/connection';
-import { peers, setPresence, type LaserPoint, type PresenceState } from '../collab/presence';
+import { Throttle, sendIntervalMs } from '../collab/pacer';
+import { audienceOf, hiddenPresence, peers, setPresence, type Audience, type LaserPoint, type PresenceState } from '../collab/presence';
+import {
+  INITIAL_FOLLOW, currentPresenter, followPresenter, followUser, onPeers, startPresenting, stopFollowing, stopPresenting,
+  targetPeer, type FollowPeer, type FollowState,
+} from '../collab/follow';
 import type { Notice } from '../collab/protocol';
-import { ArtifactFrame } from '../artifact/frame';
+import { ArtifactFrame, type FrameWheel } from '../artifact/frame';
+import { canvasUrl, classifyLink, linkContext, type LinkContext } from '../artifact/links';
+import { DEFAULT_BOARD, isDark, opaque, toCss, type Rgba } from '../ui/theme';
 import { Renderer } from '../render/renderer';
 import {
   type Camera, clampZoom, fitBox, matchViewport, nextZoomStep, screenToWorld, visibleWorld, worldToScreen, zoomAt,
@@ -15,19 +22,35 @@ import {
 import { type Box, type Pt, unionBoxes } from '../geometry/vec';
 import { shapeBounds, topShapeAt, FONT_SIZE, NOTE_FONT_SIZE, NOTE_SIZE } from '../geometry/shapes';
 import { FONT_FAMILY, layoutText } from '../render/text';
-import type { CanvasConfig } from '../config';
+import { DEFAULT_PREFIX, RESERVED, type CanvasConfig } from '../config';
 import { TOOLS, nudgeSelection as TOOLS_NUDGE, type ToolId, type Tool, type PointerInfo } from '../tools/tools';
 import { Overlay } from '../render/overlay';
 import { t } from '../i18n';
 import { own } from '../model/colors';
 
-export type Topic = 'camera' | 'selection' | 'tool' | 'style' | 'presence' | 'doc' | 'status' | 'identity' | 'visibility' | 'follow' | 'history' | 'notice';
+export type Topic = 'camera' | 'selection' | 'tool' | 'style' | 'presence' | 'doc' | 'status' | 'identity' | 'visibility' | 'follow' | 'present' | 'canvas' | 'theme' | 'history' | 'notice';
 
 export interface EditorDom {
   stage: HTMLElement;
 }
 
 const LASER_TTL = 1000;
+/** While the laser is held still, its point is sent again this often, so it does not fade for the others. */
+const LASER_HOLD_MS = 300;
+/** A follower publishes its viewport once its camera stood still this long (publishFollowedViewport). */
+export const FOLLOW_SETTLE_MS = 500;
+/** Presentation mode: the artifact page fills the screen width, up to this zoom. */
+const PRESENT_MAX_ZOOM = 2;
+/** Presentation mode: screen px above the page top, under the "Presentando" badge. */
+const PRESENT_TOP = 48;
+
+/** The presenter seen by this tab: who, and whether it is this person in another tab or device. */
+export interface PresenterInfo {
+  name: string;
+  userId: string;
+  clientId: number;
+  self: boolean;
+}
 
 export class Editor {
   readonly doc: CanvasDoc;
@@ -58,10 +81,26 @@ export class Editor {
   hoverId: string | null = null;
   pointerWorld: Pt | null = null;
   spaceDown = false;
-  presenting = false;
-  followingUserId: string | null = null;
-  private followReason: 'manual' | 'presenter' | null = null;
-  private dismissedPresenter: string | null = null;
+  /** Presenting and following (collab/follow.ts): what this tab presents or follows. */
+  private fstate: FollowState = INITIAL_FOLLOW;
+  /** The tool in use when presentation mode started; back when it ends. */
+  private toolBeforePresenting: { tool: ToolId; geo: GeoKind } | null = null;
+  /** The presence `status` last published (a laser cursor shows as one for the others). */
+  private publishedStatus: string | null = null;
+  /** Where a click on a link of the artifact leads (artifact/links.ts). */
+  readonly links: LinkContext;
+  /**
+   * The canvas is hidden (ui/visibility.ts): the artifact shows as the plain page (full view,
+   * its own scrolling, links work), no annotations, no chrome, and nothing of this tab's
+   * pointer goes to the others. The connection stays, so the annotation count stays live.
+   */
+  hidden = false;
+  private cameraBeforeHiding: Camera | null = null;
+  /** The artifact's background, as the board shows it (opaque), and whether it is dark. */
+  board: Rgba = DEFAULT_BOARD;
+  dark = false;
+  /** The user picked a colour: the default stroke colour no longer follows the board. */
+  private colorChosen = false;
   /** Local laser trail (published through awareness, never stored). */
   laser: LaserPoint[] = [];
   /** Receive time of each peer's laser state (for fading). */
@@ -69,7 +108,8 @@ export class Editor {
   private clipboard: { shapes: Shape[]; assets: Record<string, string> } | null = null;
   private listeners = new Map<Topic, Set<() => void>>();
   activeTool: Tool;
-  private presenceFrame = 0;
+  /** Awareness goes out at the send rate, not once per animation frame (collab/pacer.ts). */
+  private readonly presencePace = new Throttle(() => this.sendIntervalMs());
   private pendingPresence: Partial<PresenceState> = {};
   private laserAnim = 0;
   private stamperDetach: (() => void) | null = null;
@@ -96,12 +136,32 @@ export class Editor {
     this.frame = new ArtifactFrame(this.page, cfg.frameUrl, this.pageWidth, this.pageHeight, cfg.vendorUrl, {
       size: (_w, h) => {
         this.pageHeight = h;
-        this.page.style.height = `${h}px`;
+        if (!this.hidden) this.page.style.height = `${h}px`;
         this.emit('camera');
       },
       title: () => this.emit('status'),
       scroll: (x, y) => this.panTo({ x, y }),
+      // The artifact's own scripts share the frame with the reporter and can post the same
+      // messages, so each is taken only when the user is acting on the artifact (frameGesture)
+      link: (href, newTab) => {
+        if (this.frameGesture()) this.openLink(href, newTab);
+      },
+      anchor: (x, y) => {
+        if (this.frameGesture()) this.revealTop({ x, y });
+      },
+      wheel: (w) => {
+        if (this.tool === 'interact' && this.frame.hovered) this.wheelFromFrame(w);
+      },
+      escape: () => {
+        if (this.tool === 'interact' && !this.hidden && this.focusInFrame()) this.escape();
+      },
+      background: (c) => this.applyBackground(c),
     });
+    const prefix = (() => {
+      const base = (import.meta.env?.BASE_URL as string | undefined) ?? '/_canvas/_/';
+      return base.endsWith(RESERVED) ? base.slice(0, -RESERVED.length) : DEFAULT_PREFIX;
+    })();
+    this.links = linkContext(location.origin, location.pathname, prefix, cfg.artifactPath);
 
     this.renderer = new Renderer(this.world, this.doc);
     this.overlay = new Overlay(this);
@@ -144,8 +204,9 @@ export class Editor {
     if (conn) {
       conn.onStatus((s) => {
         this.status = s;
-        // a notice that only meant "reconnecting" ends once the tab is synced again
-        if (s === 'synced' && this.notice && (this.notice.kind === 'busy' || this.notice.kind === 'shutdown')) {
+        // a notice that only meant "reconnecting" ends once the tab is synced again (a rate
+        // limit too: the connection waits a moment and reconnects, see Connection)
+        if (s === 'synced' && this.notice && (this.notice.kind === 'busy' || this.notice.kind === 'shutdown' || this.notice.kind === 'rate-limited')) {
           this.notice = null;
           this.emit('notice');
         }
@@ -216,20 +277,23 @@ export class Editor {
     return this.status === 'closed';
   }
 
+  /** Milliseconds between two awareness messages (collab/pacer.ts; the connection paces content). */
+  sendIntervalMs(): number {
+    return sendIntervalMs(!!this.me?.anonymous);
+  }
+
   publishPresence(patch: Partial<PresenceState>, immediate = false) {
     if (!this.conn) return;
+    // a hidden canvas only views (collab/presence.ts hiddenPresence). Its state is set when the
+    // canvas hides and then left alone (setPresence skips an unchanged patch): renewals only, every 15 s.
+    if (this.hidden) patch = hiddenPresence(patch);
+    if ('status' in patch) this.publishedStatus = patch.status ?? null;
     Object.assign(this.pendingPresence, patch);
-    if (immediate) {
-      this.flushPresence();
-      return;
-    }
-    if (this.presenceFrame) return;
-    this.presenceFrame = requestAnimationFrame(() => this.flushPresence());
+    this.presencePace.schedule(() => this.flushPresence());
+    if (immediate) this.presencePace.flush();
   }
 
   private flushPresence() {
-    if (this.presenceFrame) cancelAnimationFrame(this.presenceFrame);
-    this.presenceFrame = 0;
     if (!this.conn || !this.me) {
       return;
     }
@@ -244,52 +308,284 @@ export class Editor {
       if (p.state.laser && p.state.laser.pts.length) this.laserSeen.set(p.clientId, { at: now, now: p.state.laser.now });
     }
     this.ensureLaserAnimation();
-    // presenter / follow
-    const presenter = peers(this.conn.awareness).find((p) => p.state.presenting && p.state.user && p.state.user.id !== this.me?.id);
-    const pid = presenter?.state.user?.id ?? null;
-    if (!pid) this.dismissedPresenter = null;
-    if (this.followReason === 'presenter' && this.followingUserId !== pid) this.stopFollowing();
-    if (pid && !this.presenting && !this.followingUserId && this.dismissedPresenter !== pid) this.follow(pid, 'presenter');
-    if (this.followingUserId) this.applyFollow();
+    this.setFollowState(onPeers(this.fstate, this.followPeers(), this.selfClientId()));
+    if (this.fstate.target) this.applyFollow();
     this.overlay.updateCursors();
     this.emit('presence');
   }
 
-  presenterName(): string | null {
-    if (!this.conn) return null;
-    const p = peers(this.conn.awareness).find((x) => x.state.presenting && x.state.user);
-    return p?.state.user?.name ?? null;
+  /** The awareness peers as the follow state machine sees them. */
+  private followPeers(): FollowPeer[] {
+    if (!this.conn) return [];
+    return peers(this.conn.awareness).map((p) => ({ clientId: p.clientId, userId: p.state.user!.id, presenting: !!p.state.presenting }));
   }
 
-  follow(userId: string, reason: 'manual' | 'presenter' = 'manual') {
-    this.followingUserId = userId;
-    this.followReason = reason;
-    this.publishPresence({ following: userId });
+  private selfClientId(): number {
+    return this.conn?.awareness.clientID ?? -1;
+  }
+
+  private setFollowState(next: FollowState) {
+    const prev = this.fstate;
+    if (next === prev) return;
+    this.fstate = next;
+    const following = next.target?.userId ?? null;
+    if (following !== (prev.target?.userId ?? null)) this.publishPresence({ following });
+    if (next.target !== prev.target || next.dismissed !== prev.dismissed) this.emit('follow');
+  }
+
+  /** This tab presents (presentation mode). */
+  get presenting(): boolean {
+    return this.fstate.presenting;
+  }
+
+  /** The person this tab follows, or null. */
+  get followingUserId(): string | null {
+    return this.fstate.target?.userId ?? null;
+  }
+
+  /** Following because someone presents (not "Seguir a ..."). */
+  get followingPresenter(): boolean {
+    return this.fstate.target?.reason === 'presenter';
+  }
+
+  /** The presenter this tab sees (followed or not), or null. Never this tab. */
+  presenter(): PresenterInfo | null {
+    if (!this.conn) return null;
+    const p = currentPresenter(this.followPeers(), this.selfClientId(), this.fstate);
+    if (!p) return null;
+    const st = peers(this.conn.awareness).find((x) => x.clientId === p.clientId)?.state;
+    return { name: st?.user?.name ?? '', userId: p.userId, clientId: p.clientId, self: p.userId === this.me?.id };
+  }
+
+  follow(userId: string) {
+    this.setFollowState(followUser(this.fstate, userId, this.followPeers(), this.selfClientId()));
     this.applyFollow();
-    this.emit('follow');
+  }
+
+  /** Follow the presenter again after "Dejar de seguir". */
+  followPresenter() {
+    this.setFollowState(followPresenter(this.fstate, this.followPeers(), this.selfClientId()));
+    this.applyFollow();
   }
 
   stopFollowing() {
-    if (!this.followingUserId) return;
-    if (this.followReason === 'presenter') this.dismissedPresenter = this.followingUserId;
-    this.followingUserId = null;
-    this.followReason = null;
-    this.publishPresence({ following: null });
-    this.emit('follow');
+    this.setFollowState(stopFollowing(this.fstate));
   }
 
   private applyFollow() {
-    if (!this.conn || !this.followingUserId) return;
-    const target = peers(this.conn.awareness).find((p) => p.state.user?.id === this.followingUserId && p.state.viewport);
-    if (!target?.state.viewport) return;
-    this.setCamera(matchViewport(target.state.viewport, this.viewW, this.viewH), 'follow');
+    if (!this.conn || this.hidden) return;
+    const target = targetPeer(this.fstate, this.followPeers(), this.selfClientId());
+    if (!target) return;
+    const vp = peers(this.conn.awareness).find((p) => p.clientId === target.clientId)?.state.viewport;
+    if (!vp) return;
+    const next = matchViewport(vp, this.viewW, this.viewH);
+    // every awareness update of the room comes here (a laser, a cursor): the camera moves only when the viewport did
+    if (next.tx === this.camera.tx && next.ty === this.camera.ty && clampZoom(next.z) === this.camera.z) return;
+    this.setCamera(next, 'follow');
   }
 
+  /**
+   * Presentation mode on or off. On: this tab follows nobody, the others (this person's other
+   * tabs too) follow it, the laser is the tool and the artifact fills the screen width. Off:
+   * the tool from before comes back, and the followers are released. Fullscreen is the UI's
+   * part (ui/present.ts): it needs the click that started it.
+   */
   setPresenting(on: boolean) {
-    this.presenting = on;
-    if (on) this.stopFollowing();
+    if (on === this.fstate.presenting) return;
+    if (on && this.hidden) this.setCanvasVisible(true);
+    if (on) {
+      this.toolBeforePresenting = { tool: this.tool, geo: this.geoKind };
+      this.setFollowState(startPresenting(this.fstate));
+      if (this.tool !== 'laser') this.setTool('laser');
+      this.fitForPresentation();
+    } else {
+      this.setFollowState(stopPresenting(this.fstate, this.followPeers(), this.selfClientId()));
+      const back = this.toolBeforePresenting;
+      this.toolBeforePresenting = null;
+      if (back) {
+        this.geoKind = back.geo;
+        this.setTool(back.tool);
+      }
+      if (this.fstate.target) this.applyFollow();
+    }
     this.publishPresence({ presenting: on, viewport: this.visibleWorld() }, true);
+    this.emit('present');
     this.emit('follow');
+  }
+
+  /** Esc: leave presentation mode, else drop the tool for select, else the selection. */
+  escape() {
+    if (this.presenting) {
+      this.setPresenting(false);
+      return;
+    }
+    this.activeTool.cancel?.();
+    if (this.tool !== 'select') this.setTool('select');
+    else this.clearSelection();
+  }
+
+  // ------------------------------------------------------------------ links of the artifact
+
+  /** Until when a link or anchor message answers the select tool's click (clickArtifact). */
+  private frameClickUntil = 0;
+
+  /**
+   * Is a `link` or `anchor` message from the frame the user's doing? It must come with a user
+   * gesture on this page (a click inside the frame activates its ancestors too), and either
+   * answer the select tool's click of the last moment, or come while the user works inside the
+   * artifact (interact tool, focus in the frame). A script of the artifact posting on its own,
+   * or riding on a click made elsewhere on the canvas, gets nothing.
+   */
+  private frameGesture(): boolean {
+    if (!userActivated()) return false;
+    if (performance.now() < this.frameClickUntil) {
+      this.frameClickUntil = 0;
+      return true;
+    }
+    return (this.tool === 'interact' || this.hidden) && this.focusInFrame();
+  }
+
+  // ------------------------------------------------------------------ canvas shown / hidden
+
+  /** Show the canvas (the full editor) or hide it (the artifact as the plain page). */
+  setCanvasVisible(visible: boolean) {
+    if (visible === !this.hidden) return;
+    if (!visible) {
+      if (this.presenting) this.setPresenting(false);
+      if (this.editingId) this.stopEditing();
+      this.activeTool.cancel?.();
+      this.clearSelection();
+      this.hideHover();
+      this.setLaserPointer(null);
+      this.laser = [];
+      this.cameraBeforeHiding = { ...this.camera };
+      this.hidden = true;
+      // what the others had of this tab goes away; it views (publishPresence keeps it so from now on)
+      this.publishPresence({ cursor: null, viewport: null, laser: null, presenting: false }, true);
+      this.frame.setInteractive(true);
+      this.layoutHidden();
+    } else {
+      this.hidden = false;
+      this.page.style.width = `${this.pageWidth}px`;
+      this.page.style.height = `${this.pageHeight}px`;
+      this.frame.setNative(false);
+      this.frame.setInteractive(this.tool === 'interact');
+      const cam = this.cameraBeforeHiding;
+      this.cameraBeforeHiding = null;
+      if (cam && this.initialCameraSet) this.setCamera(cam, 'system');
+      else this.resetCamera();
+      this.publishPresence({ status: this.tool === 'laser' ? 'cursor.laser' : null, viewport: this.visibleWorld(), following: this.fstate.target?.userId ?? null });
+      if (this.fstate.target) this.applyFollow();
+    }
+    this.emit('canvas');
+    this.emit('camera');
+  }
+
+  /** Hidden: the frame takes the whole view at scale 1, and the page scrolls on its own. */
+  private layoutHidden() {
+    this.page.style.width = `${this.viewW}px`;
+    this.page.style.height = `${this.viewH}px`;
+    this.frame.setNative(true, this.viewW, this.viewH);
+    this.camera = { tx: 0, ty: 0, z: 1 };
+    this.world.style.transform = 'translate(0px, 0px) scale(1)';
+  }
+
+  /** Annotations in the room (the hidden canvas's badge). */
+  annotationCount(): number {
+    return this.doc.all().length;
+  }
+
+  /** Other people here, by person: viewing (any session) and annotating (canvas shown), never this user. */
+  audience(): Audience {
+    return audienceOf(this.conn ? peers(this.conn.awareness) : [], this.me?.id ?? null);
+  }
+
+  // ------------------------------------------------------------------ the artifact's background
+
+  /**
+   * The board takes the artifact's background (ui/theme.ts), so the area around and beyond the
+   * page is the page's own colour. On a dark one the chrome goes dark and the default stroke
+   * colour is white, unless the user picked a colour.
+   */
+  private applyBackground(c: Rgba) {
+    this.board = opaque(c);
+    const dark = isDark(c);
+    document.documentElement.style.setProperty('--board', toCss(c));
+    document.body.classList.toggle('theme-dark', dark);
+    if (dark !== this.dark) {
+      this.dark = dark;
+      const color = dark ? 'white' : 'black';
+      if (!this.colorChosen && (this.style.color === 'black' || this.style.color === 'white') && this.style.color !== color) {
+        this.style = { ...this.style, color };
+        this.emit('style');
+      }
+    }
+    this.emit('theme');
+  }
+
+  private focusInFrame(): boolean {
+    return document.activeElement === this.frame.el;
+  }
+
+  /** A link clicked in the artifact (the reporter's `link` message, artifact/links.ts). */
+  openLink(href: string, newTab: boolean) {
+    const a = classifyLink(href, this.links);
+    if (a.kind === 'blocked') {
+      this.toast(t('link.blocked'));
+      return;
+    }
+    if (a.kind === 'external') {
+      window.open(a.url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    const url = canvasUrl(a.key, this.links, new URLSearchParams(location.search), { presenting: this.presenting, dev: this.cfg.dev });
+    if (newTab) {
+      window.open(url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    // the edits of the last send interval go out before the page changes
+    this.conn?.flush();
+    this.navigate(url);
+  }
+
+  /** A full page load opens the other file's canvas (its own room, its own annotations). */
+  navigate(url: string) {
+    location.assign(url);
+  }
+
+  /** Follow the link of the artifact at a world point (the select tool's click on the page). */
+  clickArtifact(p: Pt, newTab: boolean) {
+    if (p.x < 0 || p.y < 0 || p.x > this.pageWidth || p.y > this.pageHeight) return;
+    this.frameClickUntil = performance.now() + 1500;
+    this.frame.clickAt(p.x, p.y, newTab);
+  }
+
+  private probeSeq = 0;
+  private readonly probePace = new Throttle(() => 80);
+
+  /** The select tool hovers the page: a pointer cursor over a link of the artifact. */
+  probeLink(p: Pt | null) {
+    const seq = ++this.probeSeq;
+    if (!p || p.x < 0 || p.y < 0 || p.x > this.pageWidth || p.y > this.pageHeight) {
+      if (this.stage.dataset.cursor === 'pointer') this.stage.dataset.cursor = '';
+      return;
+    }
+    this.probePace.schedule(() => {
+      void this.frame.probe(p.x, p.y).then((link) => {
+        if (seq !== this.probeSeq || this.tool !== 'select') return;
+        const cur = this.stage.dataset.cursor ?? '';
+        if (cur === '' || cur === 'pointer') this.stage.dataset.cursor = link ? 'pointer' : '';
+      });
+    });
+  }
+
+  /** Bring the world point `p` near the top of the view, under the top panels (an anchor of the artifact). */
+  revealTop(p: Pt) {
+    const z = this.camera.z;
+    const vis = this.visibleWorld();
+    const tx = p.x >= vis.x && p.x <= vis.x + vis.w ? this.camera.tx : this.viewW / 2 - p.x * z;
+    const margin = this.presenting ? PRESENT_TOP : this.viewW < 760 ? 112 : 70;
+    this.setCamera({ z, tx, ty: margin - p.y * z });
   }
 
   // ------------------------------------------------------------------ camera
@@ -304,23 +600,48 @@ export class Editor {
         this.initialCameraSet = true;
         this.resetCamera();
       }
-    } else if (this.followingUserId) this.applyFollow();
+    } else if (this.hidden) this.layoutHidden();
+    else if (this.followingUserId) this.applyFollow();
+    // fullscreen on or off, a phone turned: the page fills the new width, the same line at the top
+    else if (this.presenting && r.width > 0) this.fitForPresentation();
     this.emit('camera');
   }
 
   /** Initial camera: the artifact page at the top, as wide as fits (100% on a desktop). */
   resetCamera() {
+    if (this.hidden) {
+      this.layoutHidden();
+      return;
+    }
+    if (this.presenting) {
+      this.fitForPresentation();
+      return;
+    }
     const z = clampZoom(Math.min(1, (this.viewW - 24) / this.pageWidth));
     this.setCamera({ z, tx: (this.viewW - this.pageWidth * z) / 2, ty: this.viewW < 760 ? 112 : 70 }, 'system');
+  }
+
+  /**
+   * Presentation: the artifact page as wide as the screen (up to PRESENT_MAX_ZOOM), the line at
+   * the top of the view kept at the top (the page top, under the badge, when it was in view).
+   */
+  fitForPresentation() {
+    if (this.viewW <= 0) return;
+    const pad = this.viewW < 760 ? 6 : 24;
+    const z = clampZoom(Math.min(PRESENT_MAX_ZOOM, (this.viewW - 2 * pad) / this.pageWidth));
+    const top = Math.max(0, this.visibleWorld().y);
+    this.setCamera({ z, tx: (this.viewW - this.pageWidth * z) / 2, ty: top > 0 ? -top * z : PRESENT_TOP }, 'system');
   }
 
   private applyPageWidth() {
     const w = this.doc.pageWidth(this.cfg.pageWidth);
     if (w === this.pageWidth) return;
     this.pageWidth = w;
-    this.page.style.width = `${w}px`;
     this.frame.width = w;
-    this.frame.el.style.width = `${w}px`;
+    if (!this.hidden) {
+      this.page.style.width = `${w}px`;
+      this.frame.el.style.width = `${w}px`;
+    }
     this.resetCamera();
   }
 
@@ -329,9 +650,34 @@ export class Editor {
     if (source === 'user' && this.followingUserId) this.stopFollowing();
     this.camera = { tx: c.tx, ty: c.ty, z: clampZoom(c.z) };
     this.world.style.transform = `translate(${this.camera.tx}px, ${this.camera.ty}px) scale(${this.camera.z})`;
-    this.publishPresence({ viewport: this.visibleWorld() });
+    if (source === 'follow') this.publishFollowedViewport();
+    else {
+      this.clearFollowSettle();
+      this.publishPresence({ viewport: this.visibleWorld() });
+    }
     if (this.editingId) this.positionTextarea();
     this.emit('camera');
+  }
+
+  private followSettle: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * A follower's camera moves with the presenter's: its own viewport goes out once that camera
+   * stood still for FOLLOW_SETTLE_MS, not at the presenter's pace. Otherwise every follower became
+   * a sender as soon as the presenter scrolled, and the room carried one stream per member instead
+   * of the presenter's alone.
+   */
+  private publishFollowedViewport() {
+    this.clearFollowSettle();
+    this.followSettle = setTimeout(() => {
+      this.followSettle = null;
+      this.publishPresence({ viewport: this.visibleWorld() });
+    }, FOLLOW_SETTLE_MS);
+  }
+
+  private clearFollowSettle() {
+    if (this.followSettle) clearTimeout(this.followSettle);
+    this.followSettle = null;
   }
 
   visibleWorld(): Box {
@@ -434,6 +780,7 @@ export class Editor {
 
   /** Change the style for the next shape and for the selected shapes. */
   applyStyle(patch: Partial<Style>) {
+    if (patch.color) this.colorChosen = true;
     this.style = { ...this.style, ...patch };
     const ids = this.selected().filter((s) => !s.locked).map((s) => s.id);
     if (ids.length && !this.readOnly) {
@@ -520,11 +867,18 @@ export class Editor {
 
   paste(offset = 24): boolean {
     if (!this.clipboard || this.readOnly) return false;
+    // image data the room no longer holds (its shapes were deleted since the copy) is stored again:
+    // it must fit like a new image (canvasFits), or the server would refuse the update (4413)
+    const missing = Object.entries(this.clipboard.assets).filter(([aid, url]) => url && !this.doc.assets.has(aid));
+    const adding = missing.reduce((a, [, url]) => a + url.length, 0);
+    if (adding && !this.canvasFits(adding)) return true;
     const idMap = new Map<string, string>();
     const groupMap = new Map<string, string>();
     for (const s of this.clipboard.shapes) idMap.set(s.id, newId());
     const created: string[] = [];
     this.doc.transact(() => {
+      // setAsset keeps only raster data URLs (assetValueOk); in the same transaction as the shapes
+      for (const [aid, url] of missing) this.doc.setAsset(aid, url);
       for (const s of this.clipboard!.shapes) {
         const copy: Record<string, unknown> = { ...s, id: idMap.get(s.id), index: undefined };
         if (s.groupId) {
@@ -545,8 +899,6 @@ export class Editor {
         created.push(this.doc.create(copy as unknown as Shape));
       }
     });
-    // setAsset keeps only raster data URLs (assetValueOk)
-    for (const [aid, url] of Object.entries(this.clipboard.assets)) if (url && !this.doc.assets.has(aid)) this.doc.setAsset(aid, url);
     this.doc.endGesture();
     this.select(created);
     return true;
@@ -561,6 +913,13 @@ export class Editor {
     this.activeTool = TOOLS[id](this);
     if (id !== 'select') this.hideHover();
     this.stage.dataset.tool = id;
+    // a cursor the select tool set (move, a resize arrow, a link's pointer) must not hide the new tool's
+    this.stage.dataset.cursor = '';
+    this.frame.setInteractive(id === 'interact' || this.hidden);
+    if (id !== 'laser') this.setLaserPointer(null);
+    // the others see a laser dot instead of an arrow for this cursor
+    const status = id === 'laser' ? 'cursor.laser' : null;
+    if (status !== this.publishedStatus) this.publishPresence({ status });
     this.emit('tool');
   }
 
@@ -576,6 +935,28 @@ export class Editor {
     this.laser = this.laser.filter((q) => now - q[2] < LASER_TTL);
     this.publishPresence({ laser: { pts: this.laser.slice(-60), now } });
     this.ensureLaserAnimation();
+  }
+
+  private laserHoldTimer: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * The laser is pressed (true) or released (false). While it is pressed and held still, its
+   * last point goes out again every LASER_HOLD_MS so the dot stays on for the others (a few
+   * messages per second, inside the awareness pace).
+   */
+  holdLaser(on: boolean) {
+    if (this.laserHoldTimer) clearInterval(this.laserHoldTimer);
+    this.laserHoldTimer = null;
+    if (!on) return;
+    this.laserHoldTimer = setInterval(() => {
+      const last = this.laser[this.laser.length - 1];
+      if (last && Date.now() - last[2] >= LASER_HOLD_MS) this.addLaserPoint({ x: last[0], y: last[1] });
+    }, LASER_HOLD_MS);
+  }
+
+  /** The laser dot under a finger or a pen (no mouse cursor there); null hides it. */
+  setLaserPointer(screen: Pt | null) {
+    this.overlay?.setLaserPointer(screen);
   }
 
   ensureLaserAnimation() {
@@ -734,24 +1115,55 @@ export class Editor {
       this.toast(t('image.tooLarge', { max: `${Math.round(max / 1024 / 1024)} MB` }));
       return;
     }
-    // fv8 U1: a canvas that cannot take the image says so, before the server would refuse the
-    // update by closing the connection (4413)
-    const cap = this.cfg.maxDocBytes;
-    if (wouldOverfill(roomBytes(this.doc.doc, this.doc.ledger), dataUrl.length, cap)) {
-      this.toast(t('image.canvasFull', { max: `${(cap / 1024 / 1024).toFixed(cap < 2 * 1024 * 1024 ? 2 : 1)} MB` }));
-      this.canvasFullRefusals++;
-      return;
-    }
+    this.insertImageData(dataUrl, img.naturalWidth, img.naturalHeight, at);
+  }
+
+  /**
+   * Add an image already in its stored form (a data URL the server accepts) of `naturalWidth` x
+   * `naturalHeight` px at `at`, when the canvas can take it. Returns the new shape's id, or null.
+   */
+  insertImageData(dataUrl: string, naturalWidth: number, naturalHeight: number, at?: Pt): string | null {
+    if (this.readOnly || !this.canvasFits(dataUrl.length)) return null;
     const assetId = newId('a');
-    if (!this.doc.setAsset(assetId, dataUrl)) return;
-    const scale = Math.min(1, 600 / img.naturalWidth, 600 / img.naturalHeight);
-    const w = Math.max(20, img.naturalWidth * scale);
-    const h = Math.max(20, img.naturalHeight * scale);
+    const scale = Math.min(1, 600 / naturalWidth, 600 / naturalHeight);
+    const w = Math.max(20, naturalWidth * scale);
+    const h = Math.max(20, naturalHeight * scale);
     const c = at ?? this.toWorld({ x: this.viewW / 2, y: this.viewH / 2 });
-    const id = this.doc.create({ type: 'image', assetId, x: c.x - w / 2, y: c.y - h / 2, w, h, opacity: this.style.opacity } as Partial<Shape> & { type: 'image' });
+    // the data and the shape that names it: one update, one undo step
+    let id = '';
+    this.doc.transact(() => {
+      if (!this.doc.setAsset(assetId, dataUrl)) return;
+      id = this.doc.create({ type: 'image', assetId, x: c.x - w / 2, y: c.y - h / 2, w, h, opacity: this.style.opacity } as Partial<Shape> & { type: 'image' });
+    });
+    if (!id) return null;
     this.doc.endGesture();
     this.select([id]);
     this.setTool('select');
+    return id;
+  }
+
+  /**
+   * fv8 U1: a canvas that cannot take `adding` more characters of image data says so, before the
+   * server would refuse the update by closing the connection (4413). The room is measured as the
+   * server stores it (deleted image data no longer counts, roomBytes), and image data left with no
+   * shape naming it is deleted first. Data deleted in the last FREED_GRACE_MS still counts: the
+   * server forgets it at its next save, and until then the toast asks to wait a moment.
+   */
+  canvasFits(adding: number): boolean {
+    const cap = this.cfg.maxDocBytes;
+    let room = roomBytes(this.doc.doc, this.doc.ledger);
+    if (wouldOverfill(room, adding, cap) && this.doc.collectUnreferencedAssets() > 0) room = roomBytes(this.doc.doc, this.doc.ledger);
+    if (wouldOverfill(room, adding, cap)) {
+      this.toast(t('image.canvasFull', { max: `${(cap / 1024 / 1024).toFixed(cap < 2 * 1024 * 1024 ? 2 : 1)} MB` }));
+      this.canvasFullRefusals++;
+      return false;
+    }
+    if (wouldOverfill(room + this.doc.recentlyFreedBytes(), adding, cap)) {
+      this.toast(t('image.freeing'), 6000);
+      this.canvasFullRefusals++;
+      return false;
+    }
+    return true;
   }
 
   pickImage(at?: Pt) {
@@ -767,9 +1179,10 @@ export class Editor {
 
   // ------------------------------------------------------------------ misc UI hooks
 
-  toastFn: ((msg: string) => void) | null = null;
-  toast(msg: string) {
-    this.toastFn?.(msg);
+  toastFn: ((msg: string, ms?: number) => void) | null = null;
+  /** Show `msg` for `ms` milliseconds (the UI's default when omitted). */
+  toast(msg: string, ms?: number) {
+    this.toastFn?.(msg, ms);
   }
 
   setAnnotationsVisible(v: boolean) {
@@ -837,7 +1250,8 @@ export class Editor {
         this.pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), c: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, cam: { ...this.camera } };
         return;
       }
-      if (e.button === 1 || this.spaceDown || (e.button === 0 && this.tool === 'hand')) {
+      // the interact tool: the page takes the pointer itself; around it, a drag pans
+      if (e.button === 1 || this.spaceDown || (e.button === 0 && (this.tool === 'hand' || this.tool === 'interact'))) {
         this.panning = { last: info.screen };
         st.classList.add('panning');
         e.preventDefault();
@@ -852,12 +1266,15 @@ export class Editor {
         return;
       }
       if (this.readOnly && this.tool !== 'select' && this.tool !== 'laser') return;
+      if (this.tool === 'laser' && e.pointerType !== 'mouse') this.setLaserPointer(info.screen);
       this.activeTool.down(info);
     });
     st.addEventListener('pointermove', (e) => {
       const info = this.info(e);
       if (this.activePointers.has(e.pointerId)) this.activePointers.set(e.pointerId, info.screen);
       this.pointerWorld = info.world;
+      // a finger only moves while it touches; a pen also hovers
+      if (this.tool === 'laser' && (e.pointerType === 'pen' || (e.pointerType === 'touch' && this.activePointers.has(e.pointerId)))) this.setLaserPointer(info.screen);
       if (this.annotationsVisible || this.tool === 'laser') this.publishPresence({ cursor: { x: round(info.world.x), y: round(info.world.y) } });
       if (this.pinch && this.activePointers.size >= 2) {
         const [a, b] = [...this.activePointers.values()];
@@ -882,6 +1299,7 @@ export class Editor {
     });
     const up = (e: PointerEvent) => {
       this.activePointers.delete(e.pointerId);
+      if (e.pointerType === 'touch') this.setLaserPointer(null);
       if (this.pinch) {
         if (this.activePointers.size < 2) this.pinch = null;
         return;
@@ -896,6 +1314,7 @@ export class Editor {
     st.addEventListener('pointerup', up);
     st.addEventListener('pointercancel', (e) => {
       this.activePointers.delete(e.pointerId);
+      this.setLaserPointer(null);
       this.pinch = null;
       this.panning = null;
       this.activeTool.cancel?.();
@@ -903,6 +1322,7 @@ export class Editor {
     st.addEventListener('pointerleave', () => {
       this.publishPresence({ cursor: null });
       this.hideHover();
+      this.setLaserPointer(null);
     });
     st.addEventListener(
       'wheel',
@@ -910,15 +1330,7 @@ export class Editor {
         e.preventDefault();
         const r = st.getBoundingClientRect();
         const anchor = { x: e.clientX - r.left, y: e.clientY - r.top };
-        if (e.ctrlKey || e.metaKey) {
-          const factor = Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0025) * 4);
-          this.setCamera(zoomAt(this.camera, this.camera.z * factor, anchor));
-        } else {
-          const k = e.deltaMode === 1 ? 16 : 1;
-          const dx = e.shiftKey && !e.deltaX ? e.deltaY : e.deltaX;
-          const dy = e.shiftKey && !e.deltaX ? 0 : e.deltaY;
-          this.panBy(-dx * k, -dy * k);
-        }
+        this.wheel({ dx: e.deltaX, dy: e.deltaY, mode: e.deltaMode, zoom: e.ctrlKey || e.metaKey, shift: e.shiftKey }, anchor);
       },
       { passive: false },
     );
@@ -926,6 +1338,7 @@ export class Editor {
       if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
     });
     st.addEventListener('drop', (e) => {
+      if (this.hidden) return;
       const files = Array.from(e.dataTransfer?.files ?? []).filter((f) => f.type.startsWith('image/'));
       if (!files.length) return;
       e.preventDefault();
@@ -933,7 +1346,7 @@ export class Editor {
       files.forEach((f, i) => void this.insertImageFile(f, { x: at.x + i * 24, y: at.y + i * 24 }));
     });
     window.addEventListener('paste', (e) => {
-      if (isTyping(e.target)) return;
+      if (isTyping(e.target) || this.hidden) return;
       const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith('image/'));
       if (files.length) {
         e.preventDefault();
@@ -943,12 +1356,12 @@ export class Editor {
       if (this.paste()) e.preventDefault();
     });
     window.addEventListener('copy', (e) => {
-      if (isTyping(e.target) || !this.selection.size) return;
+      if (isTyping(e.target) || !this.selection.size || this.hidden) return;
       this.copy();
       e.preventDefault();
     });
     window.addEventListener('cut', (e) => {
-      if (isTyping(e.target) || !this.selection.size) return;
+      if (isTyping(e.target) || !this.selection.size || this.hidden) return;
       this.copy();
       this.deleteSelection();
       e.preventDefault();
@@ -966,8 +1379,27 @@ export class Editor {
     });
   }
 
+  /** A wheel: ctrl/⌘ (or a trackpad pinch) zooms at `anchor` (screen px), else it pans. */
+  wheel(w: Omit<FrameWheel, 'x' | 'y'>, anchor: Pt) {
+    if (w.zoom) {
+      const factor = Math.exp(-w.dy * (w.mode === 1 ? 0.05 : 0.0025) * 4);
+      this.setCamera(zoomAt(this.camera, this.camera.z * factor, anchor));
+      return;
+    }
+    const k = w.mode === 1 ? 16 : w.mode === 2 ? this.viewH : 1;
+    const dx = w.shift && !w.dx ? w.dy : w.dx;
+    const dy = w.shift && !w.dx ? 0 : w.dy;
+    this.panBy(-dx * k, -dy * k);
+  }
+
+  /** The artifact handed over a wheel (interact tool): the same as a wheel on the canvas. */
+  private wheelFromFrame(w: FrameWheel) {
+    this.wheel(w, this.toScreen({ x: w.x, y: w.y }));
+  }
+
   private onKeyDown(e: KeyboardEvent) {
-    if (isTyping(e.target)) return;
+    // a hidden canvas takes no shortcut: the page is the plain artifact
+    if (isTyping(e.target) || this.hidden) return;
     const mod = e.metaKey || e.ctrlKey;
     const k = e.key.toLowerCase();
     if (e.code === 'Space') {
@@ -1001,9 +1433,7 @@ export class Editor {
       return;
     }
     if (e.key === 'Escape') {
-      this.activeTool.cancel?.();
-      if (this.tool !== 'select') this.setTool('select');
-      else this.clearSelection();
+      this.escape();
       return;
     }
     if (e.key === 'Enter' && this.selection.size === 1) {
@@ -1031,7 +1461,7 @@ export class Editor {
     }
     const map: Record<string, ToolId> = {
       v: 'select', h: 'hand', d: 'draw', p: 'draw', e: 'eraser', a: 'arrow', l: 'line', t: 'text', n: 'note',
-      f: 'frame', k: 'laser',
+      f: 'frame', k: 'laser', i: 'interact',
     };
     if (map[k]) {
       this.setTool(map[k]);
@@ -1049,6 +1479,15 @@ export class Editor {
   }
 }
 
+
+/**
+ * Does this page have a user gesture right now? A click inside the artifact counts: user
+ * activation reaches the ancestors of the frame clicked. A browser without the API says no.
+ */
+function userActivated(): boolean {
+  const ua = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation;
+  return !!ua?.isActive;
+}
 
 function el(tag: string, cls: string): HTMLElement {
   const e = document.createElement(tag);

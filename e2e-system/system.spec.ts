@@ -135,9 +135,15 @@ test('b. user3 (not in the ACL) is refused the canvas page and the WebSocket', a
   // logs in for real, comes back to the canvas link and gets the gate's denial
   expect(await openWithLogin(p3, priv.canvas, 'user3')).toBe(403);
   expect(await p3.evaluate(() => (window as any).__canvas ?? null)).toBeNull();
+  // ...as a page that points to the plain artifact link, where the core's request-access form is
+  await expect(p3.getByTestId('access-required')).toBeVisible();
+  expect(new URL(await p3.getByTestId('request-access').getAttribute('href') ?? '', BASE).href).toBe(priv.index);
   // the frame route is refused too (no artifact bytes through the plugin)
   expect((await p3.request.get(`${BASE}/_canvas/_/frame/artifacts/${priv.key}`)).status()).toBe(403);
-  // the WebSocket from user3's browser (session cookie attached) closes 4403
+  // the WebSocket from user3's browser (session cookie attached) closes 4403. It is opened from a
+  // page of the canvas origin that lets a script connect: the access-required page allows nothing
+  // (default-src 'none')
+  await p3.goto(`${BASE}/_canvas/healthz`);
   const code = await p3.evaluate((url) => new Promise<number>((resolve) => {
     const ws = new WebSocket(url);
     ws.onclose = (e) => resolve(e.code);
@@ -146,6 +152,12 @@ test('b. user3 (not in the ACL) is refused the canvas page and the WebSocket', a
   // and user3 never shows up in the room
   const users = await p1.evaluate(() => Object.keys((window as any).__canvas.editor.doc.users.toJSON()));
   expect(users).not.toContain(USERS.user3.email);
+  // the link leads to the core's own access-required page, with its request-access form
+  expect((await p3.goto(priv.canvas))?.status()).toBe(403);
+  const plain = p3.waitForResponse((r) => r.request().isNavigationRequest() && r.url() === priv.index);
+  await p3.getByTestId('request-access').click();
+  expect((await plain).status()).toBe(403);
+  await expect(p3.locator('form button[type="submit"]')).toHaveText('Request access');
 });
 
 test('c. anonymous draws on a pub/ canvas as "Anónimo NNNN"; anonymous is refused on u/', async ({ browser }) => {

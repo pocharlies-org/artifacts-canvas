@@ -7,6 +7,12 @@ import { buildPdf, type PdfPage } from './pdf';
 
 export type ExportScope = 'view' | 'full';
 export type ExportFormat = 'png' | 'pdf';
+/**
+ * What an export holds of the artifact page: all of it, part of it (an image or a background of
+ * the page could not be read: left blank), none of it (the page could not be captured at all:
+ * only the annotations are drawn), or nothing to capture (the region is outside the page).
+ */
+export type ArtifactCapture = 'full' | 'partial' | 'missing' | 'outside';
 
 const MAX_SIDE = 16000;
 const BG = '#e9ebef';
@@ -41,8 +47,8 @@ export async function annotationsSvg(ed: Editor, rect: Box, scale: number): Prom
   return wrapSvg(body, rect, scale, fontCss);
 }
 
-/** Render artifact + annotations of a world rectangle into a canvas. */
-export async function renderRegion(ed: Editor, rect: Box, scale: number): Promise<HTMLCanvasElement> {
+/** Render artifact + annotations of a world rectangle into a canvas, and say how much of the artifact it holds. */
+export async function renderRegion(ed: Editor, rect: Box, scale: number): Promise<{ canvas: HTMLCanvasElement; artifact: ArtifactCapture }> {
   const c = document.createElement('canvas');
   c.width = Math.max(1, Math.round(rect.w * scale));
   c.height = Math.max(1, Math.round(rect.h * scale));
@@ -52,11 +58,13 @@ export async function renderRegion(ed: Editor, rect: Box, scale: number): Promis
   // the artifact page
   const page = ed.pageBox();
   const inter = intersect(rect, page);
+  let artifact: ArtifactCapture = 'outside';
   if (inter) {
     ctx.fillStyle = '#fff';
     ctx.fillRect((inter.x - rect.x) * scale, (inter.y - rect.y) * scale, inter.w * scale, inter.h * scale);
-    const img = await ed.frame.snapshot(inter, scale);
-    if (img) ctx.drawImage(img, (inter.x - rect.x) * scale, (inter.y - rect.y) * scale, inter.w * scale, inter.h * scale);
+    const snap = await ed.frame.snapshot(inter, scale);
+    if (snap) ctx.drawImage(snap.img, (inter.x - rect.x) * scale, (inter.y - rect.y) * scale, inter.w * scale, inter.h * scale);
+    artifact = !snap ? 'missing' : snap.partial ? 'partial' : 'full';
   }
   // annotations
   const svg = await annotationsSvg(ed, rect, scale);
@@ -67,7 +75,7 @@ export async function renderRegion(ed: Editor, rect: Box, scale: number): Promis
   } finally {
     URL.revokeObjectURL(url);
   }
-  return c;
+  return { canvas: c, artifact };
 }
 
 export function exportRect(ed: Editor, scope: ExportScope): Box {
@@ -92,19 +100,19 @@ export function exportScale(rect: Box, scope: ExportScope, zoom = 1): number {
   return Math.max(0.01, Math.min(want, MAX_SIDE / rect.w, MAX_SIDE / rect.h));
 }
 
-export async function exportCanvas(ed: Editor, format: ExportFormat, scope: ExportScope): Promise<{ blob: Blob; filename: string }> {
+export async function exportCanvas(ed: Editor, format: ExportFormat, scope: ExportScope): Promise<{ blob: Blob; filename: string; artifact: ArtifactCapture }> {
   ed.renderer.flush();
   const rect = exportRect(ed, scope);
   const scale = exportScale(rect, scope, ed.camera.z);
-  const canvas = await renderRegion(ed, rect, scale);
+  const { canvas, artifact } = await renderRegion(ed, rect, scale);
   const base = fileBase(ed);
   if (format === 'png') {
     const blob = await new Promise<Blob>((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error('toBlob'))), 'image/png'));
-    return { blob, filename: `${base}.png` };
+    return { blob, filename: `${base}.png`, artifact };
   }
   const pages = await pdfPages(canvas);
   const pdf = buildPdf(pages, ed.frame.title || ed.cfg.title || ed.cfg.artifactPath);
-  return { blob: new Blob([pdf as BlobPart], { type: 'application/pdf' }), filename: `${base}.pdf` };
+  return { blob: new Blob([pdf as BlobPart], { type: 'application/pdf' }), filename: `${base}.pdf`, artifact };
 }
 
 /** Split a tall canvas into pages no taller than ~1.42x the width (A4-like). */

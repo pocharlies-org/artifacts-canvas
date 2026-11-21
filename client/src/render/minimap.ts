@@ -2,6 +2,7 @@ import type { Editor } from '../editor/editor';
 import { shapeBounds } from '../geometry/shapes';
 import { unionBoxes } from '../geometry/vec';
 import { personColor } from '../model/colors';
+import { toCss } from '../ui/theme';
 
 /** Minimap: the artifact page, the shapes (in their author's colour) and my viewport. */
 export class Minimap {
@@ -15,6 +16,8 @@ export class Minimap {
     this.canvas.setAttribute('data-testid', 'minimap');
     parent.appendChild(this.canvas);
     ed.on('camera', () => this.schedule());
+    // the page takes the artifact's background; the map follows (dark or light)
+    ed.on('theme', () => this.schedule());
     ed.on('doc', () => {
       this.docVersion++;
       this.schedule();
@@ -72,7 +75,7 @@ export class Minimap {
     const ctx = c.getContext('2d')!;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, r.width, r.height);
-    ctx.fillStyle = '#f3f4f6';
+    ctx.fillStyle = ed.dark ? '#111827' : '#f3f4f6';
     ctx.fillRect(0, 0, r.width, r.height);
     const view = ed.visibleWorld();
     // The map covers the page and the content; the viewport only extends it when it leaves that area.
@@ -83,7 +86,7 @@ export class Minimap {
     const ox = (r.width - all.w * s) / 2 - all.x * s;
     const oy = (r.height - all.h * s) / 2 - all.y * s;
     this.map = { s, ox, oy };
-    const key = `${this.docVersion}|${s.toFixed(5)}|${ox.toFixed(1)}|${oy.toFixed(1)}|${r.width}|${r.height}|${ed.annotationsVisible}`;
+    const key = `${this.docVersion}|${s.toFixed(5)}|${ox.toFixed(1)}|${oy.toFixed(1)}|${r.width}|${r.height}|${ed.annotationsVisible}|${toCss(ed.board)}`;
     if (key !== this.shapesKey || !this.shapesLayer) {
       this.shapesKey = key;
       this.shapesLayer = this.renderShapes(r.width, r.height, dpr, s, ox, oy);
@@ -112,8 +115,8 @@ export class Minimap {
     const ctx = layer.getContext('2d')!;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const pg = ed.pageBox();
-    ctx.fillStyle = '#fff';
-    ctx.strokeStyle = '#d1d5db';
+    ctx.fillStyle = toCss(ed.board);
+    ctx.strokeStyle = ed.dark ? '#4b5563' : '#d1d5db';
     ctx.lineWidth = 1;
     ctx.fillRect(ox + pg.x * s, oy + pg.y * s, pg.w * s, pg.h * s);
     ctx.strokeRect(ox + pg.x * s + 0.5, oy + pg.y * s + 0.5, pg.w * s, pg.h * s);

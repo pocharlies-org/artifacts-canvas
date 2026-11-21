@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { newRoom, open } from './helpers';
+import { newRoom, open, type Opened } from './helpers';
 
 /**
  * Every tool of the bottom toolbar must be reachable on a phone, the way a person reaches
@@ -73,8 +73,8 @@ for (const vp of PHONES) {
     await expect(page.getByTestId('toolbar-prev')).toBeHidden();
 
     const ids = await toolIds(page);
-    expect(ids).toEqual(expect.arrayContaining(["tool-select", "tool-note", "tool-more", "tool-frame", "tool-image", "tool-laser"]));
-    expect(ids.length).toBe(15);
+    expect(ids).toEqual(expect.arrayContaining(["tool-select", "tool-interact", "tool-note", "tool-more", "tool-frame", "tool-image", "tool-laser"]));
+    expect(ids.length).toBe(16);
     for (const id of ids) {
       const btn = page.locator(`[data-testid="toolbar"] [data-testid="${id}"]`);
       // Page with the chevrons until the button sits fully in the free band.
@@ -127,3 +127,101 @@ test('wide desktop shows no toolbar chevrons', async ({ browser }) => {
   await expect(D.page.getByTestId('toolbar-prev')).toBeHidden();
   await D.close();
 });
+
+/**
+ * The top bar with a full room (ui/chrome.ts topRight): a phone shows 3 avatars of the others and
+ * a "+N" chip whose label names the rest, the follow button as an icon, and the whole row fits, so
+ * "▶ Presentar" is never cut and nothing scrolls sideways. A desktop keeps its stack as it was: the
+ * first 6 people, this user included, and its own "+N" past them.
+ */
+const OTHERS = ['Ana López', 'Bea Ruiz', 'Carl Ortiz', 'Dora Gil', 'Eva Martín', 'Fran Soto'];
+
+/** The avatars a person sees (not the chips), by name. */
+const shownAvatars = (p: Page) => p.locator('[data-testid="avatars"] .av:not(.more)').filter({ visible: true })
+  .evaluateAll((els) => els.map((e) => (e as HTMLElement).dataset.user!));
+const chip = (p: Page) => p.getByTestId('avatars-more');
+/** The names in the chip's label: "Y 3 más: Dora Gil, Eva Martín, Fran Soto". */
+const chipNames = async (p: Page) => ((await chip(p).getAttribute('aria-label')) ?? '').replace(/^Y \d+ más: /, '').split(', ').sort();
+
+async function topBarFits(p: Page, vp: { width: number; height: number }) {
+  const present = (await p.getByTestId('present').boundingBox())!;
+  expect(present.x, 'Presentar starts on screen').toBeGreaterThanOrEqual(0);
+  expect(present.x + present.width, 'Presentar ends on screen').toBeLessThanOrEqual(vp.width);
+  expect(present.y).toBeGreaterThanOrEqual(0);
+  const hit = await p.evaluate(([x, y]) => !!document.elementFromPoint(x, y)?.closest('[data-testid="present"]'),
+    [present.x + present.width / 2, present.y + present.height / 2]);
+  expect(hit, 'Presentar is the element under its own centre').toBe(true);
+  const bar = await p.locator('.panel.topright').evaluate((el) => ({ sw: el.scrollWidth, cw: el.clientWidth, right: el.getBoundingClientRect().right }));
+  expect(bar.sw, 'the top bar does not scroll sideways').toBeLessThanOrEqual(bar.cw);
+  expect(bar.right).toBeLessThanOrEqual(vp.width);
+  // nothing dropped: the hide button and the count are there, and the follow icon keeps its label
+  await expect(p.getByTestId('canvas-hide')).toBeVisible();
+  await expect(p.getByTestId('audience')).toBeVisible();
+  await expect(p.getByTestId('follow')).toBeVisible();
+  await expect(p.getByTestId('follow')).toHaveAttribute('aria-label', 'Seguir a…');
+}
+
+for (const vp of [{ width: 390, height: 844 }, { width: 360, height: 800 }]) {
+  test(`the top bar at ${vp.width}x${vp.height} with six others: 3 avatars, a "+3" chip naming the rest, and Presentar whole`, async ({ browser }) => {
+    const room = newRoom('topbar');
+    // Ana on a desktop, the others with the canvas hidden (they count the same: people, not tabs)
+    const ana = await open(browser, OTHERS[0], room);
+    const rest = new Map<string, Opened>();
+    for (const n of OTHERS.slice(1)) rest.set(n, await open(browser, n, room, { query: { canvas: '0' } }));
+    const me = await open(browser, 'Gus Vidal', room, { viewport: vp });
+    const p = me.page;
+    await expect(p.getByTestId('audience')).toHaveAttribute('data-viewing', '6');
+
+    // six others: 3 avatars (not mine) and "+3", whose label names the 3 not shown
+    await expect.poll(() => shownAvatars(p)).toHaveLength(3);
+    const shown = await shownAvatars(p);
+    expect(shown).not.toContain('Gus Vidal');
+    await expect(chip(p)).toBeVisible();
+    await expect(chip(p)).toHaveText('+3');
+    await expect(p.locator('[data-testid="avatars"] .av.more').filter({ visible: true })).toHaveCount(1);
+    expect(await chipNames(p)).toEqual(OTHERS.filter((n) => !shown.includes(n)).sort());
+    await expect(chip(p)).toHaveAttribute('title', (await chip(p).getAttribute('aria-label'))!);
+    await topBarFits(p, vp);
+
+    // the desktop stack is as before: 6 of the 7 people (Ana's own first) and its "+1", no phone chip
+    await expect.poll(() => shownAvatars(ana.page)).toHaveLength(6);
+    expect((await shownAvatars(ana.page))[0]).toBe(OTHERS[0]);
+    await expect(ana.page.locator('[data-testid="avatars"] .av.more').filter({ visible: true })).toHaveText(['+1']);
+    await expect(chip(ana.page)).toBeHidden();
+    await expect(ana.page.getByTestId('follow').locator('.lbl-full')).toBeVisible(); // the label, not the icon
+    await expect(ana.page.getByTestId('follow').locator('.lbl-full')).toHaveText('Seguir a…');
+    await expect(ana.page.getByTestId('follow').locator('.lbl-short')).toBeHidden();
+
+    // the chip opens the people panel, where "Ahora aquí" lists all six
+    await chip(p).click();
+    await expect(p.locator('.panel.people')).toBeVisible();
+    await expect(p.getByTestId('here-row')).toHaveCount(6);
+    await p.evaluate(() => document.body.classList.remove('panels-open'));
+
+    // two of the hidden ones leave: "+1", naming the one left out
+    const hiddenNow = OTHERS.filter((n) => !shown.includes(n) && n !== OTHERS[0]);
+    for (const n of hiddenNow.slice(0, 2)) await rest.get(n)!.close();
+    await expect(p.getByTestId('audience')).toHaveAttribute('data-viewing', '4');
+    await expect(chip(p)).toHaveText('+1');
+    const shown4 = await shownAvatars(p);
+    expect(shown4).toHaveLength(3);
+    const left = OTHERS.filter((n) => !hiddenNow.slice(0, 2).includes(n));
+    expect(await chipNames(p)).toEqual(left.filter((n) => !shown4.includes(n)));
+    await topBarFits(p, vp);
+    // and the desktop: all 5 people, no chip at all
+    await expect.poll(() => shownAvatars(ana.page)).toHaveLength(5);
+    await expect(ana.page.locator('[data-testid="avatars"] .av.more').filter({ visible: true })).toHaveCount(0);
+
+    // one more leaves: 3 others, 3 avatars, no chip
+    const third = left.find((n) => n !== OTHERS[0] && rest.has(n) && !hiddenNow.slice(0, 2).includes(n))!;
+    await rest.get(third)!.close();
+    await expect(p.getByTestId('audience')).toHaveAttribute('data-viewing', '3');
+    await expect(chip(p)).toHaveCount(0);
+    await expect.poll(() => shownAvatars(p)).toHaveLength(3);
+    await topBarFits(p, vp);
+
+    for (const [n, o] of rest) if (n !== third && !hiddenNow.slice(0, 2).includes(n)) await o.close();
+    await ana.close();
+    await me.close();
+  });
+}

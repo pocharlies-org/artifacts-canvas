@@ -36,6 +36,53 @@ const WRAPPER_HEADERS: Record<string, string> = {
   'cache-control': 'no-store',
 };
 
+/** The access-required page: static HTML, no script, nothing loaded from anywhere. */
+const ACCESS_HEADERS: Record<string, string> = {
+  'content-type': 'text/html; charset=utf-8',
+  'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'",
+  'referrer-policy': 'no-referrer',
+  'x-content-type-options': 'nosniff',
+  'cache-control': 'no-store',
+};
+
+const ACCESS_TEXT = {
+  es: {
+    title: 'Acceso necesario',
+    body: 'No tienes acceso a este lienzo. Abre el artifact: su página te dice por qué y, cuando se puede, te deja pedir acceso a quien lo publicó.',
+    link: 'Abrir el artifact y pedir acceso',
+  },
+  en: {
+    title: 'Access required',
+    body: 'You do not have access to this canvas. Open the artifact: its page says why and, where it can, lets you request access from its owner.',
+    link: 'Open the artifact and request access',
+  },
+} as const;
+
+/**
+ * The page a visitor the artifact is not open to gets on the wrapper route (403), instead of a bare
+ * "forbidden": it points to the plain artifact link, where the core shows its access-required page
+ * with the request-access form. Every refused key gets the same page, built from the requested key
+ * only: it says nothing about whether the artifact exists (docs/protocol.md §1).
+ */
+export function accessRequiredPage(artifactLink: string, lang: 'es' | 'en'): string {
+  const t = ACCESS_TEXT[lang];
+  return (
+    `<!doctype html><html lang="${lang}"><head><meta charset="utf-8">` +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    `<title>${t.title}</title><style>` +
+    'body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;color:#1d1d1f;background:#f5f6f8}' +
+    'main{max-width:520px;margin:12vh auto;padding:32px;background:#fff;border:1px solid #e5e7eb;border-radius:12px}' +
+    'h1{margin:0 0 12px;font-size:22px}p{line-height:1.55;margin:0 0 20px}' +
+    'a{display:inline-block;padding:10px 16px;border-radius:8px;background:#1d4ed8;color:#fff;text-decoration:none;font-weight:600}' +
+    `</style></head><body><main data-testid="access-required"><h1>${t.title}</h1><p>${t.body}</p>` +
+    `<p><a href="${escapeHtml(artifactLink)}" data-testid="request-access">${t.link}</a></p></main></body></html>`
+  );
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+}
+
 const FRAME_HEADERS: Record<string, string> = {
   'content-security-policy': 'sandbox allow-scripts',
   'cache-control': 'no-store',
@@ -219,6 +266,10 @@ export class HttpApp {
         res.end();
         return;
       }
+      if (gate.status === 403) {
+        this.accessRequired(req, res, key, url.searchParams.get('lang') === 'en' ? 'en' : 'es');
+        return;
+      }
       this.generic(res, gate.status);
       return;
     }
@@ -241,6 +292,8 @@ export class HttpApp {
         maxImageBytes: anon ? cfg.anonMaxImageBytes : cfg.maxImageBytes,
         // fv8 U1: the editor says the canvas is full before the server would refuse it
         maxDocBytes: anon ? cfg.anonMaxDocBytes : cfg.maxDocBytes,
+        // "Ver original": the plain artifact on this host (the link the access-required page gives too)
+        artifactUrl: this.plainArtifactPath(key),
       });
     }
     res.statusCode = 200;
@@ -285,6 +338,24 @@ export class HttpApp {
     // is off: logging in is the way in for both.
     if (!res.allowed) return { ok: false, status: 403, login: (res.reason === 'unauthenticated' || res.reason === 'anon_disabled') && !isBearer(authorization) };
     return { ok: true, res };
+  }
+
+  /**
+   * 403 on the wrapper: the access-required page (accessRequiredPage). The link is the plain
+   * artifact URL on this host: the path of ARTIFACT_BASE_URL (the core's edge, "exactly like a
+   * browser read", by default https://<publicHost>/<bucket>) plus the key.
+   */
+  private accessRequired(req: IncomingMessage, res: ServerResponse, key: string, lang: 'es' | 'en'): void {
+    const link = this.plainArtifactPath(key);
+    res.statusCode = 403;
+    for (const [k, v] of Object.entries(ACCESS_HEADERS)) res.setHeader(k, v);
+    res.end(req.method === 'HEAD' ? undefined : accessRequiredPage(link, lang));
+  }
+
+  /** The plain artifact URL on this host, path only: the path of ARTIFACT_BASE_URL plus the key. */
+  private plainArtifactPath(key: string): string {
+    const base = new URL(this.deps.cfg.artifactBaseUrl).pathname.replace(/\/+$/, '');
+    return `${base}/${key.split('/').map(encodeURIComponent).join('/')}`;
   }
 
   private generic(res: ServerResponse, status: number): void {
