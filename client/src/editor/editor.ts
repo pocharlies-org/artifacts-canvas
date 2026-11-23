@@ -99,8 +99,6 @@ export class Editor {
   /** The artifact's background, as the board shows it (opaque), and whether it is dark. */
   board: Rgba = DEFAULT_BOARD;
   dark = false;
-  /** The user picked a colour: the default stroke colour no longer follows the board. */
-  private colorChosen = false;
   /** Local laser trail (published through awareness, never stored). */
   laser: LaserPoint[] = [];
   /** Receive time of each peer's laser state (for fading). */
@@ -504,22 +502,17 @@ export class Editor {
 
   /**
    * The board takes the artifact's background (ui/theme.ts), so the area around and beyond the
-   * page is the page's own colour. On a dark one the chrome goes dark and the default stroke
-   * colour is white, unless the user picked a colour.
+   * page is the page's own colour. On a dark one the chrome goes dark and the shapes are drawn
+   * for a dark board (render/shapeSvg.ts): `black`, the default ink, shows near-white, and the
+   * highlighter lightens the page instead of darkening it. The stored colours do not change.
    */
   private applyBackground(c: Rgba) {
     this.board = opaque(c);
     const dark = isDark(c);
     document.documentElement.style.setProperty('--board', toCss(c));
     document.body.classList.toggle('theme-dark', dark);
-    if (dark !== this.dark) {
-      this.dark = dark;
-      const color = dark ? 'white' : 'black';
-      if (!this.colorChosen && (this.style.color === 'black' || this.style.color === 'white') && this.style.color !== color) {
-        this.style = { ...this.style, color };
-        this.emit('style');
-      }
-    }
+    this.dark = dark;
+    this.renderer.setDark(dark);
     this.emit('theme');
   }
 
@@ -780,7 +773,6 @@ export class Editor {
 
   /** Change the style for the next shape and for the selected shapes. */
   applyStyle(patch: Partial<Style>) {
-    if (patch.color) this.colorChosen = true;
     this.style = { ...this.style, ...patch };
     const ids = this.selected().filter((s) => !s.locked).map((s) => s.id);
     if (ids.length && !this.readOnly) {

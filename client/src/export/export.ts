@@ -1,7 +1,10 @@
 import type { Editor } from '../editor/editor';
 import { shapeBounds } from '../geometry/shapes';
 import { type Box, boxesOverlap } from '../geometry/vec';
+import { highlightBlend } from '../model/colors';
+import { layerOf } from '../model/doc';
 import { defsMarkup, shapeElement } from '../render/shapeSvg';
+import { toCss } from '../ui/theme';
 import { HAND_FAMILY, exportFontCss } from '../render/fonts';
 import { buildPdf, type PdfPage } from './pdf';
 
@@ -17,8 +20,11 @@ export type ArtifactCapture = 'full' | 'partial' | 'missing' | 'outside';
 const MAX_SIDE = 16000;
 const BG = '#e9ebef';
 
-/** Markup of the annotations inside `rect` (world units). */
-export function annotationsBody(ed: Editor, rect: Box): string {
+/**
+ * Markup of the annotations inside `rect` (world units), in paint order; `layer` keeps only the
+ * shapes of one layer (model/doc.ts layerOf: frames, highlighter strokes, everything else).
+ */
+export function annotationsBody(ed: Editor, rect: Box, layer?: number): string {
   const env = ed.renderer.env;
   const safe = <T>(f: () => T, fallback: T): T => {
     try {
@@ -27,7 +33,9 @@ export function annotationsBody(ed: Editor, rect: Box): string {
       return fallback; // one bad shape never breaks the export
     }
   };
-  const shapes = ed.annotationsVisible ? ed.visibleShapes().filter((s) => safe(() => boxesOverlap(shapeBounds(s, env), rect), false)) : [];
+  const shapes = ed.annotationsVisible
+    ? ed.visibleShapes().filter((s) => (layer === undefined || layerOf(s) === layer) && safe(() => boxesOverlap(shapeBounds(s, env), rect), false))
+    : [];
   return shapes.map((s) => safe(() => shapeElement(s, env), '')).join('');
 }
 
@@ -35,16 +43,30 @@ export function annotationsBody(ed: Editor, rect: Box): string {
  * Standalone SVG of `body` for the world rectangle `rect`, sized rect * scale. `fontCss` holds
  * the embedded @font-face rules: an SVG drawn through an <img> cannot load external fonts.
  */
-export function wrapSvg(body: string, rect: Box, scale: number, fontCss = ''): string {
+export function wrapSvg(body: string, rect: Box, scale: number, fontCss = '', dark = false): string {
   const style = fontCss ? `<style>${fontCss}</style>` : '';
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.round(rect.w * scale)}" height="${Math.round(rect.h * scale)}" viewBox="${rect.x} ${rect.y} ${rect.w} ${rect.h}"><defs>${style}${defsMarkup()}</defs>${body}</svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.round(rect.w * scale)}" height="${Math.round(rect.h * scale)}" viewBox="${rect.x} ${rect.y} ${rect.w} ${rect.h}"><defs>${style}${defsMarkup(dark)}</defs>${body}</svg>`;
 }
 
-/** SVG of the annotations inside `rect`, with the bundled hand font embedded when it is used. */
-export async function annotationsSvg(ed: Editor, rect: Box, scale: number): Promise<string> {
-  const body = annotationsBody(ed, rect);
+/** SVG of the annotations inside `rect` (one layer of them with `layer`), with the bundled hand font embedded when it is used. */
+export async function annotationsSvg(ed: Editor, rect: Box, scale: number, layer?: number): Promise<string> {
+  const body = annotationsBody(ed, rect, layer);
   const fontCss = body.includes(HAND_FAMILY) ? await exportFontCss() : '';
-  return wrapSvg(body, rect, scale, fontCss);
+  return wrapSvg(body, rect, scale, fontCss, !!ed.renderer.env.dark);
+}
+
+/**
+ * How each layer goes onto the export canvas. An SVG drawn as an image is blended on its own, so
+ * a highlighter's mix-blend-mode never reaches the artifact under it: the highlighter layer is
+ * drawn as its own image with the same blend as on the screen (multiply on a light board, screen
+ * on a dark one), between the frames and the other shapes, as the screen paints them.
+ */
+export function exportLayers(dark: boolean): { layer: number; op: GlobalCompositeOperation }[] {
+  return [
+    { layer: 0, op: 'source-over' },
+    { layer: 1, op: highlightBlend(dark) },
+    { layer: 2, op: 'source-over' },
+  ];
 }
 
 /** Render artifact + annotations of a world rectangle into a canvas, and say how much of the artifact it holds. */
@@ -60,20 +82,30 @@ export async function renderRegion(ed: Editor, rect: Box, scale: number): Promis
   const inter = intersect(rect, page);
   let artifact: ArtifactCapture = 'outside';
   if (inter) {
-    ctx.fillStyle = '#fff';
+    // the page's own background (the board, ui/theme.ts) under the snapshot: a background set on
+    // <html> is not in the snapshot, and a dark page must stay dark for the annotations over it
+    ctx.fillStyle = toCss(ed.board);
     ctx.fillRect((inter.x - rect.x) * scale, (inter.y - rect.y) * scale, inter.w * scale, inter.h * scale);
     const snap = await ed.frame.snapshot(inter, scale);
     if (snap) ctx.drawImage(snap.img, (inter.x - rect.x) * scale, (inter.y - rect.y) * scale, inter.w * scale, inter.h * scale);
     artifact = !snap ? 'missing' : snap.partial ? 'partial' : 'full';
   }
-  // annotations
-  const svg = await annotationsSvg(ed, rect, scale);
-  const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
-  try {
-    const img = await loadImage(url);
-    ctx.drawImage(img, 0, 0, c.width, c.height);
-  } finally {
-    URL.revokeObjectURL(url);
+  // annotations, layer by layer
+  const dark = !!ed.renderer.env.dark;
+  for (const { layer, op } of exportLayers(dark)) {
+    const body = annotationsBody(ed, rect, layer);
+    if (!body) continue;
+    const fontCss = body.includes(HAND_FAMILY) ? await exportFontCss() : '';
+    const svg = wrapSvg(body, rect, scale, fontCss, dark);
+    const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+    try {
+      const img = await loadImage(url);
+      ctx.globalCompositeOperation = op;
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+    } finally {
+      ctx.globalCompositeOperation = 'source-over';
+      URL.revokeObjectURL(url);
+    }
   }
   return { canvas: c, artifact };
 }

@@ -1,5 +1,5 @@
 import { getStroke } from 'perfect-freehand';
-import { COLORS, colorName, noteFill, own, rgba, strokeColor, tint } from '../model/colors';
+import { COLORS, colorName, highlightInk, noteFill, own, rgba, strokeColor, tint } from '../model/colors';
 import type { ColorName, DrawShape, LineShape, Shape, Style } from '../model/types';
 import { geoExtras, geoOutline } from '../geometry/geo';
 import {
@@ -12,6 +12,8 @@ import { assetValueOk } from '@pocharlies/artifacts-canvas-shared/model';
 
 export interface RenderEnv extends GeomCtx {
   asset(id: string): string | undefined;
+  /** The board is dark (ui/theme.ts): `black` is drawn near-white and highlighters screen. */
+  dark?: boolean;
 }
 
 const n = (v: number) => (Math.round(v * 100) / 100).toString();
@@ -86,8 +88,8 @@ export function dashArray(style: Style, sw: number): string {
   return '';
 }
 
-export function fillFor(style: Style): string {
-  const c = own(COLORS, style.color, COLORS.black);
+export function fillFor(style: Style, dark = false): string {
+  const c = strokeColor(style.color, dark);
   switch (style.fill) {
     case 'semi':
       return style.color === 'white' ? 'rgba(255,255,255,0.6)' : rgba(c, 0.1);
@@ -100,10 +102,11 @@ export function fillFor(style: Style): string {
   }
 }
 
-/** <defs> needed by shape markup: one hatch pattern per colour and the note shadow. */
-export function defsMarkup(): string {
+/** <defs> needed by shape markup: one hatch pattern per colour (as the board shows it) and the note shadow. */
+export function defsMarkup(dark = false): string {
   let d = '';
-  for (const [name, hex] of Object.entries(COLORS) as [ColorName, string][]) {
+  for (const name of Object.keys(COLORS) as ColorName[]) {
+    const hex = strokeColor(name, dark);
     d += `<pattern id="hatch-${name}" patternUnits="userSpaceOnUse" width="8" height="8" patternTransform="rotate(45)">` +
       `<rect width="8" height="8" fill="${rgba(hex, 0.06)}"/><line x1="0" y1="0" x2="0" y2="8" stroke="${hex}" stroke-width="2" stroke-opacity="0.55"/></pattern>`;
   }
@@ -111,8 +114,8 @@ export function defsMarkup(): string {
   return d;
 }
 
-function strokeLine(pts: Pt[], closed: boolean, s: Shape, sw: number, fill = 'none'): string {
-  const color = strokeColor(s.color);
+function strokeLine(pts: Pt[], closed: boolean, s: Shape, sw: number, dark: boolean, fill = 'none'): string {
+  const color = strokeColor(s.color, dark);
   if (s.dash === 'draw') {
     const [p1, p2] = sketchPaths(pts, closed, s.id, sw);
     const fillPart = fill !== 'none' ? `<path d="${polyPath(pts, closed)}" fill="${fill}" stroke="none"/>` : '';
@@ -146,13 +149,14 @@ function arrowHead(tip: Pt, from: Pt, size: number, color: string): string {
   return `<path d="M${n(left.x)} ${n(left.y)}L${n(tip.x)} ${n(tip.y)}L${n(right.x)} ${n(right.y)}Z" fill="${color}" stroke="${color}" stroke-width="1" stroke-linejoin="round"/>`;
 }
 
-function lineMarkup(s: LineShape, ctx: GeomCtx): string {
-  const g = lineGeometry(s, ctx);
+function lineMarkup(s: LineShape, env: RenderEnv): string {
+  const g = lineGeometry(s, env);
   const sw = own(STROKE_WIDTH, s.size, 3.5);
-  const color = strokeColor(s.color);
+  const dark = !!env.dark;
+  const color = strokeColor(s.color, dark);
   let out = '';
   // wide transparent stroke: easier hovering, invisible in export
-  out += strokeLine(g.pts, false, s, sw);
+  out += strokeLine(g.pts, false, s, sw, dark);
   if (s.type === 'arrow') {
     const head = Math.max(10, sw * 3.2);
     const nearB = s.bend ? g.pts[g.pts.length - 2] : g.a;
@@ -164,19 +168,24 @@ function lineMarkup(s: LineShape, ctx: GeomCtx): string {
   return out;
 }
 
-function drawMarkup(s: DrawShape): string {
+function drawMarkup(s: DrawShape, dark: boolean): string {
   const pts = drawLocalPoints(s);
   const raw: number[][] = [];
   const pr = s.points;
   for (let i = 0, k = 0; k < pts.length; i += 3, k++) raw.push([pts[k].x, pts[k].y, pr[i + 2] ?? 0.5]);
   const size = freehandSize(s);
-  const color = strokeColor(s.color);
-  if (raw.length === 1) {
-    return `<circle cx="${n(raw[0][0])}" cy="${n(raw[0][1])}" r="${n(size / 2)}" fill="${s.highlight ? rgba(color, 0.4) : color}"/>`;
-  }
   if (s.highlight) {
-    const d = polyPath(pts, false);
-    return `<path d="${d}" fill="none" stroke="${color}" stroke-opacity="0.38" stroke-width="${n(size)}" stroke-linecap="round" stroke-linejoin="round" style="mix-blend-mode:multiply"/>`;
+    // multiply on a light board, screen on a dark one (model/colors.ts highlightInk)
+    const ink = highlightInk(s.color, dark);
+    const blend = ` style="mix-blend-mode:${ink.blend}"`;
+    if (raw.length === 1) {
+      return `<circle cx="${n(raw[0][0])}" cy="${n(raw[0][1])}" r="${n(size / 2)}" fill="${ink.color}" fill-opacity="${n(ink.opacity)}"${blend}/>`;
+    }
+    return `<path d="${polyPath(pts, false)}" fill="none" stroke="${ink.color}" stroke-opacity="${n(ink.opacity)}" stroke-width="${n(size)}" stroke-linecap="round" stroke-linejoin="round"${blend}/>`;
+  }
+  const color = strokeColor(s.color, dark);
+  if (raw.length === 1) {
+    return `<circle cx="${n(raw[0][0])}" cy="${n(raw[0][1])}" r="${n(size / 2)}" fill="${color}"/>`;
   }
   const outline = getStroke(raw, {
     size,
@@ -195,24 +204,34 @@ function drawMarkup(s: DrawShape): string {
   return `<path d="${path}" fill="${color}" stroke="none"/>`;
 }
 
+/**
+ * Label of a geo shape: its own colour, except on a white shape, where it is dark ink on a white
+ * (solid or semi) fill and, with no such fill, the board's ink (white on a dark board).
+ */
+function labelColor(s: Style, dark: boolean): string {
+  if (s.color !== 'white') return strokeColor(s.color, dark);
+  return dark && s.fill !== 'solid' && s.fill !== 'semi' ? COLORS.white : COLORS.black;
+}
+
 /** Inner SVG markup of one shape, in its local coordinates (see shapeTransform). */
 export function shapeMarkup(s: Shape, env: RenderEnv): string {
   const sw = own(STROKE_WIDTH, s.size, 3.5);
+  const dark = !!env.dark;
   switch (s.type) {
     case 'draw':
-      return drawMarkup(s);
+      return drawMarkup(s, dark);
     case 'line':
     case 'arrow':
       return lineMarkup(s, env);
     case 'geo': {
       const poly = geoOutline(s.geo, s.w, s.h);
-      let out = strokeLine(poly, true, s, sw, fillFor(s));
-      for (const extra of geoExtras(s.geo, s.w, s.h)) out += strokeLine(extra, false, s, sw);
+      let out = strokeLine(poly, true, s, sw, dark, fillFor(s, dark));
+      for (const extra of geoExtras(s.geo, s.w, s.h)) out += strokeLine(extra, false, s, sw, dark);
       if (s.text) {
         const size = own(LABEL_FONT_SIZE, s.size, 18);
         const lay = layoutText(s.text, s.font, size, Math.max(20, s.w - 16));
         const y = s.h / 2 - lay.height / 2;
-        out += textBlock(s.text, s, s.w / 2, y, Math.max(20, s.w - 16), size, 'middle', strokeColor(s.color === 'white' ? 'black' : s.color)).svg;
+        out += textBlock(s.text, s, s.w / 2, y, Math.max(20, s.w - 16), size, 'middle', labelColor(s, dark)).svg;
       }
       return out;
     }
@@ -224,7 +243,7 @@ export function shapeMarkup(s: Shape, env: RenderEnv): string {
     }
     case 'text': {
       const size = own(FONT_SIZE, s.size, 24);
-      return textBlock(s.text, s, 0, 0, s.fixedWidth ? s.w : 100000, size, 'start', strokeColor(s.color)).svg;
+      return textBlock(s.text, s, 0, 0, s.fixedWidth ? s.w : 100000, size, 'start', strokeColor(s.color, dark)).svg;
     }
     case 'frame': {
       const lb = localBox(s);

@@ -232,7 +232,9 @@
         pixelRatio: scale,
         skipFonts: true,
         cacheBust: false,
-        backgroundColor: '#ffffff',
+        // the page's own background: html-to-image paints this over the root, so a fixed white
+        // turned a dark page white in the export (and hid what was drawn light on it)
+        backgroundColor: effectiveBg(),
         imagePlaceholder: PLACEHOLDER,
         onImageErrorHandler: onImageError,
         filter: function (node) { return !(node.tagName === 'SCRIPT'); },

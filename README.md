@@ -31,7 +31,8 @@ Miro-style, and the canvas keeps who drew what. It is the first plugin of
   `_plugins/canvas/`, saved debounced and flushed on last leave. Canvas data never outlives the artifact (expiry + orphan sweep).
 - **Export** to PNG and PDF, current view or the whole artifact.
 - **Looks like the page**: the board takes the artifact's background, a theme toggle in the page included; on a dark
-  page the chrome goes dark and the default stroke is white. A first visit opens the canvas **hidden**: the artifact
+  page the chrome goes dark, black ink (the default) is drawn near-white and the highlighter is a bright fluorescent
+  band over the page. A first visit opens the canvas **hidden**: the artifact
   as the original page (its own scrolling, links and buttons), with a small "✏️ Canvas · 3" pill that counts the
   annotations, says who else is viewing and annotating ("👁 5 viendo · 2 anotando") and opens the canvas, and a
   "Ver original" link. The choice of the "Mostrar canvas" / "Ocultar canvas" toggle is remembered per user;

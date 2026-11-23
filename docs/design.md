@@ -53,7 +53,7 @@ Check every licence before you add the dependency.
 | Hand / pan | H | Space-drag pans from any tool |
 | Interact | I | The artifact takes the pointer: its links, buttons and inner scrolling work; nothing is drawn |
 | Freehand pen | D | Pressure-like smoothing (perfect-freehand style) |
-| Highlighter | ⇧D | Translucent marker under the other strokes |
+| Highlighter | ⇧D | Translucent marker under the other strokes; it darkens a light page (multiply) and lightens a dark one (screen, fluorescent) |
 | Eraser | E | Erases whole shapes it touches |
 | Arrow | A | Binds to shapes; when a shape moves, its arrow follows |
 | Line | L | |
@@ -86,7 +86,8 @@ arrowheads, opacity, bring to front / send to back, group / ungroup, lock / unlo
   `?present=1` on a canvas link opens it in presentation mode.
 - **The canvas can step aside.** A first visit opens it hidden: the artifact looks like the original page (its
   background, its scrolling, its links), with a small pill that counts the annotations and opens the canvas. The
-  board always takes the artifact's background; a dark page gets dark chrome and a light default stroke.
+  board always takes the artifact's background; a dark page gets dark chrome, black ink drawn near-white and a
+  highlighter that lights up the page instead of darkening it.
 - **Seguir a <persona>.** I follow one participant's viewport until I pan or zoom myself.
 - Two people who edit the same shape at the same moment converge to the same result without losing either stroke.
   This is the reason for a CRDT.
