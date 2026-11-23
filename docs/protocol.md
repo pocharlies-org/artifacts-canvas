@@ -192,7 +192,12 @@ times a second, and posts only a change. The wrapper takes only `rgb()`, `rgba()
 colours of at most 64 characters (`client/src/ui/theme.ts`), composites a translucent one over
 white, and writes the result as `rgb(r, g, b)` from the numbers: nothing the artifact wrote
 reaches a style. Under a relative luminance of 0.4 the chrome goes dark (`body.theme-dark`) and
-the default stroke colour is white instead of black, unless the user picked a colour.
+the shapes are drawn for a dark board (`client/src/model/colors.ts`), without changing what is
+stored: `black`, the default ink, is drawn near-white (`#f1f3f5`, the swatch too), and a
+highlighter stroke screens in a fluorescent ink at 0.7 opacity instead of multiplying at 0.38, so
+it lightens the page under it. Multiply on a dark page darkens it almost to black and the stroke
+looks behind the text. The export paints the highlighter layer with the same blend and the page's
+own background under the snapshot.
 
 **postMessage.** Only the following, validated on both sides (`event.source` is checked, and
 the wrapper also requires the opaque origin `"null"` of the sandboxed frame; payloads are

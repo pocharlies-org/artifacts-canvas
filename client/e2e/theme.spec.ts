@@ -29,7 +29,7 @@ const frameBg = (p: Page) => p.frameLocator('iframe.artifact-frame').locator('ht
   return c === 'rgba(0, 0, 0, 0)' ? getComputedStyle(document.body).backgroundColor : c;
 });
 
-test('a dark artifact: the board takes its background, the chrome goes dark, the default stroke is white', async ({ browser }) => {
+test('a dark artifact: the board takes its background, the chrome goes dark, the default black ink is drawn near-white', async ({ browser }) => {
   const A = await open(browser, 'Ana', newRoom('theme-dark'), { artifact: 'dark.html' });
   await expect.poll(async () => (await look(A.page)).dark).toBe(true);
   const l = await look(A.page);
@@ -38,11 +38,12 @@ test('a dark artifact: the board takes its background, the chrome goes dark, the
   expect(l.darkClass).toBe(true);
   // dark panels: toolbar, top bar, the "who drew" / history box
   for (const k of ['toolbar', 'topleft', 'authors'] as const) expect(l[k], k).toBe('rgb(31, 41, 55)');
-  // the default stroke is visible on it
-  expect(l.style).toBe('white');
+  // the default ink stays black and is drawn near-white on it (e2e/board-ink.spec.ts)
+  expect(l.style).toBe('black');
   await A.page.keyboard.press('d');
   await drawStroke(A.page, [[500, 420], [560, 440], [620, 430], [680, 450]]);
-  await expect.poll(async () => (await shapes(A.page)).map((s) => s.color)).toEqual(['white']);
+  await expect.poll(async () => (await shapes(A.page)).map((s) => s.color)).toEqual(['black']);
+  await expect(A.page.locator('svg.shapes [data-shape-type="draw"] path')).toHaveAttribute('fill', '#f1f3f5');
   // the laser dot stays the laser colour
   await A.page.keyboard.press('k');
   await A.page.mouse.move(600, 500);
@@ -65,7 +66,7 @@ test('a light artifact: a white board, light chrome, black default stroke, as be
   await A.close();
 });
 
-test("the artifact's theme toggle changes the board live; a colour the user picked stays", async ({ browser }) => {
+test("the artifact's theme toggle changes the board live; the colour in use never changes with it", async ({ browser }) => {
   const A = await open(browser, 'Ana', newRoom('theme-toggle'), { artifact: 'dark.html' });
   await expect.poll(async () => (await look(A.page)).dark).toBe(true);
   // the artifact's own "Theme" button, with the interact tool
@@ -75,7 +76,7 @@ test("the artifact's theme toggle changes the board live; a colour the user pick
   expect(await look(A.page)).toMatchObject({ darkClass: false, dark: false, style: 'black', toolbar: 'rgb(255, 255, 255)' });
   await A.page.frameLocator('iframe.artifact-frame').locator('#theme').click();
   await expect.poll(async () => (await look(A.page)).stage).toBe('rgb(11, 11, 15)');
-  expect(await look(A.page)).toMatchObject({ darkClass: true, style: 'white' });
+  expect(await look(A.page)).toMatchObject({ darkClass: true, style: 'black' });
   // a colour picked by hand is kept across theme changes
   await A.page.locator('[data-testid="swatches"] [data-color="red"]').click();
   await A.page.frameLocator('iframe.artifact-frame').locator('#theme').click();

@@ -1,6 +1,6 @@
 import type { Editor } from '../editor/editor';
 import { t, type MessageKey } from '../i18n';
-import { COLORS, COLOR_ORDER } from '../model/colors';
+import { COLOR_ORDER, strokeColor } from '../model/colors';
 import { describeHistory, displayUser, formatTime, initials, shortName } from '../model/people';
 import { GEO_KINDS, type Arrowheads, type Dash, type Fill, type Font, type GeoKind, type Size } from '../model/types';
 import { people, peers } from '../collab/presence';
@@ -321,10 +321,14 @@ function seg<T extends string>(name: string, values: T[], label: (v: T) => strin
 function stylePanel(ed: Editor): HTMLElement {
   const swatches = h('div', { class: 'swatches', 'data-testid': 'swatches' });
   const sw = COLOR_ORDER.map((c) => {
-    const b = h('button', { class: 'sw', style: `background:${COLORS[c]}${c === 'white' ? ';border:1px solid #ccc' : ''}`, title: c, 'data-color': c, onclick: () => ed.applyStyle({ color: c }) });
+    const b = h('button', { class: 'sw', style: `background:${strokeColor(c)}${c === 'white' ? ';border:1px solid #ccc' : ''}`, title: c, 'data-color': c, onclick: () => ed.applyStyle({ color: c }) });
     swatches.append(b);
     return b;
   });
+  // each swatch shows its colour as the board draws it: `black` is near-white on a dark board
+  const paint = () => sw.forEach((b, i) => (b.style.background = strokeColor(COLOR_ORDER[i], ed.dark)));
+  ed.on('theme', paint);
+  paint();
   const fill = seg<Fill>('fill', ['none', 'semi', 'solid', 'pattern'], (v) => t(`style.fill.${v}`), () => ed.style.fill, (v) => ed.applyStyle({ fill: v }));
   const dash = seg<Dash>('dash', ['solid', 'dashed', 'dotted', 'draw'], (v) => t(`style.dash.${v}`), () => ed.style.dash, (v) => ed.applyStyle({ dash: v }));
   const size = seg<Size>('size', ['s', 'm', 'l', 'xl'], (v) => v.toUpperCase(), () => ed.style.size, (v) => ed.applyStyle({ size: v }));

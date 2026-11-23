@@ -15,6 +15,7 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
  */
 export class Renderer {
   readonly svg: SVGSVGElement;
+  private defs: SVGDefsElement;
   private shapesLayer: SVGGElement;
   private tagsLayer: SVGGElement;
   private els = new Map<string, SVGGElement>();
@@ -41,9 +42,9 @@ export class Renderer {
     this.svg.setAttribute('overflow', 'visible');
     this.svg.setAttribute('width', '1');
     this.svg.setAttribute('height', '1');
-    const defs = document.createElementNS(SVG_NS, 'defs');
-    defs.innerHTML = defsMarkup();
-    this.svg.appendChild(defs);
+    this.defs = document.createElementNS(SVG_NS, 'defs');
+    this.defs.innerHTML = defsMarkup();
+    this.svg.appendChild(this.defs);
     this.shapesLayer = document.createElementNS(SVG_NS, 'g');
     this.shapesLayer.setAttribute('class', 'shapes-layer');
     this.tagsLayer = document.createElementNS(SVG_NS, 'g');
@@ -53,6 +54,7 @@ export class Renderer {
     this.env = {
       get: (id) => doc.get(id),
       asset: (id) => doc.assets.get(id),
+      dark: false,
     };
     doc.onChange((c) => {
       for (const id of c.shapes) this.invalidate(id);
@@ -199,6 +201,17 @@ export class Renderer {
       }
       prev = el;
     }
+  }
+
+  /**
+   * The board turned dark or light (the artifact's background, ui/theme.ts): every shape is drawn
+   * again, `black` near-white on a dark board and highlighters screening instead of multiplying.
+   */
+  setDark(dark: boolean) {
+    if (!!this.env.dark === dark) return;
+    this.env.dark = dark;
+    this.defs.innerHTML = defsMarkup(dark);
+    this.invalidateAll();
   }
 
   setVisible(v: boolean) {
