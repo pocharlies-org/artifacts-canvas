@@ -58,7 +58,7 @@ Each fixed entry names its regression tests.
   core's design, not a canvas defect).** A `u/` or `g/` page that loads a file next to it
   (`<img src="chart.png">`, a stylesheet, a script, a `url(...)` in CSS) shows it broken, on the plain
   artifact link and in the canvas alike. The core serves artifacts with
-  `Content-Security-Policy: sandbox allow-scripts` and the canvas frame is `sandbox="allow-scripts"`:
+  `Content-Security-Policy: sandbox allow-scripts allow-downloads` and the canvas frame is `sandbox="allow-scripts"`:
   either gives the page an opaque origin, the browser treats its subresource requests as cross-site
   and does not send the login session cookie (`SameSite=Lax`), and the request reaches the core (plain
   link) or the canvas frame route as anonymous and is refused. In the canvas frame even a `pub/`
@@ -110,6 +110,8 @@ Each fixed entry names its regression tests.
   navigation"). Tests: `client/e2e/viewport-units.spec.ts` (arrow key in presentation mode, a
   follower in a smaller window). Left: WebKit keeps such a scroll inside the cross-origin frame, so
   there the deck's own arrows move nothing (its slide links still work, as anchors).
+- [ ] **L-9 — Script-built `blob:` and `data:` downloads stay blocked in the canvas; on the plain artifact page they work (Medium; a product decision).** A button that builds a file in the artifact's script and downloads it through a `blob:` or `data:` link is refused in the canvas: the reporter stops the click and the wrapper blocks the scheme. The plain artifact page allows downloads, so the same button saves the file there. The frame keeps `sandbox allow-scripts` only; a fix in the canvas needs a hand-off from the frame that checks the viewer's gesture, and is a separate change.
+- [ ] **L-10 — A download link redirected to a sign-in page on the same host saves that page as a file (Low).** The browser follows the redirect like any download and saves the HTML under the page's name (for example `login.html`), where the link named a zip. A redirect to another host navigates the tab to that page, as a plain link does. Seen in a probe with a local server; the gate's own sign-in redirect is not yet checked in a browser.
 
 ## Review of the fv9 branch (security and QA)
 
