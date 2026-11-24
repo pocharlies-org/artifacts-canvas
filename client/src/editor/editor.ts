@@ -43,6 +43,8 @@ export const FOLLOW_SETTLE_MS = 500;
 const PRESENT_MAX_ZOOM = 2;
 /** Presentation mode: screen px above the page top, under the "Presentando" badge. */
 const PRESENT_TOP = 48;
+/** A scroll of the stage (a page's scrollIntoView) is taken as a camera move once it has been still this long. */
+const STAGE_SCROLL_SETTLE_MS = 200;
 
 /** The presenter seen by this tab: who, and whether it is this person in another tab or device. */
 export interface PresenterInfo {
@@ -112,6 +114,7 @@ export class Editor {
   private laserAnim = 0;
   private stamperDetach: (() => void) | null = null;
   private initialCameraSet = false;
+  private stageScrollTimer = 0;
 
   constructor(cfg: CanvasConfig, root: HTMLElement, ydoc: Y.Doc, conn: Connection | null, ledger?: Y.Doc) {
     this.cfg = cfg;
@@ -123,6 +126,11 @@ export class Editor {
 
     this.stage = el('div', 'stage');
     this.stage.setAttribute('data-testid', 'stage');
+    // A page in the frame can scroll the canvas itself: scrollIntoView() also scrolls the frame's
+    // ancestors, and the stage is a scroll container (overflow hidden). A deck's own navigation
+    // (arrow keys, its slide links) did that: the picture moved under the camera, so the
+    // presenter saw one part and the followers another, and a stroke landed off the pointer.
+    this.stage.addEventListener('scroll', () => this.onStageScroll());
     this.world = el('div', 'world');
     this.page = el('div', 'page');
     this.page.style.width = `${this.pageWidth}px`;
@@ -712,6 +720,25 @@ export class Editor {
   /** Centre the camera on a world point (minimap, artifact anchor links). */
   panTo(p: Pt) {
     this.setCamera({ z: this.camera.z, tx: this.viewW / 2 - p.x * this.camera.z, ty: this.viewH / 2 - p.y * this.camera.z });
+  }
+
+  /**
+   * The stage was scrolled (a page's scrollIntoView reached it). Once the scroll stops (a smooth
+   * one takes several frames), it becomes a camera move: the same picture, the stage back at 0,
+   * and the viewport published as any pan of this tab is, so followers follow. A tab that follows
+   * someone, or shows the page as itself (canvas hidden), only puts the stage back.
+   */
+  private onStageScroll() {
+    clearTimeout(this.stageScrollTimer);
+    this.stageScrollTimer = window.setTimeout(() => {
+      const dx = this.stage.scrollLeft;
+      const dy = this.stage.scrollTop;
+      if (!dx && !dy) return;
+      this.stage.scrollLeft = 0;
+      this.stage.scrollTop = 0;
+      if (this.hidden || this.followingUserId) return;
+      this.panBy(-dx, -dy);
+    }, STAGE_SCROLL_SETTLE_MS);
   }
 
   panBy(dx: number, dy: number, source: 'user' | 'system' = 'user') {

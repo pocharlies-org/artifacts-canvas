@@ -102,6 +102,13 @@ Each fixed entry names its regression tests.
   had no page. Now the reporter takes `ancestorOrigins[0]` only when it is an http(s) origin, else
   `*`, as in a browser without it (the messages carry nothing secret, protocol §3). Tests:
   `client/e2e/viewport-units.spec.ts` runs in Firefox (the frame's title and size reach the wrapper).
+- [x] **L-8 — A deck's arrow keys scrolled the canvas under the camera (Medium).** A deck moves
+  between its screens with `scrollIntoView()`. The frame cannot scroll in canvas mode, so the browser
+  scrolled the wrapper's stage (a scroll container) instead: the picture moved while the camera did
+  not, the followers kept the old view, and a stroke landed off the pointer. Now the stage's scroll
+  becomes a camera move once it stops, and the stage goes back to 0 (protocol §3 "The page's own
+  navigation"). Tests: `client/e2e/viewport-units.spec.ts` (arrow key in presentation mode, a
+  follower in a smaller window).
 
 ## Review of the fv9 branch (security and QA)
 

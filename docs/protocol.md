@@ -181,6 +181,12 @@ own scripts, changes them in canvas mode only:
   reports, and every target is observed again so the page gets the real state at once. An
   observer with an explicit root (an element, or the document) measures inside the page: the
   constructor returns the browser's own observer for it.
+- **The page's own navigation.** A deck moves between its screens with `scrollIntoView()` (arrow
+  keys, its slide links). The frame cannot scroll in canvas mode, so the browser scrolls the
+  frame's ancestors instead: the wrapper's stage, a scroll container. The wrapper turns that into
+  a camera move once the scroll has stopped (200 ms): the stage goes back to 0 and the camera
+  shows what the page scrolled to, so the presenter's viewport, and the followers with it, follow
+  the deck. A tab that follows someone, or shows the page as itself, only puts the stage back.
 
 **Links.** The sandbox stays as it is: no `allow-same-origin`, no `allow-top-navigation`, no
 `allow-popups`. The frame cannot navigate the wrapper or open a window by itself; the wrapper

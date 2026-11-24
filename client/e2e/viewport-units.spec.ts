@@ -144,6 +144,44 @@ test('presentation mode shows the sections, and a follower in a smaller window g
   await B.close();
 });
 
+test("a deck's own navigation (arrow keys, scrollIntoView) moves the camera, not the canvas under it, and the followers follow", async ({ browser }) => {
+  const room = newRoom('deck-nav');
+  const A = await open(browser, 'Ana', room, { artifact: 'scroll-deck.html' });
+  const B = await open(browser, 'Marta', room, { artifact: 'scroll-deck.html', viewport: { width: 1024, height: 640 } });
+  await A.page.getByTestId('present').click();
+  await expect(B.page.getByTestId('banner-text')).toHaveText('Ana está presentando');
+  await expectDeckOnBoard(A.page);
+  const state = (p: Page) => p.evaluate(() => {
+    const e = (window as any).__canvas.editor;
+    const v = e.visibleWorld();
+    return { stage: [e.stage.scrollLeft, e.stage.scrollTop], top: v.y, cx: v.x + v.w / 2, cy: v.y + v.h / 2 };
+  });
+  const before = await state(A.page);
+  // the presenter uses the page: a click in it, then the deck's own key
+  await A.page.getByTestId('present-tool-interact').click();
+  await frameOf(A.page).locator('#s1 p').click();
+  await A.page.keyboard.press('ArrowDown');
+  // the deck scrolls the next screen into view: the scroll reaches the stage, and becomes a camera move
+  const s5 = await frameOf(A.page).locator('#s5').evaluate((el) => el.getBoundingClientRect().top + window.scrollY);
+  await expect.poll(async () => {
+    const st = await state(A.page);
+    return st.stage[0] === 0 && st.stage[1] === 0 && Math.abs(st.top - s5) < 3;
+  }).toBe(true);
+  expect((await state(A.page)).top).not.toBe(before.top);
+  // what the presenter sees is where the camera is: the fifth heading at the top of the screen
+  const h = (await frameOf(A.page).locator('#s5 h2').boundingBox())!;
+  expect(h.y).toBeGreaterThanOrEqual(0);
+  expect(h.y).toBeLessThan(A.page.viewportSize()!.height / 2);
+  // the follower sees the same part of the page, and its own canvas did not scroll
+  await expect.poll(async () => {
+    const [a, b] = [await state(A.page), await state(B.page)];
+    return Math.abs(a.cx - b.cx) < 2 && Math.abs(a.cy - b.cy) < 2 && b.stage[0] === 0 && b.stage[1] === 0;
+  }).toBe(true);
+  await A.page.keyboard.press('Escape');
+  await A.close();
+  await B.close();
+});
+
 test('viewers with different windows (desktop, small, phone) get the same layout, so drawings stay on their element', async ({ browser, browserName }) => {
   const room = newRoom('deck-viewers');
   const sizes = [{ width: 1440, height: 900 }, { width: 1100, height: 600 }, { width: 1920, height: 1080 }];
