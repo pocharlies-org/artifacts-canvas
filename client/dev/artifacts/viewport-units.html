@@ -29,6 +29,8 @@
   #pend{height:0;padding:var(--z, 1px) 0 2vh}
   /* a ")" inside a quoted url(): what follows it is still the url */
   #url2{height:10px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Crect transform='rotate(0)' height='10vh' width='1'/%3E%3C/svg%3E")}
+  /* a logical twin after the unit wins, as written */
+  #lg{height:100vh;block-size:30px}
   .filler{height:1600px}
 </style>
 </head>
@@ -53,6 +55,8 @@
 <div class="box" id="pend">padding with var() and 2vh</div>
 <div class="box" id="url2">url with a parenthesis</div>
 <div class="box" id="vin" style="height:20vh;border:var(--bd);border-left-color:rgb(0, 0, 255)">inline border from var()</div>
+<div class="box" id="lg">logical twin</div>
+<div class="box" id="lgi" style="height:100vh;block-size:31px">inline logical twin</div>
 <div class="box" id="ins">insertRule 5vh</div>
 <div class="box" id="adopt">adopted 4vh</div>
 <div class="box" id="late">late style 7vh</div>

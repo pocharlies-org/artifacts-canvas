@@ -99,7 +99,7 @@
     });
   }
 
-  /** One declaration rewritten in place, with its priority; nothing else of the block is touched. */
+  /** One declaration rewritten, with its priority. */
   function fixProp(style, prop) {
     var v = style.getPropertyValue(prop);
     if (!v || !UNIT_QUICK.test(v)) return;
@@ -108,17 +108,36 @@
   }
 
   /**
-   * Rewrite a declaration block declaration by declaration. Never by assigning cssText back: a
-   * shorthand set from var() and overridden by one of its longhands serialises its other longhands
-   * as empty ("pending substitution"), and assigning that text drops the shorthand for good.
+   * Rewrite a rule's declaration block declaration by declaration. Never by assigning cssText back:
+   * a shorthand set from var() and overridden by one of its longhands serialises its other
+   * longhands as empty ("pending substitution"), and assigning that text drops the shorthand for
+   * good. setProperty can move a declaration to the end of the block (when the block also has its
+   * logical or physical twin, height and block-size), which would change which one wins: every
+   * declaration from the first rewritten one on is set again, in the block's order.
    */
   function fixDecl(style) {
     if (!style) return;
     var t = style.cssText;
     if (!t || !UNIT_QUICK.test(t)) return;
     var props = [];
-    for (var i = 0; i < style.length; i++) props.push(style[i]);
-    for (var j = 0; j < props.length; j++) fixProp(style, props[j]);
+    var vals = [];
+    var pris = [];
+    for (var i = 0; i < style.length; i++) {
+      props.push(style[i]);
+      vals.push(style.getPropertyValue(style[i]));
+      pris.push(style.getPropertyPriority(style[i]));
+    }
+    var first = -1;
+    for (var j = 0; j < props.length; j++) {
+      var v = vals[j];
+      if (!v || !UNIT_QUICK.test(v)) continue;
+      var n = rewriteUnits(v);
+      if (n === v) continue;
+      vals[j] = n;
+      if (first < 0) first = j;
+    }
+    // empty: a longhand of a var() shorthand, which only the shorthand can set
+    if (first >= 0) for (var k = first; k < props.length; k++) if (vals[k]) style.setProperty(props[k], vals[k], pris[k]);
     // a unit inside a shorthand set from var(): its longhands read empty, only the shorthand has it
     t = style.cssText;
     if (rewriteUnits(t) === t) return;
@@ -163,6 +182,14 @@
   }
 
   var linksSeen = typeof WeakSet === 'function' ? new WeakSet() : null;
+  /** An inline style: its attribute text rewritten as written (a var() shorthand stays, outerHTML too). */
+  function fixInline(el) {
+    var a = el.getAttribute('style');
+    if (!a || !UNIT_QUICK.test(a)) return;
+    var n = rewriteUnits(a);
+    if (n !== a) el.setAttribute('style', n);
+  }
+
   function fixElement(n) {
     if (isStyle(n)) fixSheet(n.sheet, 0);
     else if (isSheetLink(n)) {
@@ -172,7 +199,7 @@
         n.addEventListener('load', function () { fixSheet(n.sheet, 0); });
       }
     }
-    if (n.style && n.hasAttribute && n.hasAttribute('style')) fixDecl(n.style);
+    if (n.getAttribute && n.hasAttribute('style')) fixInline(n);
   }
 
   function fixTree(n) {
@@ -209,7 +236,7 @@
       var t = r.target;
       if (r.type === 'attributes') {
         if (t === docEl) applyUnits(); // the page rewrote <html style>: put the variables back
-        if (t.style && UNIT_QUICK.test(t.getAttribute('style') || '')) fixDecl(t.style);
+        if (t.getAttribute) fixInline(t);
         continue;
       }
       // text of a <style> changed (characterData on its text, or a child added/removed)
@@ -300,15 +327,26 @@
     return e;
   }
 
+  /**
+   * Is `target` within the part of the page the canvas shows (the frame's height cap)? An infinite
+   * scroll that observes its new last item would otherwise load for ever.
+   */
+  var BOARD_MAX = 100000;
+  function onBoard(target) {
+    try { return target.getBoundingClientRect().top + (window.scrollY || 0) < BOARD_MAX; } catch (e) { return false; }
+  }
+
   function ioFlush(s) {
     s.scheduled = false;
     if (native || !s.queue.size) {
       s.queue.clear();
       return;
     }
-    var entries = Array.from(s.queue, fullEntry);
-    s.queue.forEach(function (t) { s.reported.add(t); });
+    var shown = Array.from(s.queue).filter(onBoard);
     s.queue.clear();
+    if (!shown.length) return;
+    var entries = shown.map(fullEntry);
+    shown.forEach(function (t) { s.reported.add(t); });
     try { s.callback.call(s.self, entries, s.self); } catch (err) {
       setTimeout(function () { throw err; }); // reported like an error in a real observer's callback
     }
@@ -385,16 +423,17 @@
       s.real.disconnect();
       s.targets.clear();
       s.queue.clear();
+      s.reported = new WeakSet();
       unlist(s);
     };
     P.takeRecords = function () {
       var s = stateOf(this);
       var real = s.real.takeRecords();
       if (native) return real;
-      var out = Array.from(s.queue, fullEntry);
-      s.queue.forEach(function (t) { s.reported.add(t); });
+      var shown = Array.from(s.queue).filter(onBoard);
       s.queue.clear();
-      return out;
+      shown.forEach(function (t) { s.reported.add(t); });
+      return shown.map(fullEntry);
     };
     ['root', 'rootMargin', 'thresholds', 'scrollMargin', 'delay', 'trackVisibility'].forEach(function (k) {
       if (!(k in RealIO.prototype)) return;

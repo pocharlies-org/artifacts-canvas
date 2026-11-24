@@ -211,6 +211,10 @@ test('reveal scripts: an observer of the page reports its targets in view at onc
     sentinel.observe(tail);
     await new Promise((res) => setTimeout(res, 300));
     sentinel.disconnect();
+    // disconnected and observed again: told again
+    sentinel.observe(tail);
+    await new Promise((res) => setTimeout(res, 100));
+    sentinel.disconnect();
     const own = new IntersectionObserver(() => {}, { root: document.documentElement });
     const out = {
       seen,
@@ -237,7 +241,7 @@ test('reveal scripts: an observer of the page reports its targets in view at onc
   expect(r.ownIsBrowser).toBe(true);
   expect(r.badTarget).toBe('TypeError');
   expect(r.noNew).toBe('TypeError');
-  expect(r.again).toBe(1);
+  expect(r.again).toBe(2);
   await A.close();
 });
 
@@ -250,6 +254,7 @@ test('viewport units from every source of CSS resolve against the reference scre
     sheet: 10 * VH, media: 30 * VH, sup: 10 * VH, imp: 10 * VH, upper: 10 * VH, cv: 100 * VH / 4, layer: 6 * VH,
     inline: 20 * VH, ins: 5 * VH, adopt: 4 * VH, late: 7 * VH, js: 8 * VH, cls: 12, pad: 3 * VH + 3,
     vbg: 10 * VH, vmar: 5 * VH, pend: 2 * VH + 1, vin: 20 * VH + 6, // vin: its 3px border, kept
+    lg: 30, lgi: 31, // block-size after height still wins
   };
   for (const [id, v] of Object.entries(want)) await expect.poll(() => h(id), { message: id }).toBeCloseTo(v, 1);
   const vm = await f.locator('#vm').evaluate((el) => [el.getBoundingClientRect().width, el.getBoundingClientRect().height]);
@@ -266,6 +271,8 @@ test('viewport units from every source of CSS resolve against the reference scre
     pend: getComputedStyle(document.getElementById('pend')!).paddingTop,
     vin: [getComputedStyle(document.getElementById('vin')!).borderTopWidth, getComputedStyle(document.getElementById('vin')!).borderLeftColor],
     url2: getComputedStyle(document.getElementById('url2')!).backgroundImage,
+    // the inline style attribute keeps its var() shorthand as written (a copy through outerHTML too)
+    vinHtml: document.getElementById('vin')!.outerHTML,
     // the page's own first sheet is still the first one (the reporter adds none before it)
     firstSheet: (document.styleSheets[0].ownerNode as HTMLElement).localName + ':' + document.styleSheets[0].cssRules.length,
   }));
@@ -281,6 +288,8 @@ test('viewport units from every source of CSS resolve against the reference scre
   expect(misc.vin).toEqual(['3px', 'rgb(0, 0, 255)']);
   expect(misc.url2).toContain("10vh");
   expect(misc.url2).not.toContain('artifacts-canvas');
+  expect(misc.vinHtml).toContain('border:var(--bd)');
+  expect(misc.vinHtml).toContain('height:calc(20 * var(--artifacts-canvas-vh, 1vh))');
   // the canvas hidden: the real units come back, from the same rewritten CSS
   await A.page.evaluate(() => (window as any).__canvas.editor.setCanvasVisible(false));
   const share = (id: string) => f.locator(`#${id}`).evaluate((el) => Math.round((el.getBoundingClientRect().height / window.innerHeight) * 1000) / 1000);

@@ -159,9 +159,10 @@ own scripts, changes them in canvas mode only:
   real unit. It covers the page's `<style>` sheets (rules in `@media`, `@supports`, `@layer`,
   `@container`, nesting, `@keyframes`, `@import`), constructed and adopted sheets, rules added
   later (a new `<style>`, `insertRule`, `replace`/`replaceSync`) and inline `style` attributes as
-  they are set. Each declaration is rewritten on its own (`setProperty`, with its priority), never
-  the block's `cssText`, so the rest of a block stays as written. Strings, `url()` and selectors
-  are not touched. Not covered: a stylesheet loaded with `<link>` (from the opaque origin every
+  they are set. In a rule each declaration is rewritten on its own (`setProperty`, with its
+  priority, the later ones set again in order so a logical twin such as `block-size` still wins),
+  never through the block's `cssText`, so a `var()` shorthand stays; an inline `style` attribute is
+  rewritten as written. Strings, `url()` and selectors are not touched. Not covered: a stylesheet loaded with `<link>` (from the opaque origin every
   such file is another origin and its rules cannot be read; a self-contained artifact has none,
   see known issues L-4), media queries on the height or orientation, the `vb` family, and scripts
   that read `window.innerHeight` (it stays the frame's height, so scroll-position reveal scripts
@@ -175,7 +176,8 @@ own scripts, changes them in canvas mode only:
   mode the reporter's stand-in reports every observed target as fully intersecting
   (`isIntersecting: true`, `intersectionRatio: 1`, its own rects) right after the task that
   observed it, once per canvas-mode period (a callback that observes its target again, an
-  infinite-scroll sentinel, is not told again in a loop). In native mode the browser's observer
+  infinite-scroll sentinel, is not told again in a loop; `disconnect()` starts over), and never for
+  a target past the frame's 100 000 px cap. In native mode the browser's observer
   reports, and every target is observed again so the page gets the real state at once. An
   observer with an explicit root (an element, or the document) measures inside the page: the
   constructor returns the browser's own observer for it.
