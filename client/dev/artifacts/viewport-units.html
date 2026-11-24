@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Viewport units test page</title>
+<style>
+  :root{--grad:linear-gradient(rgb(255, 0, 0), rgb(0, 0, 255));--m:7px;--bd:3px solid rgb(255, 0, 0)}
+  body{margin:0;font-family:sans-serif}
+  .box{background:#cfe3ff;margin:0 0 4px;width:200px}
+  #sheet{height:10vh}
+  @media (min-width:600px){ #media{height:30svh} }
+  @supports (height:1dvh){ #sup{height:10dvh} }
+  #imp{height:10lvh !important}
+  #vm{width:10vmin;height:10vmax}
+  #neg{height:10px;margin-top:-2vh}
+  #upper{height:10VH}
+  #str::after{content:"50vh"}
+  #url{height:10px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' data-x='10vh'/%3E")}
+  #cls.h-100vh{height:12px}
+  #cv{--slide-h:100vh;height:calc(var(--slide-h) / 4)}
+  #pad{height:0;padding:2vh 0 calc(1vh + 3px)}
+  @keyframes drop{from{transform:translateY(10vh)}to{transform:translateY(10vh)}}
+  #kf{height:10px;animation:drop 1000s linear infinite paused}
+  @layer base{ #layer{height:6vh} }
+  /* a shorthand from var() overridden by one of its longhands, next to a unit: the shorthand stays */
+  #vbg{min-height:10vh;background:var(--grad);background-color:rgb(1, 2, 3)}
+  #vmar{height:5vh;margin:var(--m);margin-top:3px}
+  /* the unit inside a shorthand set from var(): only the shorthand holds it */
+  #pend{height:0;padding:var(--z, 1px) 0 2vh}
+  /* a ")" inside a quoted url(): what follows it is still the url */
+  #url2{height:10px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Crect transform='rotate(0)' height='10vh' width='1'/%3E%3C/svg%3E")}
+  /* a logical twin after the unit wins, as written */
+  #lg{height:100vh;block-size:30px}
+  .filler{height:1600px}
+</style>
+</head>
+<body>
+<div class="box" id="sheet">sheet 10vh</div>
+<div class="box" id="media">@media 30svh</div>
+<div class="box" id="sup">@supports 10dvh</div>
+<div class="box" id="imp" style="height:1px">!important 10lvh</div>
+<div class="box" id="vm">10vmin x 10vmax</div>
+<div class="box" id="neg">-2vh margin</div>
+<div class="box" id="upper">10VH</div>
+<div class="box" id="str">string</div>
+<div class="box" id="url">url</div>
+<div class="box h-100vh" id="cls">class name with vh</div>
+<div class="box" id="cv">custom property</div>
+<div class="box" id="pad">padding shorthand</div>
+<div class="box" id="kf">keyframes</div>
+<div class="box" id="layer">@layer</div>
+<div class="box" id="inline" style="height:20vh">inline 20vh</div>
+<div class="box" id="vbg">background from var()</div>
+<div class="box" id="vmar">margin from var()</div>
+<div class="box" id="pend">padding with var() and 2vh</div>
+<div class="box" id="url2">url with a parenthesis</div>
+<div class="box" id="vin" style="height:20vh;border:var(--bd);border-left-color:rgb(0, 0, 255)">inline border from var()</div>
+<div class="box" id="lg">logical twin</div>
+<div class="box" id="lgi" style="height:100vh;block-size:31px">inline logical twin</div>
+<div class="box" id="ins">insertRule 5vh</div>
+<div class="box" id="adopt">adopted 4vh</div>
+<div class="box" id="late">late style 7vh</div>
+<div class="box" id="js">script-set 8vh</div>
+<div class="filler"></div>
+<script>
+  // rules added through the CSSOM (as CSS-in-JS libraries do), a constructed sheet, and styles
+  // added or set after the page loaded
+  document.styleSheets[0].insertRule('#ins{height:5vh}', document.styleSheets[0].cssRules.length);
+  try {
+    var s = new CSSStyleSheet();
+    s.replaceSync('#adopt{height:4vh}');
+    document.adoptedStyleSheets = document.adoptedStyleSheets.concat([s]);
+  } catch (e) { document.getElementById('adopt').style.height = '4vh'; }
+  window.addEventListener('load', function () {
+    setTimeout(function () {
+      var st = document.createElement('style');
+      st.textContent = '#late{height:7vh}';
+      document.head.appendChild(st);
+      document.getElementById('js').style.height = '8vh';
+      document.documentElement.dataset.late = '1';
+    }, 50);
+  });
+</script>
+</body>
+</html>

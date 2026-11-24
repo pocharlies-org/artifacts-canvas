@@ -56,7 +56,8 @@ jobs:
           # the worker test hooks are never rendered, alerts or not
           if helm template chart/ -f chart/ci/ci-values.yaml --set alerts.enabled=true | grep -q WORKER_TEST_HOOKS; then exit 1; fi
           helm template chart/ -f chart/ci/ci-values.yaml --set alerts.enabled=true | grep -q 'kind: PrometheusRule'
-      - run: npx playwright install --with-deps chromium
+      # firefox and webkit: the specs of what runs inside the artifact's page (client/playwright.config.ts)
+      - run: npx playwright install --with-deps chromium firefox webkit
       - run: npm run e2e
         env:
           CI: '1'
