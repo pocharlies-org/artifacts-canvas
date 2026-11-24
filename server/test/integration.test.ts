@@ -662,6 +662,21 @@ describe('http routes', () => {
     expect(html).toContain('<title>art</title>');
   });
 
+  it('frame CSP grants exactly allow-scripts: no same-origin, popup, top-navigation, download, form or modal token', async () => {
+    core.rules.set('pub/a.html', allowAnon());
+    core.artifacts.set('pub/a.html', '<!doctype html><title>art</title><body>hi</body>');
+    const app = await startApp();
+    const port = (app.server.address() as { port: number }).port;
+    const res = await fetch(`http://127.0.0.1:${port}/_canvas/_/frame/pub/a.html`);
+    expect(res.status).toBe(200);
+    const [directive, ...grants] = (res.headers.get('content-security-policy') ?? '').split(/\s+/).filter(Boolean);
+    expect(directive).toBe('sandbox');
+    expect(grants).toEqual(['allow-scripts']);
+    for (const token of ['allow-same-origin', 'allow-popups', 'allow-popups-to-escape-sandbox', 'allow-top-navigation', 'allow-top-navigation-by-user-activation', 'allow-top-navigation-to-custom-protocols', 'allow-downloads', 'allow-forms', 'allow-modals']) {
+      expect(grants).not.toContain(token);
+    }
+  });
+
   it('frame forwards the visitor cookie to the core and refuses redirects', async () => {
     core.rules.set('pub/b.html', allowAnon());
     core.artifacts.set('pub/b.html', '<html><head></head></html>');

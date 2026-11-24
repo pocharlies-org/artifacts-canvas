@@ -174,3 +174,117 @@ test("the artifact's own script cannot navigate, open, pan or press keys through
   expect(await A.page.evaluate(() => (window as any).__canvas.editor.camera)).toEqual(cam);
   await A.close();
 });
+
+/*
+ * Download links. The core serves an artifact at /<bucket>/<key> and its canvas at /_canvas/<bucket>/<key>.
+ * The dev server gets that shape with ?artifact=, so the wrapper sits at /_canvas/artifacts/<file> and the
+ * plain artifact URLs are /artifacts/<file>. Opened as /_canvas/<file> the context has no artifact base and
+ * nothing downloads, so these tests would pass for the wrong reason there.
+ */
+const BUCKET = { artifact: 'artifacts/links-download.html', query: { artifact: 'links-download.html' } };
+const DOWNLOAD_TITLE = 'Download links test page';
+const ZIP = Buffer.from('PK\u0003\u0004 test archive');
+
+/** Serve the plain artifact file a link points to. The bytes come from the test, nothing leaves the machine. */
+async function serveFile(p: Page, name: string, contentType: string, body: string | Buffer) {
+  await p.context().route(`**/artifacts/${name}`, (r) => r.fulfill({ status: 200, contentType, body }));
+}
+
+/**
+ * Run `act` (a click on a link of the fixture) and expect the file to be saved under `filename`
+ * while the tab stays on its page: same URL, same canvas page, no new page, and no "Download is
+ * disallowed" message from the sandboxed frame.
+ */
+async function expectSavedInPlace(p: Page, act: () => Promise<void>, filename: string) {
+  const before = p.url();
+  const messages: string[] = [];
+  const onConsole = (m: { text(): string }) => messages.push(m.text());
+  p.on('console', onConsole);
+  const [download] = await Promise.all([p.waitForEvent('download'), act()]);
+  expect(download.suggestedFilename()).toBe(filename);
+  await p.waitForTimeout(500);
+  expect(p.url()).toBe(before);
+  expect(new URL(p.url()).pathname).toMatch(/\/_canvas\/artifacts\/links-download\.html$/);
+  expect(p.context().pages()).toHaveLength(1);
+  await expect.poll(() => frameTitle(p)).toBe(DOWNLOAD_TITLE);
+  p.off('console', onConsole);
+  expect(messages.join('\n')).not.toContain('Download is disallowed');
+}
+
+test('download link: canvas hidden (the default view), a click on a zip saves it and the tab stays on its page', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('download-hidden'), { ...BUCKET, query: { ...BUCKET.query, canvas: '0' } });
+  await expect.poll(() => frameTitle(A.page)).toBe(DOWNLOAD_TITLE);
+  await serveFile(A.page, 'x.zip', 'application/zip', ZIP);
+  await expectSavedInPlace(A.page, () => frameOf(A.page).locator('#zip').click(), 'x.zip');
+  await A.close();
+});
+
+test('download link: canvas shown with the interact tool, a click on a zip saves it and the tab stays on its page', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('download-interact'), BUCKET);
+  await expect.poll(() => frameTitle(A.page)).toBe(DOWNLOAD_TITLE);
+  await A.page.keyboard.press('i');
+  await expect(A.page.getByTestId('tool-interact')).toHaveClass(/\bon\b/);
+  await serveFile(A.page, 'x.zip', 'application/zip', ZIP);
+  await expectSavedInPlace(A.page, () => frameOf(A.page).locator('#zip').click(), 'x.zip');
+  await A.close();
+});
+
+test('download link: canvas shown with the select tool, a mouse click on a zip saves it and the tab stays on its page', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('download-select'), BUCKET);
+  await expect.poll(() => frameTitle(A.page)).toBe(DOWNLOAD_TITLE);
+  await A.page.keyboard.press('v');
+  await serveFile(A.page, 'x.zip', 'application/zip', ZIP);
+  const zip = (await frameOf(A.page).locator('#zip').boundingBox())!;
+  await expectSavedInPlace(A.page, () => A.page.mouse.click(zip.x + zip.width / 2, zip.y + zip.height / 2), 'x.zip');
+  await A.close();
+});
+
+test('download link: the production wrapper CSP, canvas hidden: the zip is saved and the tab stays on its page', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('download-prod'), { ...BUCKET, prodCsp: true, query: { ...BUCKET.query, canvas: '0' } });
+  await expect.poll(() => frameTitle(A.page)).toBe(DOWNLOAD_TITLE);
+  await serveFile(A.page, 'x.zip', 'application/zip', ZIP);
+  await expectSavedInPlace(A.page, () => frameOf(A.page).locator('#zip').click(), 'x.zip');
+  await A.close();
+});
+
+test('download link: a csv and a png are saved too; the png is saved, not opened, and the tab stays on its page', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('download-types'), BUCKET);
+  await expect.poll(() => frameTitle(A.page)).toBe(DOWNLOAD_TITLE);
+  await A.page.keyboard.press('i');
+  await serveFile(A.page, 'data.csv', 'text/csv', 'a,b\n1,2\n');
+  await serveFile(A.page, 'pic.png', 'image/png', Buffer.from('iVBORw0KGgo=', 'base64'));
+  await expectSavedInPlace(A.page, () => frameOf(A.page).locator('#csv').click(), 'data.csv');
+  await expectSavedInPlace(A.page, () => frameOf(A.page).locator('#png').click(), 'pic.png');
+  await A.close();
+});
+
+test('download link: an .html link still opens that file\'s canvas page in the same tab and saves nothing', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('download-page'), BUCKET);
+  await expect.poll(() => frameTitle(A.page)).toBe(DOWNLOAD_TITLE);
+  await A.page.keyboard.press('i');
+  let downloads = 0;
+  A.page.on('download', () => { downloads += 1; });
+  await frameOf(A.page).locator('#page').click();
+  await A.page.waitForURL(/\/_canvas\/artifacts\/links-b\.html\?/);
+  await A.page.waitForTimeout(300);
+  expect(downloads).toBe(0);
+  expect(A.page.context().pages()).toHaveLength(1);
+  await A.close();
+});
+
+test("download link: a forged link message from the artifact's own script downloads nothing and does not navigate", async ({ browser }) => {
+  // links-forge.html posts a link to x.zip (among others) every 400 ms, on its own, with no click
+  const A = await open(browser, 'Ana', newRoom('download-forge'), { artifact: 'artifacts/links-forge.html', query: { artifact: 'links-forge.html', canvas: '0' } });
+  await serveFile(A.page, 'x.zip', 'application/zip', ZIP);
+  let downloads = 0;
+  A.page.on('download', () => { downloads += 1; });
+  const before = A.page.url();
+  const forged = () => frameOf(A.page).locator('#forged').textContent().then(Number);
+  // several forged rounds go by; the verdict is the download count and the URL, the counter shows they ran
+  await A.page.waitForTimeout(3000);
+  expect(downloads, { message: 'a forged link message started a download' }).toBe(0);
+  expect(A.page.url(), { message: 'a forged link message navigated the tab' }).toBe(before);
+  expect(A.page.context().pages()).toHaveLength(1);
+  expect(await forged()).toBeGreaterThanOrEqual(4);
+  await A.close();
+});

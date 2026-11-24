@@ -21,6 +21,12 @@ test('the artifact iframe is sandboxed with an opaque origin and cannot reach th
   const sandbox = await page.locator('iframe.artifact-frame').getAttribute('sandbox');
   expect(sandbox).toBe('allow-scripts');
   expect(sandbox).not.toContain('allow-same-origin');
+  // the token set is exactly allow-scripts: a download is the wrapper's job, never the frame's
+  const grants = (sandbox ?? '').split(/\s+/).filter(Boolean);
+  expect(grants).toEqual(['allow-scripts']);
+  for (const token of ['allow-same-origin', 'allow-popups', 'allow-popups-to-escape-sandbox', 'allow-top-navigation', 'allow-top-navigation-by-user-activation', 'allow-top-navigation-to-custom-protocols', 'allow-downloads', 'allow-forms', 'allow-modals']) {
+    expect(grants).not.toContain(token);
+  }
   // the wrapper cannot script into the frame either (opaque origin)
   expect(await page.evaluate(() => (document.querySelector('iframe.artifact-frame') as HTMLIFrameElement).contentDocument)).toBeNull();
   // the frame response carries the CSP sandbox header too
