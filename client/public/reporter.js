@@ -272,19 +272,19 @@
 
   function ioFlush(s) {
     s.scheduled = false;
-    if (native || !s.queue.length) {
-      s.queue = [];
+    if (native || !s.queue.size) {
+      s.queue.clear();
       return;
     }
-    var entries = s.queue.map(fullEntry);
-    s.queue = [];
+    var entries = Array.from(s.queue, fullEntry);
+    s.queue.clear();
     try { s.callback.call(s.self, entries, s.self); } catch (err) {
       setTimeout(function () { throw err; }); // reported like an error in a real observer's callback
     }
   }
 
   function ioQueue(s, target) {
-    if (s.queue.indexOf(target) < 0) s.queue.push(target);
+    s.queue.add(target);
     if (s.scheduled) return;
     s.scheduled = true;
     Promise.resolve().then(function () { ioFlush(s); });
@@ -294,7 +294,7 @@
   function ioMode() {
     ioLive.forEach(function (s) {
       if (native) {
-        s.queue = [];
+        s.queue.clear();
         s.targets.forEach(function (t) { s.real.unobserve(t); s.real.observe(t); });
       } else {
         s.targets.forEach(function (t) { ioQueue(s, t); });
@@ -303,7 +303,7 @@
   }
 
   function installIO() {
-    if (typeof RealIO !== 'function' || !ioState) return;
+    if (typeof RealIO !== 'function' || !ioState || typeof Set !== 'function') return;
     var stateOf = function (o) {
       var s = ioState.get(o);
       if (!s) throw new TypeError('Illegal invocation');
@@ -315,7 +315,8 @@
       // an explicit root: the geometry is inside the page, the browser's observer is right
       if (options && options.root) return new RealIO(callback, options);
       var self = this;
-      var s = { self: self, callback: callback, targets: [], queue: [], scheduled: false, real: null };
+      // targets in the order observed; queue: observed, not reported yet
+      var s = { self: self, callback: callback, targets: new Set(), queue: new Set(), scheduled: false, real: null };
       s.real = new RealIO(function (entries) {
         if (native) callback.call(self, entries, self);
       }, options);
@@ -326,24 +327,22 @@
     P.observe = function (target) {
       var s = stateOf(this);
       s.real.observe(target); // throws as the browser does for a target that is not an Element
-      if (s.targets.indexOf(target) >= 0) return;
-      s.targets.push(target);
+      if (s.targets.has(target)) return;
+      s.targets.add(target);
       if (ioLive.indexOf(s) < 0) ioLive.push(s);
       if (!native) ioQueue(s, target);
     };
     P.unobserve = function (target) {
       var s = stateOf(this);
       s.real.unobserve(target);
-      var i = s.targets.indexOf(target);
-      if (i >= 0) s.targets.splice(i, 1);
-      i = s.queue.indexOf(target);
-      if (i >= 0) s.queue.splice(i, 1);
+      s.targets.delete(target);
+      s.queue.delete(target);
     };
     P.disconnect = function () {
       var s = stateOf(this);
       s.real.disconnect();
-      s.targets = [];
-      s.queue = [];
+      s.targets.clear();
+      s.queue.clear();
       var i = ioLive.indexOf(s);
       if (i >= 0) ioLive.splice(i, 1);
     };
@@ -351,8 +350,8 @@
       var s = stateOf(this);
       var real = s.real.takeRecords();
       if (native) return real;
-      var out = s.queue.map(fullEntry);
-      s.queue = [];
+      var out = Array.from(s.queue, fullEntry);
+      s.queue.clear();
       return out;
     };
     ['root', 'rootMargin', 'thresholds', 'scrollMargin', 'delay', 'trackVisibility'].forEach(function (k) {
