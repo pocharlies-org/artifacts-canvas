@@ -14,7 +14,11 @@
  *   - posts the page's background colour (html, else body, else white) when it changes, so the
  *     canvas board can follow it (a theme toggle included),
  *   - in "native" mode (the canvas hidden: the page is shown as itself) lets the page scroll on
- *     its own, as the plain artifact does.
+ *     its own, as the plain artifact does,
+ *   - in canvas mode, resolves the page's `vh`-family lengths against a fixed reference screen
+ *     (the frame's width, 16:9) instead of the page's own height, and lets an
+ *     IntersectionObserver report the whole page as in view (sections that a script reveals on
+ *     scroll): the whole page is on the board.
  * It reads no cookies or storage (it has none) and sends nothing anywhere else.
  * Copyright 2026 Daniel Ibáñez. Licensed under the Apache License, Version 2.0.
  */
@@ -43,7 +47,8 @@
     var w = Math.max(d ? d.scrollWidth : 0, b ? b.scrollWidth : 0);
     if (Math.abs(h - lastH) < 1) return;
     lastH = h;
-    post({ type: 'size', w: w, h: h });
+    // the mode it was measured in: the wrapper drops a size of the other mode (a mode change on its way)
+    post({ type: 'size', w: w, h: h, native: native });
   }
 
   function reportTitle() {
@@ -51,14 +56,324 @@
   }
 
   // The canvas lays the page out at its full height and pans it: the page itself must not scroll.
-  // In native mode (canvas hidden) the page scrolls as the plain artifact does.
+  // In native mode (canvas hidden) the page scrolls as the plain artifact does. Scroll snapping
+  // on the root is off too: a "deck" of full-screen sections asks for it, and the browser would
+  // re-snap the (unscrollable) page after every layout change, which the reporter would then
+  // pass on to the camera as a pan.
   var noScroll = document.createElement('style');
-  noScroll.textContent = 'html,body{overflow:hidden !important;scrollbar-width:none}';
+  noScroll.textContent = 'html,body{overflow:hidden !important;scrollbar-width:none;scroll-snap-type:none !important}';
   var native = false;
   var started = false;
 
+  // ---- viewport units (docs/protocol.md §3 "Viewport units and reveal scripts") ----
+  // In canvas mode the frame is as tall as the page, so `vh` would be a share of the page's own
+  // height: a section of `min-height:100vh` (or a font sized from `vh`) grows with the page, which
+  // grows with it, and so on. In canvas mode every `vh`-family length (vh, svh, lvh, dvh, and
+  // vmin/vmax, which depend on it) is resolved against a reference screen instead: as wide as the
+  // frame (the room's pageWidth, the same for every participant) and 9/16 of that high, a 16:9
+  // screen. Every viewer, presenter and followers alike, gets the same layout. `vw` is left alone:
+  // it already follows the frame's width. The page's own CSS is rewritten once, in place:
+  // `100vh` becomes `calc(100 * var(--artifacts-canvas-vh, 1vh))`. The variables are set on
+  // <html> in canvas mode and removed in native mode, where the fallback gives the real unit back.
+  // Covered: the page's <style> sheets (rules inside @media, @supports, @layer, @container,
+  // nesting, @keyframes, @import), constructed and adopted sheets, rules added later (a new
+  // <style>, insertRule, replace/replaceSync, a stylesheet <link> once loaded) and inline `style`
+  // attributes, as they are set. Not covered: a stylesheet from another origin (its rules cannot
+  // be read from this opaque origin), media queries on the height, and `innerHeight` in scripts.
+  var UNIT_VAR = '--artifacts-canvas-';
+  var UNIT_RE = /("(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*'|url\([^)]*\)|var\(\s*--artifacts-canvas-v[a-z]+\s*,[^)]*\))|(^|[^\w.\-])([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)((?:s|l|d)?v(?:h|min|max))(?![\w-])/gi;
+  var UNIT_QUICK = /\d[sld]?v(?:h|min|max)/i;
+
+  /** The CSS text with every vh-family length turned into the variable form (strings and url() untouched). */
+  function rewriteUnits(text) {
+    return text.replace(UNIT_RE, function (m, skip, pre, num, unit) {
+      if (skip !== undefined) return m;
+      var u = unit.toLowerCase();
+      var kind = /min$/.test(u) ? 'vmin' : /max$/.test(u) ? 'vmax' : 'vh';
+      return pre + 'calc(' + num + ' * var(' + UNIT_VAR + kind + ', 1' + u + '))';
+    });
+  }
+
+  function fixDecl(style) {
+    if (!style) return;
+    var t = style.cssText;
+    if (!t || !UNIT_QUICK.test(t)) return;
+    var n = rewriteUnits(t);
+    if (n !== t) style.cssText = n;
+  }
+
+  function fixRules(rules, depth) {
+    if (!rules || depth > 32) return;
+    for (var i = 0; i < rules.length; i++) fixRule(rules[i], depth);
+  }
+
+  function fixRule(r, depth) {
+    if (!r) return;
+    try {
+      if (r.style) fixDecl(r.style);
+      if (r.cssRules) fixRules(r.cssRules, (depth || 0) + 1);
+      if (r.styleSheet) fixSheet(r.styleSheet, (depth || 0) + 1);
+    } catch (e) { /* ignore */ }
+  }
+
+  function fixSheet(sheet, depth) {
+    if (!sheet) return;
+    var rules;
+    try { rules = sheet.cssRules; } catch (e) { return; } // another origin: not readable from here
+    fixRules(rules, depth || 0);
+  }
+
+  var sheetCount = -1;
+  function fixAllSheets() {
+    var list = document.styleSheets || [];
+    sheetCount = list.length;
+    for (var i = 0; i < list.length; i++) fixSheet(list[i], 0);
+    var adopted = document.adoptedStyleSheets;
+    if (adopted) for (var j = 0; j < adopted.length; j++) fixSheet(adopted[j], 0);
+  }
+
+  function isStyle(n) { return n && n.nodeType === 1 && String(n.localName).toLowerCase() === 'style'; }
+  function isSheetLink(n) {
+    return n && n.nodeType === 1 && String(n.localName).toLowerCase() === 'link' && /(^|\s)stylesheet(\s|$)/i.test(n.getAttribute('rel') || '');
+  }
+
+  var linksSeen = typeof WeakSet === 'function' ? new WeakSet() : null;
+  function fixElement(n) {
+    if (isStyle(n)) fixSheet(n.sheet, 0);
+    else if (isSheetLink(n)) {
+      if (n.sheet) fixSheet(n.sheet, 0);
+      if (linksSeen && !linksSeen.has(n)) {
+        linksSeen.add(n);
+        n.addEventListener('load', function () { fixSheet(n.sheet, 0); });
+      }
+    }
+    if (n.style && n.hasAttribute && n.hasAttribute('style')) fixDecl(n.style);
+  }
+
+  function fixTree(n) {
+    if (!n || n.nodeType !== 1) return;
+    fixElement(n);
+    if (!n.querySelectorAll) return;
+    var all = n.querySelectorAll('style,link,[style]');
+    for (var i = 0; i < all.length; i++) fixElement(all[i]);
+  }
+
+  var docEl = document.documentElement;
+  function setUnitVar(name, value) {
+    if (docEl.style.getPropertyValue(name) !== value) docEl.style.setProperty(name, value);
+  }
+  /** The reference screen's units on <html> (canvas mode), or none (native mode: the real units). */
+  function applyUnits() {
+    if (!docEl || !docEl.style) return;
+    var w = window.innerWidth || docEl.clientWidth || 0;
+    if (native || !(w > 0)) {
+      ['vh', 'vmin', 'vmax'].forEach(function (k) { docEl.style.removeProperty(UNIT_VAR + k); });
+      return;
+    }
+    var h = (w * 9) / 16;
+    var px = function (v) { return Math.round(v * 10000) / 10000 + 'px'; };
+    setUnitVar(UNIT_VAR + 'vh', px(h / 100));
+    setUnitVar(UNIT_VAR + 'vmin', px(Math.min(w, h) / 100));
+    setUnitVar(UNIT_VAR + 'vmax', px(Math.max(w, h) / 100));
+  }
+
+  function onStyleMutations(list) {
+    var changed = []; // <style> elements whose text changed: each sheet is walked once per batch
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i];
+      var t = r.target;
+      if (r.type === 'attributes') {
+        if (t === docEl) applyUnits(); // the page rewrote <html style>: put the variables back
+        if (t.style) fixDecl(t.style);
+        continue;
+      }
+      // text of a <style> changed (characterData on its text, or a child added/removed)
+      var host = t && t.nodeType === 3 ? t.parentNode : t;
+      if (isStyle(host) && changed.indexOf(host) < 0) changed.push(host);
+      if (r.type === 'childList') for (var j = 0; j < r.addedNodes.length; j++) fixTree(r.addedNodes[j]);
+    }
+    for (var k = 0; k < changed.length; k++) fixSheet(changed[k].sheet, 0);
+  }
+
+  function wrapAfter(proto, name, after) {
+    if (!proto || typeof proto[name] !== 'function') return;
+    var orig = proto[name];
+    proto[name] = function () {
+      var out = orig.apply(this, arguments);
+      try { after(this, out); } catch (e) { /* ignore */ }
+      return out;
+    };
+  }
+
+  function installUnits() {
+    applyUnits();
+    window.addEventListener('resize', applyUnits);
+    // CSS-in-JS libraries add rules through the CSSOM, which no mutation reports
+    var inserted = function (owner, index) {
+      var rules = owner.cssRules;
+      if (rules && typeof index === 'number') fixRule(rules[index], 0);
+    };
+    wrapAfter(window.CSSStyleSheet && CSSStyleSheet.prototype, 'insertRule', inserted);
+    wrapAfter(window.CSSGroupingRule && CSSGroupingRule.prototype, 'insertRule', inserted);
+    wrapAfter(window.CSSKeyframesRule && CSSKeyframesRule.prototype, 'appendRule', function (owner) {
+      fixRule(owner.cssRules[owner.cssRules.length - 1], 0);
+    });
+    wrapAfter(window.CSSStyleSheet && CSSStyleSheet.prototype, 'replaceSync', function (sheet) { fixSheet(sheet, 0); });
+    wrapAfter(window.CSSStyleSheet && CSSStyleSheet.prototype, 'replace', function (sheet, p) {
+      if (p && typeof p.then === 'function') p.then(function () { fixSheet(sheet, 0); }, function () { /* ignore */ });
+    });
+    if (window.MutationObserver && docEl) {
+      // installed before the page's own markup is parsed: each <style> is rewritten before the
+      // next script of the page runs (the parser delivers mutations before it runs a script)
+      new MutationObserver(onStyleMutations).observe(docEl, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['style'] });
+    }
+    fixTree(docEl);
+  }
+
+  // ---- reveal scripts: IntersectionObserver (docs/protocol.md §3) ----
+  // Pages that fade their sections in as they scroll into view hide them until an
+  // IntersectionObserver reports them. In the canvas the frame is a cross-origin child of a
+  // transformed board: with the implicit root the browser measures each section against the
+  // wrapper's viewport, so most of the page never "intersects", and it stays hidden on the board,
+  // in exports and for followers. In canvas mode the whole page is on the board, so an observer
+  // with the implicit root reports every target as fully intersecting as soon as it is observed.
+  // In native mode (canvas hidden) the page scrolls as itself and the browser's own observer
+  // reports, re-observing every target so the page gets the real state at once. An observer with
+  // an explicit root (an element or the document) measures inside the page, so it is the browser's.
+  // The browser's constructor stays here, in the reporter; the page sees the stand-in.
+  var RealIO = window.IntersectionObserver;
+  var ioLive = [];
+  var ioState = typeof WeakMap === 'function' ? new WeakMap() : null;
+
+  function rectOf(x, y, w, h) {
+    try { return new DOMRectReadOnly(x, y, w, h); } catch (e) { return { x: x, y: y, width: w, height: h, top: y, left: x, right: x + w, bottom: y + h }; }
+  }
+
+  function fullEntry(target) {
+    var b = target.getBoundingClientRect();
+    var proto = window.IntersectionObserverEntry && IntersectionObserverEntry.prototype;
+    var e = Object.create(proto || Object.prototype);
+    var fields = {
+      time: window.performance && performance.now ? performance.now() : Date.now(),
+      target: target,
+      rootBounds: rectOf(0, 0, window.innerWidth || 0, window.innerHeight || 0),
+      boundingClientRect: b,
+      intersectionRect: b,
+      isIntersecting: true,
+      isVisible: true,
+      intersectionRatio: 1,
+    };
+    for (var k in fields) Object.defineProperty(e, k, { value: fields[k], enumerable: true });
+    return e;
+  }
+
+  function ioFlush(s) {
+    s.scheduled = false;
+    if (native || !s.queue.length) {
+      s.queue = [];
+      return;
+    }
+    var entries = s.queue.map(fullEntry);
+    s.queue = [];
+    try { s.callback.call(s.self, entries, s.self); } catch (err) {
+      setTimeout(function () { throw err; }); // reported like an error in a real observer's callback
+    }
+  }
+
+  function ioQueue(s, target) {
+    if (s.queue.indexOf(target) < 0) s.queue.push(target);
+    if (s.scheduled) return;
+    s.scheduled = true;
+    Promise.resolve().then(function () { ioFlush(s); });
+  }
+
+  /** Mode changed: canvas mode reports every target again; native mode re-observes for the real state. */
+  function ioMode() {
+    ioLive.forEach(function (s) {
+      if (native) {
+        s.queue = [];
+        s.targets.forEach(function (t) { s.real.unobserve(t); s.real.observe(t); });
+      } else {
+        s.targets.forEach(function (t) { ioQueue(s, t); });
+      }
+    });
+  }
+
+  function installIO() {
+    if (typeof RealIO !== 'function' || !ioState) return;
+    var stateOf = function (o) {
+      var s = ioState.get(o);
+      if (!s) throw new TypeError('Illegal invocation');
+      return s;
+    };
+    var IntersectionObserver = function IntersectionObserver(callback, options) {
+      if (!(this instanceof IntersectionObserver)) throw new TypeError("Failed to construct 'IntersectionObserver': Please use the 'new' operator.");
+      if (typeof callback !== 'function') throw new TypeError("Failed to construct 'IntersectionObserver': The callback provided as parameter 1 is not a function.");
+      // an explicit root: the geometry is inside the page, the browser's observer is right
+      if (options && options.root) return new RealIO(callback, options);
+      var self = this;
+      var s = { self: self, callback: callback, targets: [], queue: [], scheduled: false, real: null };
+      s.real = new RealIO(function (entries) {
+        if (native) callback.call(self, entries, self);
+      }, options);
+      ioState.set(self, s);
+      ioLive.push(s);
+    };
+    var P = IntersectionObserver.prototype;
+    P.observe = function (target) {
+      var s = stateOf(this);
+      s.real.observe(target); // throws as the browser does for a target that is not an Element
+      if (s.targets.indexOf(target) >= 0) return;
+      s.targets.push(target);
+      if (ioLive.indexOf(s) < 0) ioLive.push(s);
+      if (!native) ioQueue(s, target);
+    };
+    P.unobserve = function (target) {
+      var s = stateOf(this);
+      s.real.unobserve(target);
+      var i = s.targets.indexOf(target);
+      if (i >= 0) s.targets.splice(i, 1);
+      i = s.queue.indexOf(target);
+      if (i >= 0) s.queue.splice(i, 1);
+    };
+    P.disconnect = function () {
+      var s = stateOf(this);
+      s.real.disconnect();
+      s.targets = [];
+      s.queue = [];
+      var i = ioLive.indexOf(s);
+      if (i >= 0) ioLive.splice(i, 1);
+    };
+    P.takeRecords = function () {
+      var s = stateOf(this);
+      var real = s.real.takeRecords();
+      if (native) return real;
+      var out = s.queue.map(fullEntry);
+      s.queue = [];
+      return out;
+    };
+    ['root', 'rootMargin', 'thresholds', 'scrollMargin', 'delay', 'trackVisibility'].forEach(function (k) {
+      if (!(k in RealIO.prototype)) return;
+      Object.defineProperty(P, k, {
+        configurable: true,
+        enumerable: true,
+        get: function () { return stateOf(this).real[k]; },
+      });
+    });
+    try { Object.defineProperty(P, Symbol.toStringTag, { value: 'IntersectionObserver', configurable: true }); } catch (e) { /* ignore */ }
+    window.IntersectionObserver = IntersectionObserver;
+  }
+
+  try { installIO(); } catch (e) { /* the page keeps the browser's observer */ }
+  try { installUnits(); } catch (e) { /* the page keeps the real units */ }
+
   function setNative(on) {
+    var was = native;
     native = !!on;
+    if (was !== native) {
+      try { applyUnits(); } catch (e) { /* ignore */ }
+      try { ioMode(); } catch (e) { /* ignore */ }
+    }
     if (!started) return;
     if (native) {
       if (noScroll.parentNode) noScroll.parentNode.removeChild(noScroll);
@@ -73,6 +388,7 @@
   function start() {
     started = true;
     if (!native) (document.head || document.documentElement).appendChild(noScroll);
+    try { fixAllSheets(); } catch (e) { /* ignore */ }
     reportTitle();
     reportSize();
     checkBg();
@@ -90,7 +406,12 @@
       else if (mq.addListener) mq.addListener(checkBg);
     } catch (e) { /* ignore */ }
     // also catches a background that changes by a CSS transition or a late stylesheet
-    setInterval(function () { reportSize(); checkBg(); }, 1000);
+    setInterval(function () {
+      // a sheet no mutation reported (the count is cheap; the scan runs only when it moved)
+      try { if ((document.styleSheets || []).length !== sheetCount) fixAllSheets(); } catch (e) { /* ignore */ }
+      reportSize();
+      checkBg();
+    }, 1000);
   }
 
   // ---- background colour: html's, else body's, else white; posted only when it changes ----

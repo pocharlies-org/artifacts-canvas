@@ -76,6 +76,24 @@ Each fixed entry names its regression tests.
   `410`, frame and WebSocket keep their plain answers, and the page depends on the requested key only
   (the same for a key that is not shared and one that does not exist). Tests:
   `server/test/integration.test.ts` (access-required page), `e2e-system/system.spec.ts` (b).
+- [x] **L-6 — A deck of full-screen sections showed its title and then nothing; presenting it blanked
+  it (High).** Generated presentations are often a scroll-snap "deck": a root font sized from `vw`
+  and `vh`, sections of `min-height:100vh`, and a script that hides each section until an
+  `IntersectionObserver` reports it. The frame is as tall as the page, so `vh` was a share of the
+  page's own height: sections and font grew with the page, which grew with them, until the frame's
+  100 000 px cap. The observer, measured against the wrapper's viewport, never reported sections
+  that tall, so they stayed hidden on the board and in presentation mode; the plain artifact was
+  fine. Now, in canvas mode, the reporter resolves the `vh` family against a reference screen (the
+  frame's width, 16:9: 980 x 551.25), the same for every participant, and reports every observed
+  section as in view; root scroll snapping is off. Native mode gets the real units and the
+  browser's observer back (protocol §3 "Viewport units and reveal scripts"). A size the reporter
+  measured in the other mode is dropped, and showing the canvas again puts the frame back at its
+  canvas height (the native page's height had stuck). Tests: `client/e2e/viewport-units.spec.ts`
+  (Chromium, Firefox and WebKit) with `client/dev/artifacts/scroll-deck.html` and
+  `viewport-units.html`. Left: a stylesheet from another origin is not rewritten, media queries on
+  the height are not, and scripts that read `window.innerHeight` still get the frame's full height
+  (a fixed backdrop that positions itself from it spans the whole page); a deck that scrolls inside
+  its own `100vh` container shows one screen of it, with its inner scrolling.
 
 ## Review of the fv9 branch (security and QA)
 

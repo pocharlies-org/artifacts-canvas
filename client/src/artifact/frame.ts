@@ -81,6 +81,12 @@ export class ArtifactFrame {
   native = false;
   /** The reporter of the current document knows the mode (it starts in canvas mode). */
   private reporterTold = false;
+  /**
+   * The page's height as the reporter last measured it in canvas mode (the frame starts there).
+   * Native mode lays the page out at the view's size, so its height says nothing about the
+   * canvas layout; the frame goes back to this one when the canvas is shown again.
+   */
+  private canvasHeight: number;
   private pending = new Map<string, (snap: FrameSnapshot | null) => void>();
   private growthStreak = 0;
   private probes = new Map<string, (link: boolean) => void>();
@@ -89,6 +95,7 @@ export class ArtifactFrame {
   constructor(parent: HTMLElement, src: string, width: number, initialHeight: number, private vendorUrl: string, private ev: FrameEvents = {}) {
     this.width = width;
     this.height = initialHeight;
+    this.canvasHeight = initialHeight;
     const f = document.createElement('iframe');
     // Opaque origin: scripts only. Never add allow-same-origin, allow-top-navigation or allow-popups-to-escape-sandbox.
     f.setAttribute('sandbox', 'allow-scripts');
@@ -162,6 +169,10 @@ export class ArtifactFrame {
         return;
       }
       case 'size': {
+        // measured in the other mode (the mode message is still on its way): it says nothing
+        // about this one. In canvas mode a page measured at the view's units could be taken for
+        // the canvas layout, and the frame would grow with it.
+        if (typeof d.native === 'boolean' && d.native !== this.native) return;
         const h = Number(d.h);
         if (!isFinite(h) || h <= 0) return;
         const nh = Math.min(MAX_HEIGHT, Math.ceil(h));
@@ -172,7 +183,10 @@ export class ArtifactFrame {
         if (this.growthStreak > 20) return;
         this.height = nh;
         // native mode: the page scrolls inside a frame the size of the view; only its height is noted
-        if (!this.native) this.el.style.height = `${nh}px`;
+        if (!this.native) {
+          this.canvasHeight = nh;
+          this.el.style.height = `${nh}px`;
+        }
         this.ev.size?.(this.width, nh);
         return;
       }
@@ -240,6 +254,7 @@ export class ArtifactFrame {
    * (the page width, its full height, no scrolling: the canvas pans it).
    */
   setNative(on: boolean, w = 0, h = 0) {
+    if (on !== this.native) this.growthStreak = 0;
     this.native = on;
     // the frame scrolls only in native mode (the canvas pans it otherwise)
     this.el.setAttribute('scrolling', on ? 'auto' : 'no');
@@ -247,6 +262,9 @@ export class ArtifactFrame {
       this.el.style.width = `${w}px`;
       this.el.style.height = `${h}px`;
     } else {
+      // the canvas layout's own height, not the native one (the frame cannot measure a page
+      // shorter than itself, so it would keep the native height)
+      this.height = this.canvasHeight;
       this.el.style.width = `${this.width}px`;
       this.el.style.height = `${this.height}px`;
     }

@@ -143,6 +143,37 @@ iframe and the drawings together, so world coordinates are artifact CSS pixels a
 annotations stay on the element they were drawn on. Wheel and touch go to the canvas, except
 with the interact tool (below), where the artifact takes the pointer.
 
+**Viewport units and reveal scripts.** A frame as tall as the page breaks two things that pages
+written as a "deck" of full-screen sections rely on, so the reporter, which runs before the page's
+own scripts, changes them in canvas mode only:
+
+- **Viewport units.** `vh` would be a share of the page's own height: a section of
+  `min-height:100vh`, or a root font sized from `vh`, grows with the page, which grows with it,
+  up to the frame's cap. In canvas mode the `vh` family (`vh`, `svh`, `lvh`, `dvh`, and `vmin`,
+  `vmax`, which depend on it) resolves against a **reference screen**: as wide as the frame
+  (`pageWidth`, the same for every participant) and 9/16 of that high, a 16:9 screen (551.25 px
+  for 980). Every viewer, presenter and followers included, gets the same layout, whatever the
+  window. `vw` already follows the frame's width and is left alone. The reporter rewrites the
+  page's CSS in place, `100vh` into `calc(100 * var(--artifacts-canvas-vh, 1vh))`, and sets the
+  variables on `<html>` in canvas mode; in native mode it removes them and the fallback is the
+  real unit. It covers the page's `<style>` sheets (rules in `@media`, `@supports`, `@layer`,
+  `@container`, nesting, `@keyframes`, `@import`), constructed and adopted sheets, rules added
+  later (a new `<style>`, `insertRule`, `replace`/`replaceSync`, a stylesheet `<link>` once loaded)
+  and inline `style` attributes as they are set. Strings, `url()` and selectors are not touched.
+  Not covered: a stylesheet from another origin (the opaque origin cannot read its rules), media
+  queries on the height or orientation, and scripts that read `window.innerHeight` (it stays the
+  frame's height, so scroll-position reveal scripts still see the whole page in view). Root
+  scroll snapping is off in canvas mode (the page never scrolls there).
+- **Reveal scripts.** Pages that fade sections in as they scroll into view hide them until an
+  `IntersectionObserver` reports them. In the frame, a cross-origin child of a transformed board,
+  an observer with the implicit root is measured against the wrapper's viewport, so most sections
+  never intersect and stay hidden on the board, in presentation mode and for followers. In canvas
+  mode the reporter's stand-in reports every observed target as fully intersecting
+  (`isIntersecting: true`, `intersectionRatio: 1`, its own rects) as soon as it is observed. In
+  native mode the browser's observer reports, and every target is observed again so the page gets
+  the real state at once. An observer with an explicit root (an element, or the document) measures
+  inside the page and is the browser's own.
+
 **Links.** The sandbox stays as it is: no `allow-same-origin`, no `allow-top-navigation`, no
 `allow-popups`. The frame cannot navigate the wrapper or open a window by itself; the wrapper
 does it for the user, in `client/src/artifact/links.ts`:
@@ -205,7 +236,7 @@ clamped):
 
 | Direction | Message |
 |---|---|
-| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'size', w, h}` content size, on load and on every resize |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'size', w, h, native}` content size, on load and on every resize; `native` is the mode it was measured in, and the wrapper drops a size of the other mode (a mode change still on its way). When the canvas is shown again the frame goes back to the last canvas-mode height, not the native page's |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'title', title}` |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'scroll', x, y}` the artifact tried to scroll: the wrapper pans there |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'link', href, newTab}` a link was clicked (`href` absolute, as the frame resolved it; `''` when over 4096 characters); see "Links" |

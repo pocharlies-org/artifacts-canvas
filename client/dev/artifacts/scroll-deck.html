@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scroll deck test page</title>
+<style>
+  /* A "deck" of full-screen sections, as generated presentations are often written: the root
+     font follows the screen (vw and vh), every section is at least one screen high and snaps,
+     and a script fades the sections in as they scroll into view. */
+  :root{--bg:#0b1220;--fg:#e8eef7;--muted:#9fb0c8;--accent:#5aa9ff}
+  html{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  body{margin:0}
+  @media (min-width:900px){
+    html{font-size:max(10.5px,min(calc(100vw / 90),calc(100vh / 56.25)));scroll-snap-type:y mandatory}
+  }
+  .scr{position:relative;min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;justify-content:center;
+    padding:3.2rem 4rem;box-sizing:border-box;scroll-snap-align:start;scroll-snap-stop:always;border-bottom:1px solid #1e2a3d}
+  .scr h2{font-size:3.4rem;line-height:1.05;margin:0 0 1rem}
+  .scr p{font-size:1.5rem;color:var(--muted);max-width:52rem;margin:0}
+  .kicker{font:600 1rem ui-monospace,Menlo,monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin-bottom:.8rem}
+  /* entrance animation: progressive enhancement, the hiding class is added last by the script */
+  .rv{transition:opacity .6s,transform .6s}
+  .js-anim .scr:not(.in) .rv{opacity:0;transform:translateY(1.2rem)}
+  #rail{position:fixed;right:.8rem;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:.5rem}
+  #rail a{display:block;width:.7rem;height:.7rem;border-radius:50%;background:#33445e}
+  #rail a.on{background:var(--accent)}
+  .tail{padding:3rem 4rem 5rem;font-size:15px;line-height:1.6;color:var(--muted)}
+  .tail h3{color:var(--fg);font-size:20px}
+</style>
+</head>
+<body>
+<nav id="rail" aria-label="Slides">
+  <a href="#s1" aria-label="Slide 1"></a><a href="#s2" aria-label="Slide 2"></a><a href="#s3" aria-label="Slide 3"></a>
+  <a href="#s4" aria-label="Slide 4"></a><a href="#s5" aria-label="Slide 5"></a><a href="#s6" aria-label="Slide 6"></a>
+</nav>
+<main>
+  <section class="scr" id="s1"><div class="kicker rv">Quarterly review</div><h2 class="rv">One deck, six screens</h2><p class="rv">Each section is one screen high and snaps into place.</p></section>
+  <section class="scr" id="s2"><div class="kicker rv">Part 2</div><h2 class="rv">What we run today</h2><p class="rv">The sections fade in as they scroll into view.</p></section>
+  <section class="scr" id="s3"><div class="kicker rv">Part 3</div><h2 class="rv">What it costs</h2><p class="rv">The root font follows the screen width and height.</p></section>
+  <section class="scr" id="s4"><div class="kicker rv">Part 4</div><h2 class="rv">What would change</h2><p class="rv">Arrow keys and the rail move between screens.</p></section>
+  <section class="scr" id="s5"><div class="kicker rv">Part 5</div><h2 class="rv">Risks</h2><p class="rv">Nothing here depends on the page's own height.</p></section>
+  <section class="scr" id="s6"><div class="kicker rv">Part 6</div><h2 class="rv">Decision</h2><p class="rv">The last screen before the notes.</p></section>
+</main>
+<footer class="tail" id="tail">
+  <h3>Notes</h3>
+  <p>Long notes after the last screen: they are not a section, do not snap and are never hidden.</p>
+  <p>Line 1 of the notes. Line 2 of the notes. Line 3 of the notes. Line 4 of the notes. Line 5 of the notes.</p>
+  <p>Line 6 of the notes. Line 7 of the notes. Line 8 of the notes. Line 9 of the notes. Line 10 of the notes.</p>
+  <p>Line 11 of the notes. Line 12 of the notes. Line 13 of the notes. Line 14 of the notes. Line 15 of the notes.</p>
+  <p>Line 16 of the notes. Line 17 of the notes. Line 18 of the notes. Line 19 of the notes. Line 20 of the notes.</p>
+  <p id="tail-end">End of the notes.</p>
+</footer>
+<script>
+(function () {
+  var root = document.documentElement;
+  var scrs = Array.prototype.slice.call(document.querySelectorAll('.scr'));
+  var dots = Array.prototype.slice.call(document.querySelectorAll('#rail a'));
+  function active() {
+    var mid = window.innerHeight / 2, k = 0;
+    scrs.forEach(function (s, i) { var r = s.getBoundingClientRect(); if (r.top <= mid) k = i; });
+    return k;
+  }
+  function mark() { var k = active(); dots.forEach(function (d, i) { d.classList.toggle('on', i === k); }); }
+  window.addEventListener('scroll', mark, { passive: true });
+  mark();
+  // arrow keys: the next or previous screen
+  window.addEventListener('keydown', function (e) {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    var k = Math.max(0, Math.min(scrs.length - 1, active() + (e.key === 'ArrowDown' ? 1 : -1)));
+    scrs[k].scrollIntoView({ block: 'start' });
+    e.preventDefault();
+  });
+  // entrance animation: progressive enhancement. The class that hides things goes on last.
+  try {
+    if ('IntersectionObserver' in window && window.innerWidth >= 900) {
+      var io = new IntersectionObserver(function (es) {
+        es.forEach(function (en) { if (en.isIntersecting) en.target.classList.add('in'); });
+      }, { threshold: 0.1 });
+      scrs.forEach(function (s) { io.observe(s); });
+      scrs[0].classList.add('in');
+      root.classList.add('js-anim');
+    }
+  } catch (e) { root.classList.remove('js-anim'); scrs.forEach(function (s) { s.classList.add('in'); }); }
+})();
+</script>
+</body>
+</html>

@@ -464,9 +464,11 @@ export class Editor {
       this.layoutHidden();
     } else {
       this.hidden = false;
+      // the frame goes back to the canvas layout's height (the hidden page reported its own)
+      this.frame.setNative(false);
+      this.pageHeight = this.frame.height;
       this.page.style.width = `${this.pageWidth}px`;
       this.page.style.height = `${this.pageHeight}px`;
-      this.frame.setNative(false);
       this.frame.setInteractive(this.tool === 'interact');
       const cam = this.cameraBeforeHiding;
       this.cameraBeforeHiding = null;
