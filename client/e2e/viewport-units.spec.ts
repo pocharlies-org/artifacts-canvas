@@ -80,6 +80,11 @@ async function headingOnScreen(p: Page, id: string) {
 async function expectDeckOnBoard(p: Page) {
   // every section revealed (the transition has ended), one reference screen each, the font sane
   await expect.poll(async () => (await deck(p)).sections.every((s) => s.inClass && s.opacity.every((o) => o === 1))).toBe(true);
+  // the layout settles (after a mode change the frame goes back to its canvas size first)
+  await expect.poll(async () => {
+    const d = await deck(p);
+    return Math.abs(d.docH - (6 * REF_H + d.tailH)) < 4 && Math.abs((await pageHeight(p)) - d.docH) < 3;
+  }).toBe(true);
   const d = await deck(p);
   expect(d.jsAnim).toBe(true); // the page did hide them: the observer revealed them
   expect(d.sections).toHaveLength(6);
