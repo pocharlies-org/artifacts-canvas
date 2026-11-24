@@ -31,7 +31,10 @@
   var SOURCE = 'artifacts-canvas-reporter';
   var target = '*';
   try {
-    if (location.ancestorOrigins && location.ancestorOrigins.length) target = location.ancestorOrigins[0];
+    // The parent's origin where the browser says it. Firefox masks it as "null" (the frame's
+    // no-referrer policy), and postMessage throws on "null": every message was dropped there.
+    var ao = location.ancestorOrigins;
+    if (ao && ao.length && /^https?:\/\/[^/]+$/.test(String(ao[0]))) target = String(ao[0]);
   } catch (e) { /* ignore */ }
 
   function post(msg) {

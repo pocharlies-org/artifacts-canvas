@@ -94,6 +94,13 @@ Each fixed entry names its regression tests.
   the height are not, and scripts that read `window.innerHeight` still get the frame's full height
   (a fixed backdrop that positions itself from it spans the whole page); a deck that scrolls inside
   its own `100vh` container shows one screen of it, with its inner scrolling.
+- [x] **L-7 — In Firefox no message of the artifact reached the canvas (Medium).** The reporter posted
+  to the parent's origin from `location.ancestorOrigins`. Firefox now has it, but masks it as `"null"`
+  for a frame with `referrerpolicy="no-referrer"`, and `postMessage` throws on `"null"`: size, title,
+  background, links and snapshots were all dropped, so the frame stayed 900 px high and the export
+  had no page. Now the reporter takes `ancestorOrigins[0]` only when it is an http(s) origin, else
+  `*`, as in a browser without it (the messages carry nothing secret, protocol §3). Tests:
+  `client/e2e/viewport-units.spec.ts` runs in Firefox (the frame's title and size reach the wrapper).
 
 ## Review of the fv9 branch (security and QA)
 

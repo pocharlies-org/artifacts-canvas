@@ -99,6 +99,8 @@ async function expectDeckOnBoard(p: Page) {
 
 test('a scroll-snap deck: every section shows on the board, one reference screen high, with a sane font', async ({ browser }) => {
   const A = await open(browser, 'Ana', newRoom('deck-board'), { artifact: 'scroll-deck.html' });
+  // the reporter's messages reach the wrapper in every engine (Firefox masks ancestorOrigins as "null")
+  await expect.poll(() => A.page.evaluate(() => (window as any).__canvas.editor.frame.title)).toBe('Scroll deck test page');
   await expectDeckOnBoard(A.page);
   // the page cannot scroll in the frame (the camera pans it), snapping included
   const root = await frameOf(A.page).locator('html').evaluate((h) => ({ snap: getComputedStyle(h).scrollSnapType, overflow: getComputedStyle(h).overflowY, y: window.scrollY }));
