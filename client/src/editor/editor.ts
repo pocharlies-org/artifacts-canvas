@@ -13,7 +13,7 @@ import {
 } from '../collab/follow';
 import type { Notice } from '../collab/protocol';
 import { ArtifactFrame, type FrameReading, type FrameWheel } from '../artifact/frame';
-import { canvasUrl, classifyLink, linkContext, type LinkContext } from '../artifact/links';
+import { canvasUrl, classifyLink, downloadUrl, linkContext, type LinkContext } from '../artifact/links';
 import { DEFAULT_BOARD, isDark, opaque, toCss, type Rgba } from '../ui/theme';
 import { Renderer } from '../render/renderer';
 import {
@@ -551,6 +551,11 @@ export class Editor {
       window.open(a.url, '_blank', 'noopener,noreferrer');
       return;
     }
+    if (a.kind === 'download') {
+      const fileUrl = downloadUrl(a.key, this.links);
+      if (fileUrl) this.download(fileUrl);
+      return;
+    }
     const url = canvasUrl(a.key, this.links, new URLSearchParams(location.search), { presenting: this.presenting, dev: this.cfg.dev });
     if (newTab) {
       window.open(url, '_blank', 'noopener,noreferrer');
@@ -564,6 +569,20 @@ export class Editor {
   /** A full page load opens the other file's canvas (its own room, its own annotations). */
   navigate(url: string) {
     location.assign(url);
+  }
+
+  /**
+   * Save a file of the artifact and keep this page: an `<a download>` click starts the download
+   * with no navigation and no history entry, and a failed response (403, 404) leaves the page in
+   * place. The click runs in the caller's call stack, so it keeps the user gesture openLink checked.
+   */
+  download(url: string) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   }
 
   /** Follow the link of the artifact at a world point (the select tool's click on the page). */

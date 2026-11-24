@@ -9,6 +9,9 @@ import { RESERVED, encodePath, sanitizePath } from '../config';
  *   - another file of the artifact host (a relative link resolves to the frame route
  *     `/_canvas/_/frame/<key>`; an absolute link to the plain artifact URL or to a canvas URL
  *     works too): this tab opens the canvas of that file, so its annotations follow per page;
+ *   - a non-HTML file of the artifact (the last path segment has an extension other than
+ *     `html` or `htm`; a path ending in `/` is a page): the file is saved and this tab stays on
+ *     its page (`download`, see `downloadUrl`);
  *   - another page, http or https only: a new tab, `noopener,noreferrer`;
  *   - anything else (`javascript:`, `data:`, `blob:`, `file:`, `mailto:`, user:password URLs,
  *     an unparsable or over-long URL): blocked.
@@ -31,6 +34,7 @@ export interface LinkContext {
 
 export type LinkAction =
   | { kind: 'canvas'; key: string }
+  | { kind: 'download'; key: string }
   | { kind: 'external'; url: string }
   | { kind: 'blocked'; reason: 'invalid' | 'scheme' | 'credentials' | 'reserved' };
 
@@ -72,20 +76,52 @@ export function classifyLink(href: unknown, ctx: LinkContext): LinkAction {
   } catch {
     return { kind: 'blocked', reason: 'invalid' };
   }
+  // the keys of the first three branches are relative to the artifact base (no base: no download)
+  const relative = ctx.artifactBase !== null;
   const frame = ctx.prefix + RESERVED + 'frame/';
-  if (path.startsWith(frame)) return canvasKey(path.slice(frame.length));
+  if (path.startsWith(frame)) return canvasKey(path.slice(frame.length), relative);
   // the canvas's own routes other than the frame (bundle, socket): nothing to open
   if (path.startsWith(ctx.prefix + RESERVED) || path + '/' === ctx.prefix + RESERVED) return { kind: 'blocked', reason: 'reserved' };
-  if (path.startsWith(ctx.canvasBase)) return canvasKey(path.slice(ctx.canvasBase.length));
-  if (path.startsWith(ctx.prefix)) return canvasKey(path.slice(ctx.prefix.length));
-  if (ctx.artifactBase && path.startsWith(ctx.artifactBase)) return canvasKey(path.slice(ctx.artifactBase.length));
+  if (path.startsWith(ctx.canvasBase)) return canvasKey(path.slice(ctx.canvasBase.length), relative);
+  // a canvas URL of another bucket: its key is not relative to this artifact base
+  if (path.startsWith(ctx.prefix)) return canvasKey(path.slice(ctx.prefix.length), false);
+  if (ctx.artifactBase && path.startsWith(ctx.artifactBase)) return canvasKey(path.slice(ctx.artifactBase.length), true);
   // another page of this host that is not an artifact: as the plain artifact link would, a new tab
   return { kind: 'external', url: url.href };
 }
 
-function canvasKey(rest: string): LinkAction {
+/**
+ * The action for a key under a base. `relative`: the key is relative to the artifact base, so a
+ * non-HTML file of it is a download. A path ending in `/` is a page, never a file.
+ */
+function canvasKey(rest: string, relative: boolean): LinkAction {
   const key = sanitizePath(rest);
-  return key ? { kind: 'canvas', key } : { kind: 'blocked', reason: 'invalid' };
+  if (!key) return { kind: 'blocked', reason: 'invalid' };
+  if (relative && !rest.endsWith('/') && isDownloadKey(key)) return { kind: 'download', key };
+  return { kind: 'canvas', key };
+}
+
+/**
+ * Is `key` a non-HTML file? Its last path segment has an extension: a `.` that is neither the
+ * first nor the last character, and an extension other than `html` or `htm` (any case). Keys
+ * without one (`README`), dot files (`.hidden`) and pages (`Report.HTML`) stay canvas pages.
+ */
+export function isDownloadKey(key: string): boolean {
+  const name = key.slice(key.lastIndexOf('/') + 1);
+  const dot = name.lastIndexOf('.');
+  if (dot <= 0 || dot === name.length - 1) return false;
+  const ext = name.slice(dot + 1).toLowerCase();
+  return ext !== 'html' && ext !== 'htm';
+}
+
+/**
+ * The plain URL of a `download` key: the artifact base plus the sanitised, encoded key, with no
+ * query and no fragment. Null when the context has no artifact base (classifyLink makes no
+ * download then).
+ */
+export function downloadUrl(key: string, ctx: LinkContext): string | null {
+  if (ctx.artifactBase === null) return null;
+  return ctx.artifactBase + encodePath(sanitizePath(key));
 }
 
 /** Query parameters a canvas page hands to the next one (`canvas`: a forced shown/hidden stays forced). */

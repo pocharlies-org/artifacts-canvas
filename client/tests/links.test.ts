@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { MAX_LINK_LENGTH, canvasUrl, classifyLink, linkContext } from '../src/artifact/links';
+import { downloadUrl, isDownloadKey } from '../src/artifact/links';
 
 const ORIGIN = 'https://artifacts.example.com';
 // the core's link shape: /_canvas/<bucket>/<key>
@@ -115,5 +116,74 @@ describe('canvas URL of a link', () => {
 
   it('the key is sanitised again', () => {
     expect(canvasUrl('../../x/./y.html', ctx, new URLSearchParams(), { presenting: false, dev: false })).toBe('/_canvas/artifacts/x/y.html');
+  });
+});
+
+describe('download links: a non-HTML file of the artifact is saved and the page stays', () => {
+  it('a file of the artifact downloads under its key, whichever of the three URL shapes it came by', () => {
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/x.zip`, ctx)).toEqual({ kind: 'download', key: 'u/run-1/x.zip' });
+    expect(classifyLink(`${ORIGIN}/artifacts/u/run-1/x.zip`, ctx)).toEqual({ kind: 'download', key: 'u/run-1/x.zip' });
+    expect(classifyLink(`${ORIGIN}/_canvas/artifacts/u/run-1/data.csv`, ctx)).toEqual({ kind: 'download', key: 'u/run-1/data.csv' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/archive.tar.gz`, ctx)).toEqual({ kind: 'download', key: 'u/run-1/archive.tar.gz' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/pic.PNG`, ctx)).toEqual({ kind: 'download', key: 'u/run-1/pic.PNG' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/x.zip?v=1#a`, ctx)).toEqual({ kind: 'download', key: 'u/run-1/x.zip' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/page%20two.pdf`, ctx)).toEqual({ kind: 'download', key: 'u/run-1/page two.pdf' });
+  });
+
+  it('traversal stays under the artifact base, encoded or not', () => {
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/%2e%2e/x.zip`, ctx)).toEqual({ kind: 'download', key: 'x.zip' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/a%2F..%2F..%2Fb.zip`, ctx)).toEqual({ kind: 'download', key: 'u/a/b.zip' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/../x.zip`, ctx)).toEqual({ kind: 'download', key: 'u/x.zip' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/../../../x.zip`, ctx)).toEqual({ kind: 'blocked', reason: 'reserved' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/../../../../../etc/x.zip`, ctx)).toEqual({ kind: 'external', url: `${ORIGIN}/etc/x.zip` });
+  });
+
+  it('pages and other keys stay canvas pages: .html, .htm, no extension, a path ending in /, dot files', () => {
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/Report.HTML`, ctx)).toEqual({ kind: 'canvas', key: 'Report.HTML' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/page.htm`, ctx)).toEqual({ kind: 'canvas', key: 'u/run-1/page.htm' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/README`, ctx)).toEqual({ kind: 'canvas', key: 'u/run-1/README' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/`, ctx)).toEqual({ kind: 'canvas', key: 'u/run-1' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/x.zip/`, ctx)).toEqual({ kind: 'canvas', key: 'u/run-1/x.zip' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/.hidden`, ctx)).toEqual({ kind: 'canvas', key: 'u/run-1/.hidden' });
+    expect(classifyLink(`${ORIGIN}/_canvas/_/frame/u/run-1/x.`, ctx)).toEqual({ kind: 'canvas', key: 'u/run-1/x.' });
+  });
+
+  it('the other branches keep their result: another bucket, and the plain context without an artifact base', () => {
+    expect(classifyLink(`${ORIGIN}/_canvas/pub/x/y.zip`, ctx)).toEqual({ kind: 'canvas', key: 'pub/x/y.zip' });
+    expect(classifyLink('http://127.0.0.1:5180/_canvas/_/frame/x.zip', plain)).toEqual({ kind: 'canvas', key: 'x.zip' });
+    expect(classifyLink('http://127.0.0.1:5180/_canvas/x.zip', plain)).toEqual({ kind: 'canvas', key: 'x.zip' });
+  });
+
+  it('external and blocked links do not change: the gate and sign-in routes, other hosts, data:, blob:, credentials', () => {
+    expect(classifyLink(`${ORIGIN}/_gate/x.zip`, ctx)).toEqual({ kind: 'external', url: `${ORIGIN}/_gate/x.zip` });
+    expect(classifyLink(`${ORIGIN}/oauth2-artifacts/x.zip`, ctx)).toEqual({ kind: 'external', url: `${ORIGIN}/oauth2-artifacts/x.zip` });
+    expect(classifyLink('https://evil.example.com/x.zip', ctx)).toEqual({ kind: 'external', url: 'https://evil.example.com/x.zip' });
+    expect(classifyLink('https://artifacts.example.com.evil.example/x.zip', ctx)).toEqual({ kind: 'external', url: 'https://artifacts.example.com.evil.example/x.zip' });
+    expect(classifyLink('data:application/zip;base64,UEs=', ctx)).toEqual({ kind: 'blocked', reason: 'scheme' });
+    expect(classifyLink(`blob:${ORIGIN}/x.zip`, ctx)).toEqual({ kind: 'blocked', reason: 'scheme' });
+    expect(classifyLink(`https://user:pass@artifacts.example.com/artifacts/u/run-1/x.zip`, ctx)).toEqual({ kind: 'blocked', reason: 'credentials' });
+    expect(classifyLink('//evil.example.com/x.zip', ctx)).toEqual({ kind: 'blocked', reason: 'invalid' });
+  });
+
+  it('downloadUrl: the artifact base and the encoded, sanitised key, no query and no fragment; none without a base', () => {
+    expect(downloadUrl('u/run-1/x.zip', ctx)).toBe('/artifacts/u/run-1/x.zip');
+    expect(downloadUrl('u/run-1/my file é.zip', ctx)).toBe('/artifacts/u/run-1/my%20file%20%C3%A9.zip');
+    expect(downloadUrl('u/x.zip?v=1#a', ctx)).toBe('/artifacts/u/x.zip%3Fv%3D1%23a');
+    expect(downloadUrl('../../u/./x.zip', ctx)).toBe('/artifacts/u/x.zip');
+    expect(downloadUrl('u/run-1/x.zip', plain)).toBeNull();
+  });
+
+  it('isDownloadKey: one definition, case-insensitive, only the last segment counts', () => {
+    expect(isDownloadKey('x.zip')).toBe(true);
+    expect(isDownloadKey('u/run-1/archive.tar.gz')).toBe(true);
+    expect(isDownloadKey('u/run-1/pic.PNG')).toBe(true);
+    expect(isDownloadKey('a.html')).toBe(false);
+    expect(isDownloadKey('a.HTM')).toBe(false);
+    expect(isDownloadKey('a.Html')).toBe(false);
+    expect(isDownloadKey('README')).toBe(false);
+    expect(isDownloadKey('u/run-1/')).toBe(false);
+    expect(isDownloadKey('.zip')).toBe(false);
+    expect(isDownloadKey('x.')).toBe(false);
+    expect(isDownloadKey('v1.2/README')).toBe(false);
   });
 });
