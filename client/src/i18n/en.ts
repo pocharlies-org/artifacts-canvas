@@ -41,6 +41,8 @@ export const en: Record<MessageKey, string> = {
   'app.notice.closed': 'Connection closed by the server ({code}).',
   'app.avatars.more': 'And {n} more: {names}',
   'app.panels.people': 'People and styles',
+  'app.panels.left': 'People and history',
+  'app.panels.right': 'Styles',
   'app.you': '(you)',
 
   'people.title': 'Who drew',

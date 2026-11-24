@@ -32,11 +32,14 @@ export function buildChrome(ed: Editor, root: HTMLElement, visibility?: Visibili
   const bottomRow = h('div', { class: 'bottomrow' });
   bottomRow.append(bottomLeft(ed), toolbar(ed), minimapPanel(ed));
 
+  const people = peoplePanel(ed);
+  const style = stylePanel(ed);
   root.append(
     topLeft(ed),
     topRight(ed, visibility),
-    peoplePanel(ed),
-    stylePanel(ed),
+    people,
+    style,
+    ...autoHideSides(ed, people, style),
     bottomRow,
     banner(ed),
   );
@@ -229,6 +232,94 @@ function topRight(ed: Editor, visibility?: VisibilityControl): HTMLElement {
     h('span', { class: 'anchor' }, exportBtn, exportMenu));
 }
 
+// ------------------------------------------------------------------ side panels: shown at their edge
+
+/** The pointer this close to the left or right edge of the screen brings that side's panel. */
+export const EDGE_PX = 24;
+/** A side panel goes this long after the pointer left it (or its edge). */
+export const SIDE_HIDE_MS = 1000;
+
+/**
+ * A desktop shows the page edge to edge: the side panels (who is here and drew, on the left; the
+ * style, on the right) are hidden and overlay the page when they show. A side shows when the mouse
+ * comes within EDGE_PX of its screen edge or over its handle (a thin tab at the edge), stays while
+ * the pointer is on it, and goes SIDE_HIDE_MS after the pointer left. A tap (or click) on a handle
+ * toggles that side, for touch screens. The style panel also shows while shapes are selected, so a
+ * selection can be styled at once. A phone keeps its ☰ drawers (styles.css): the handles and the
+ * edge do nothing there. Presentation mode and the hidden canvas hide both, as before.
+ */
+function autoHideSides(ed: Editor, left: HTMLElement, right: HTMLElement): HTMLElement[] {
+  interface Side { panel: HTMLElement; handle: HTMLElement; hovered: boolean; pinned: boolean; timer: number }
+  const mk = (panel: HTMLElement, side: 'left' | 'right'): Side => ({
+    panel,
+    handle: h('button', { class: `edge-handle ${side}`, 'data-testid': `edge-${side}`, type: 'button',
+      title: t(side === 'left' ? 'app.panels.left' : 'app.panels.right'), 'aria-label': t(side === 'left' ? 'app.panels.left' : 'app.panels.right'), 'aria-expanded': 'false' }),
+    hovered: false, pinned: false, timer: 0,
+  });
+  const L = mk(left, 'left');
+  const R = mk(right, 'right');
+  const desktop = () => window.innerWidth > 760;
+  const wanted = (s: Side) => s.hovered || s.pinned || (s === R && ed.selection.size > 0);
+  const set = (s: Side, on: boolean) => {
+    s.panel.classList.toggle('shown', on);
+    s.handle.classList.toggle('open', on);
+    s.handle.setAttribute('aria-expanded', String(on));
+  };
+  const show = (s: Side) => {
+    clearTimeout(s.timer);
+    s.timer = 0;
+    set(s, true);
+  };
+  const hideSoon = (s: Side) => {
+    clearTimeout(s.timer);
+    s.timer = window.setTimeout(() => {
+      s.timer = 0;
+      if (!wanted(s)) set(s, false);
+    }, SIDE_HIDE_MS);
+  };
+  /** The pointer came to the edge (or the handle): show, and go unless it moves onto the panel. */
+  const reveal = (s: Side) => {
+    show(s);
+    if (!wanted(s)) hideSoon(s);
+  };
+  for (const s of [L, R]) {
+    s.panel.addEventListener('pointerenter', (e) => {
+      if (e.pointerType !== 'mouse' || !s.panel.classList.contains('shown')) return;
+      s.hovered = true;
+      show(s);
+    });
+    s.panel.addEventListener('pointerleave', (e) => {
+      if (e.pointerType !== 'mouse') return;
+      s.hovered = false;
+      hideSoon(s);
+    });
+    s.handle.addEventListener('pointerenter', (e) => {
+      if (e.pointerType === 'mouse' && !e.buttons) reveal(s);
+    });
+    // a tap (or a click) toggles the side and keeps it until the next one
+    s.handle.addEventListener('click', () => {
+      s.pinned = !s.pinned;
+      if (s.pinned) show(s);
+      else {
+        s.hovered = false;
+        set(s, wanted(s));
+      }
+    });
+  }
+  // near an edge, with no button pressed (not while drawing a stroke there)
+  window.addEventListener('pointermove', (e) => {
+    if (e.pointerType !== 'mouse' || e.buttons || !desktop() || document.body.classList.contains('present-mode')) return;
+    if (e.clientX <= EDGE_PX) reveal(L);
+    else if (e.clientX >= window.innerWidth - EDGE_PX) reveal(R);
+  }, { passive: true, capture: true });
+  // the style panel while something is selected (to style it), then as usual
+  ed.on('selection', () => {
+    if (ed.selection.size) show(R);
+    else if (!wanted(R)) hideSoon(R);
+  });
+  return [L.handle, R.handle];
+}
+
 // ------------------------------------------------------------------ left: who drew + history
 
 function peoplePanel(ed: Editor): HTMLElement {
@@ -296,7 +387,7 @@ function peoplePanel(ed: Editor): HTMLElement {
   ed.on('identity', updateHere);
   render();
   renderHere();
-  return h('div', { class: 'panel people side' }, h('h4', {}, t('people.now')), here,
+  return h('div', { class: 'panel people side', 'data-testid': 'people-panel' }, h('h4', {}, t('people.now')), here,
     h('h4', { style: 'margin-top:10px' }, t('people.title')), rows,
     h('div', { class: 'history' }, h('h4', { style: 'margin-top:10px' }, t('history.title')), hist));
 }
@@ -383,7 +474,7 @@ function bottomLeft(ed: Editor): HTMLElement {
   ed.doc.undoManager.on('stack-item-added', update);
   ed.doc.undoManager.on('stack-item-popped', update);
   update();
-  return h('div', { class: 'panel bottomleft' }, undo, redo, h('div', { class: 'sep' }),
+  return h('div', { class: 'panel bottomleft', 'data-testid': 'bottom-left' }, undo, redo, h('div', { class: 'sep' }),
     h('button', { class: 'tool', 'data-tip': t('ctl.zoomOut'), 'aria-label': t('ctl.zoomOut'), 'data-testid': 'zoom-out', onclick: () => ed.zoomBy(-1) }, '−'),
     pct,
     h('button', { class: 'tool', 'data-tip': t('ctl.zoomIn'), 'aria-label': t('ctl.zoomIn'), 'data-testid': 'zoom-in', onclick: () => ed.zoomBy(1) }, '+'),
@@ -392,7 +483,7 @@ function bottomLeft(ed: Editor): HTMLElement {
 }
 
 function minimapPanel(ed: Editor): HTMLElement {
-  const panel = h('div', { class: 'panel bottomright', title: t('ctl.minimap') });
+  const panel = h('div', { class: 'panel bottomright', 'data-testid': 'minimap-panel', title: t('ctl.minimap') });
   const inner = h('div', { class: 'mini' });
   panel.append(inner);
   new Minimap(ed, inner);

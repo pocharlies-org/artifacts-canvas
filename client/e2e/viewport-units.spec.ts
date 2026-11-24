@@ -80,6 +80,11 @@ async function headingOnScreen(p: Page, id: string) {
 async function expectDeckOnBoard(p: Page) {
   // every section revealed (the transition has ended), one reference screen each, the font sane
   await expect.poll(async () => (await deck(p)).sections.every((s) => s.inClass && s.opacity.every((o) => o === 1))).toBe(true);
+  // the layout settles (after a mode change the frame goes back to its canvas size first)
+  await expect.poll(async () => {
+    const d = await deck(p);
+    return Math.abs(d.docH - (6 * REF_H + d.tailH)) < 4 && Math.abs((await pageHeight(p)) - d.docH) < 3;
+  }).toBe(true);
   const d = await deck(p);
   expect(d.jsAnim).toBe(true); // the page did hide them: the observer revealed them
   expect(d.sections).toHaveLength(6);
@@ -139,6 +144,55 @@ test('presentation mode shows the sections, and a follower in a smaller window g
   expect(db.fontSize).toBe(da.fontSize);
   expect(db.sections.map((s) => [s.top, s.h])).toEqual(da.sections.map((s) => [s.top, s.h]));
   expect(db.sections.every((s) => s.inClass && s.opacity.every((o) => o === 1))).toBe(true);
+  await A.page.keyboard.press('Escape');
+  await A.close();
+  await B.close();
+});
+
+test("a deck's own navigation (arrow keys, scrollIntoView) moves the camera, not the canvas under it, and the followers follow", async ({ browser, browserName }) => {
+  const room = newRoom('deck-nav');
+  const A = await open(browser, 'Ana', room, { artifact: 'scroll-deck.html' });
+  const B = await open(browser, 'Marta', room, { artifact: 'scroll-deck.html', viewport: { width: 1024, height: 640 } });
+  await A.page.getByTestId('present').click();
+  await expect(B.page.getByTestId('banner-text')).toHaveText('Ana está presentando');
+  await expectDeckOnBoard(A.page);
+  const state = (p: Page) => p.evaluate(() => {
+    const e = (window as any).__canvas.editor;
+    const v = e.visibleWorld();
+    return { stage: [e.stage.scrollLeft, e.stage.scrollTop], top: v.y, cx: v.x + v.w / 2, cy: v.y + v.h / 2 };
+  });
+  const before = await state(A.page);
+  // the presenter uses the page: a click in it, then the deck's own key
+  await A.page.getByTestId('present-tool-interact').click();
+  await frameOf(A.page).locator('#s1 p').click();
+  await A.page.keyboard.press('ArrowDown');
+  if (browserName === 'webkit') {
+    // WebKit keeps the scrollIntoView of a cross-origin frame inside the frame: nothing reaches the
+    // canvas, so nothing moves (the deck's arrows do nothing there), and nothing is out of step
+    await A.page.waitForTimeout(1500);
+    const st = await state(A.page);
+    expect(st.stage).toEqual([0, 0]);
+    expect(st.top).toBeCloseTo(before.top, 1);
+    await A.close();
+    await B.close();
+    return;
+  }
+  // the deck scrolls the next screen into view: the scroll reaches the stage, and becomes a camera move
+  const s5 = await frameOf(A.page).locator('#s5').evaluate((el) => el.getBoundingClientRect().top + window.scrollY);
+  await expect.poll(async () => {
+    const st = await state(A.page);
+    return st.stage[0] === 0 && st.stage[1] === 0 && Math.abs(st.top - s5) < 3;
+  }).toBe(true);
+  expect((await state(A.page)).top).not.toBe(before.top);
+  // what the presenter sees is where the camera is: the fifth heading at the top of the screen
+  const h = (await frameOf(A.page).locator('#s5 h2').boundingBox())!;
+  expect(h.y).toBeGreaterThanOrEqual(0);
+  expect(h.y).toBeLessThan(A.page.viewportSize()!.height / 2);
+  // the follower sees the same part of the page, and its own canvas did not scroll
+  await expect.poll(async () => {
+    const [a, b] = [await state(A.page), await state(B.page)];
+    return Math.abs(a.cx - b.cx) < 2 && Math.abs(a.cy - b.cy) < 2 && b.stage[0] === 0 && b.stage[1] === 0;
+  }).toBe(true);
   await A.page.keyboard.press('Escape');
   await A.close();
   await B.close();

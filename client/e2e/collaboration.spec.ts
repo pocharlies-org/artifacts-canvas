@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { camera, drawStroke, dragBox, newRoom, open, shapes, wave } from './helpers';
+import { camera, drawStroke, dragBox, newRoom, open, shapes, showSide, wave } from './helpers';
 
 test('a stroke drawn in A appears in B before the mouse is released', async ({ browser }) => {
   const room = newRoom('live');
@@ -58,6 +58,7 @@ test('attribution: names, counts, tags, hover card and history are right', async
   await expect(card).toContainText('editado por Marta');
 
   // the eye toggle hides Marta's shapes in my view only
+  await showSide(A.page, 'left'); // the people panel comes at its screen edge (ui/chrome.ts)
   await A.page.locator('[data-testid="author-row"]', { hasText: 'Marta' }).getByTestId('author-eye').click();
   await expect(A.page.locator('svg.shapes g[data-shape-type="geo"]')).toHaveCount(1);
   await expect(B.page.locator('svg.shapes g[data-shape-type="geo"]')).toHaveCount(2);

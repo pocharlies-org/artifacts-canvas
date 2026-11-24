@@ -54,8 +54,10 @@ test('a first visit opens hidden; the toggle shows and hides the canvas and is r
   // shown
   await p.getByTestId('canvas-show').click();
   await expect.poll(async () => (await state(p)).bodyHidden).toBe(false);
+  // the page as wide as the view (it does not shrink; e2e/chrome-ui.spec.ts), laid out at the room's 980
+  await expect.poll(async () => Math.round((await state(p)).frame.w)).toBe(s.view.w);
   s = await state(p);
-  expect(s.frame.w).toBe(980);
+  expect(await p.evaluate(() => (window as any).__canvas.editor.frame.el.style.width)).toBe('980px');
   expect(s.frame.scrolling).toBe('no');
   await expect(p.getByTestId('toolbar')).toBeVisible();
   await expect(p.getByTestId('canvas-show')).toBeHidden();

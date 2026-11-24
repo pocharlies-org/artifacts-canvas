@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { expect, test } from '@playwright/test';
-import { dragBox, newRoom, open } from './helpers';
+import { dragBox, newRoom, open, showSide } from './helpers';
 
 test('export PNG and PDF of the current view and of the whole artifact', async ({ browser }) => {
   const A = await open(browser, 'Ana', newRoom('export'));
@@ -92,6 +92,7 @@ for (const dpr of [1, 2]) test(`PNG of the current view matches the visible view
   // a known camera: zoomed in to 150% and panned
   await page.evaluate(() => (window as any).__canvas.editor.setCamera({ z: 1.5, tx: -260, ty: -180 }));
   // a solid violet rectangle at a known screen position
+  await showSide(page, 'right'); // the style panel comes at its screen edge (ui/chrome.ts)
   await page.locator('.sw[data-color="violet"]').click();
   await page.getByTestId('seg-fill').locator('[data-value="solid"]').click();
   await page.keyboard.press('r');

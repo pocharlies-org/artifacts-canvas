@@ -39,6 +39,8 @@ export const es = {
   'app.notice.closed': 'Conexión cerrada por el servidor ({code}).',
   'app.avatars.more': 'Y {n} más: {names}',
   'app.panels.people': 'Personas y estilos',
+  'app.panels.left': 'Personas e historial',
+  'app.panels.right': 'Estilos',
   'app.you': '(tú)',
 
   'people.title': 'Quién ha dibujado',

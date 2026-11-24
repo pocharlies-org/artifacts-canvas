@@ -8,6 +8,12 @@
   --red: #e03131;
   /* the artifact's own background (the reporter says it; ui/theme.ts): the board takes it */
   --board: #ffffff;
+  /* Translucent chrome over the page (desktop: the side panels and the title bar). One knob: the
+     panel's background opacity, 0.2 = 80 % transparent. The blur and a light/dark shift of what is
+     behind keep the text legible on any page; the title bar is a little stronger. */
+  --chrome-alpha: .2;
+  --panel-rgb: 255, 255, 255;
+  --chrome-backdrop: blur(14px) saturate(1.3) brightness(1.12);
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; color: var(--ink); background: var(--board); overscroll-behavior: none; }
@@ -183,7 +189,7 @@ body.canvas-hidden .quiet-bar { display: flex; position: fixed; right: 12px; bot
 .quiet-link { color: #374151; padding: 0 10px 0 2px; white-space: nowrap; }
 
 /* ---------- dark artifacts: dark chrome (body.theme-dark, from the artifact's background) ---------- */
-body.theme-dark { --ink: #e5e7eb; --muted: #9ca3af; --line: #374151; --panel: #1f2937; }
+body.theme-dark { --ink: #e5e7eb; --muted: #9ca3af; --line: #374151; --panel: #1f2937; --panel-rgb: 31, 41, 55; --chrome-backdrop: blur(14px) saturate(1.3) brightness(.62); }
 body.theme-dark .panel { box-shadow: 0 2px 12px rgba(0,0,0,.55); border: 1px solid #374151; }
 body.theme-dark .page { box-shadow: none; }
 body.theme-dark .pill { background: #374151; color: #e5e7eb; }
@@ -215,6 +221,30 @@ body.theme-dark .present-badge, body.theme-dark .present-controls { border: 1px 
 body.theme-dark.canvas-hidden .quiet-bar { background: rgba(31,41,55,.94); box-shadow: 0 2px 12px rgba(0,0,0,.6); border: 1px solid #4b5563; }
 body.theme-dark .quiet-people, body.theme-dark .quiet-link { color: #e5e7eb; }
 body.theme-dark .prow.annotating .tag { color: #4ade80; }
+
+/* ---------- desktop: the page edge to edge, the side panels at their edge, translucent ---------- */
+.edge-handle { display: none; }
+@media (min-width: 761px) {
+  /* hidden until the pointer comes to their edge (ui/chrome.ts autoHideSides); they overlay the page */
+  .side { opacity: 0; visibility: hidden; transition: opacity .16s ease, transform .16s ease, visibility 0s linear .16s; }
+  .people.side { transform: translateX(-10px); }
+  .stylepanel.side { transform: translateX(10px); }
+  .side.shown { opacity: 1; visibility: visible; transform: none; transition: opacity .16s ease, transform .16s ease, visibility 0s; }
+  .side, .topleft { -webkit-backdrop-filter: var(--chrome-backdrop); backdrop-filter: var(--chrome-backdrop); }
+  .side { background: rgba(var(--panel-rgb), var(--chrome-alpha)); text-shadow: 0 0 3px rgba(var(--panel-rgb), .85); }
+  .topleft { background: rgba(var(--panel-rgb), calc(var(--chrome-alpha) + .15)); }
+  body.theme-dark .side, body.theme-dark .topleft { border-color: rgba(255, 255, 255, .14); }
+  .side .seg, .side .btn { background: rgba(var(--panel-rgb), .35); }
+  /* the handles: a thin tab on each edge (a touch screen taps it; a mouse only comes near) */
+  .edge-handle { display: block; position: absolute; top: 50%; width: 12px; height: 96px; margin-top: -48px; z-index: 33; border: 0; padding: 0; background: none; cursor: pointer; }
+  .edge-handle.left { left: 0; }
+  .edge-handle.right { right: 0; }
+  .edge-handle::after { content: ""; position: absolute; top: 20px; bottom: 20px; width: 4px; border-radius: 4px; background: rgba(var(--panel-rgb), .7); box-shadow: 0 0 0 1px rgba(0, 0, 0, .12); }
+  .edge-handle.left::after { left: 3px; }
+  .edge-handle.right::after { right: 3px; }
+  .edge-handle.open::after { opacity: 0; }
+}
+body.present-mode .edge-handle, body.canvas-hidden .edge-handle { display: none !important; }
 
 /* ---------- narrow screens (phones) ---------- */
 @media (max-width: 760px) {

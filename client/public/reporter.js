@@ -450,12 +450,88 @@
   try { installIO(); } catch (e) { /* the page keeps the browser's observer */ }
   try { installUnits(); } catch (e) { /* the page keeps the real units */ }
 
+  // ---- reading position (docs/protocol.md §3 "Reading position") ----
+  // While the page is shown as itself (native mode) the reporter keeps the block the user is
+  // reading: the block at the upper part of the view, its box on the screen. When the canvas comes
+  // back, it says where that block is in the canvas layout and how wide, so the wrapper can put it
+  // at the same place and the same size on the screen: showing the canvas never shrinks the page.
+  var reading = null;
+  var noteTimer = 0;
+
+  /** The nearest block box at (x, y) narrower than the view, not in a fixed or sticky layer, or null. */
+  function blockAt(x, y) {
+    var hit = document.elementFromPoint(x, y);
+    var block = null;
+    for (var n = hit; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+      var cs = window.getComputedStyle(n);
+      if (cs.position === 'fixed' || cs.position === 'sticky') return null;
+      if (block || !/^(block|flex|grid|list-item|table|flow-root)$/.test(cs.display)) continue;
+      var r = n.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && r.width < window.innerWidth * 0.98) block = n;
+    }
+    return block;
+  }
+
+  function noteReading() {
+    noteTimer = 0;
+    if (!native) return;
+    // the first block from the upper part of the view down (a full-width section or its empty
+    // padding is no block: further down there is text)
+    var w = window.innerWidth;
+    var el = null;
+    for (var f = 0.12; f < 0.75 && !el; f += 0.04) {
+      var y = Math.max(1, window.innerHeight * f);
+      el = blockAt(w * 0.5, y) || blockAt(w * 0.35, y) || blockAt(w * 0.65, y);
+    }
+    var r = el ? el.getBoundingClientRect() : null;
+    reading = {
+      el: el, left: r ? r.left : 0, top: r ? r.top : 0, w: r ? r.width : w, vw: w,
+      sy: window.scrollY || 0, sh: document.documentElement.scrollHeight,
+    };
+  }
+
+  function scheduleNote() {
+    if (!noteTimer) noteTimer = setTimeout(noteReading, 150);
+  }
+
+  /** Canvas mode again: once its layout is in place, say where the block read in native mode is. */
+  function scheduleReading() {
+    var r0 = reading;
+    reading = null;
+    clearTimeout(noteTimer);
+    noteTimer = 0;
+    if (!r0) return;
+    var done = false;
+    var go = function () {
+      if (done) return;
+      done = true;
+      window.removeEventListener('resize', onResize);
+      if (native) return;
+      var msg = null;
+      if (r0.el && r0.el.isConnected) {
+        var b = r0.el.getBoundingClientRect();
+        if (b.width > 0) msg = { x: b.left + (window.scrollX || 0), y: b.top + (window.scrollY || 0), w: b.width, left: r0.left, top: r0.top, nw: r0.w };
+      }
+      // no block: the page's own width, at the same share of its height
+      if (!msg) msg = { x: 0, y: r0.sh > 0 ? (r0.sy / r0.sh) * document.documentElement.scrollHeight : 0, w: window.innerWidth, left: 0, top: 0, nw: r0.vw };
+      msg.type = 'reading';
+      post(msg);
+    };
+    var onResize = function () {
+      if (window.innerWidth !== r0.vw) setTimeout(go, 60);
+    };
+    window.addEventListener('resize', onResize);
+    if (window.innerWidth !== r0.vw) setTimeout(go, 60); // already laid out at the canvas width
+    setTimeout(go, 500); // the same width (a view as wide as the page): no resize comes
+  }
+
   function setNative(on) {
     var was = native;
     native = !!on;
     if (was !== native) {
       try { applyUnits(); } catch (e) { /* ignore */ }
       try { ioMode(); } catch (e) { /* ignore */ }
+      try { if (native) scheduleNote(); else scheduleReading(); } catch (e) { /* ignore */ }
     }
     if (!started) return;
     if (native) {
@@ -544,7 +620,10 @@
   }
 
   window.addEventListener('scroll', function () {
-    if (native) return; // the page scrolls itself
+    if (native) {
+      scheduleNote(); // the page scrolls itself; the reporter notes where it is read
+      return;
+    }
     var x = window.scrollX || 0;
     var y = window.scrollY || 0;
     if (x || y) {

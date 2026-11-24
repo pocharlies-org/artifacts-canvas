@@ -58,6 +58,21 @@ export interface FrameEvents {
   escape?: () => void;
   /** The artifact's background colour (checked: rgb(), rgba() or hex only). */
   background?: (c: Rgba) => void;
+  /** Where the hidden page was being read, said once the canvas layout is back (FrameReading). */
+  reading?: (r: FrameReading) => void;
+}
+
+/**
+ * A block of the page the user was reading while the canvas was hidden: its box on the screen then
+ * (left, top, width nw, screen px) and in the canvas layout now (x, y, width w, artifact px).
+ */
+export interface FrameReading {
+  x: number;
+  y: number;
+  w: number;
+  left: number;
+  top: number;
+  nw: number;
 }
 
 /** Most a wheel delta may say (one event); anything bigger is clamped. */
@@ -188,6 +203,21 @@ export class ArtifactFrame {
           this.el.style.height = `${nh}px`;
         }
         this.ev.size?.(this.width, nh);
+        return;
+      }
+      case 'reading': {
+        // sent once the canvas layout is back (canvas mode only); the editor takes it right after
+        // it showed the canvas, and it moves this tab's camera only
+        if (this.native) return;
+        if (![d.x, d.y, d.w, d.left, d.top, d.nw].every(finite)) return;
+        const w = d.w as number;
+        const nw = d.nw as number;
+        if (!(w > 0) || !(nw > 0)) return;
+        const c = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+        this.ev.reading?.({
+          x: c(d.x as number, 0, this.width), y: c(d.y as number, 0, this.height), w: Math.min(w, this.width),
+          left: c(d.left as number, -MAX_HEIGHT, MAX_HEIGHT), top: c(d.top as number, -MAX_HEIGHT, MAX_HEIGHT), nw: Math.min(nw, MAX_HEIGHT),
+        });
         return;
       }
       case 'title':
