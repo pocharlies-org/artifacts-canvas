@@ -187,6 +187,19 @@ own scripts, changes them in canvas mode only:
   a camera move once the scroll has stopped (200 ms): the stage goes back to 0 and the camera
   shows what the page scrolled to, so the presenter's viewport, and the followers with it, follow
   the deck. A tab that follows someone, or shows the page as itself, only puts the stage back.
+  WebKit keeps such a scroll inside the cross-origin frame: there the deck's own arrows move
+  nothing (its slide links still work, as anchors).
+
+**Reading position.** While the canvas is hidden (native mode) the reporter notes the block the
+user is reading: from 12 % of the view down, the first block box narrower than the view under the
+centre (or a third, or two thirds) of it, outside any fixed or sticky layer, with its box on the
+screen. When the canvas comes back and its layout is in place, the reporter posts where that block
+is now (`reading`: x, y, width in artifact px) and where it was (left, top, width on the screen).
+The wrapper takes it only within 3 s of showing the canvas, not while presenting or following, and
+sets the camera so the block keeps its place and its width: zoom = old width / new width, never
+wider than the view nor under 40 % of that. A page that fills its window fills the view; a page
+whose column has a fixed width keeps that width. With no block, the page's width and the same share
+of its height. It moves this tab's camera only.
 
 **Links.** The sandbox stays as it is: no `allow-same-origin`, no `allow-top-navigation`, no
 `allow-popups`. The frame cannot navigate the wrapper or open a window by itself; the wrapper
@@ -260,6 +273,7 @@ clamped):
 | wrapper → frame | `{source:'artifacts-canvas', type:'probe', id, x, y}` is there a link at (x, y)? Answered `{source:'artifacts-canvas-reporter', type:'probe', id, link}` |
 | wrapper → frame | `{source:'artifacts-canvas', type:'click', x, y, newTab}` follow the link at (x, y), if any (the select tool's click) |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'bg', color}` the page's background colour (see "Background") |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'reading', x, y, w, left, top, nw}` after the canvas is shown again: the block read in native mode, now at (x, y), w wide (artifact px), was at (left, top), nw wide on the screen; see "Reading position" |
 | wrapper → frame | `{source:'artifacts-canvas', type:'mode', native}` `native: true` while the canvas is hidden: the page scrolls on its own (and same-document anchors scroll it) instead of being held still; sent on the frame's first message and on every load |
 | wrapper → frame | `{source:'artifacts-canvas', type:'snapshot', id, rect:{x,y,w,h}, scale, lib}` export request; `lib` is the `vendorUrl` |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'snapshot', id, dataUrl, partial}` a `data:image/png` of `rect`, or `null` when the page could not be captured; `partial: true` when part of it could not be read (an image or a background that did not load is left blank) |
