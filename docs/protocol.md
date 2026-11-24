@@ -158,21 +158,27 @@ own scripts, changes them in canvas mode only:
   variables on `<html>` in canvas mode; in native mode it removes them and the fallback is the
   real unit. It covers the page's `<style>` sheets (rules in `@media`, `@supports`, `@layer`,
   `@container`, nesting, `@keyframes`, `@import`), constructed and adopted sheets, rules added
-  later (a new `<style>`, `insertRule`, `replace`/`replaceSync`, a stylesheet `<link>` once loaded)
-  and inline `style` attributes as they are set. Strings, `url()` and selectors are not touched.
-  Not covered: a stylesheet from another origin (the opaque origin cannot read its rules), media
-  queries on the height or orientation, and scripts that read `window.innerHeight` (it stays the
-  frame's height, so scroll-position reveal scripts still see the whole page in view). Root
-  scroll snapping is off in canvas mode (the page never scrolls there).
+  later (a new `<style>`, `insertRule`, `replace`/`replaceSync`) and inline `style` attributes as
+  they are set. Each declaration is rewritten on its own (`setProperty`, with its priority), never
+  the block's `cssText`, so the rest of a block stays as written. Strings, `url()` and selectors
+  are not touched. Not covered: a stylesheet loaded with `<link>` (from the opaque origin every
+  such file is another origin and its rules cannot be read; a self-contained artifact has none,
+  see known issues L-4), media queries on the height or orientation, the `vb` family, and scripts
+  that read `window.innerHeight` (it stays the frame's height, so scroll-position reveal scripts
+  still see the whole page in view). The page's scripts read the rewritten form back
+  (`el.style.height` is the `calc()` form). Root scroll snapping is off in canvas mode (the page
+  never scrolls there).
 - **Reveal scripts.** Pages that fade sections in as they scroll into view hide them until an
   `IntersectionObserver` reports them. In the frame, a cross-origin child of a transformed board,
   an observer with the implicit root is measured against the wrapper's viewport, so most sections
   never intersect and stay hidden on the board, in presentation mode and for followers. In canvas
   mode the reporter's stand-in reports every observed target as fully intersecting
-  (`isIntersecting: true`, `intersectionRatio: 1`, its own rects) as soon as it is observed. In
-  native mode the browser's observer reports, and every target is observed again so the page gets
-  the real state at once. An observer with an explicit root (an element, or the document) measures
-  inside the page and is the browser's own.
+  (`isIntersecting: true`, `intersectionRatio: 1`, its own rects) right after the task that
+  observed it, once per canvas-mode period (a callback that observes its target again, an
+  infinite-scroll sentinel, is not told again in a loop). In native mode the browser's observer
+  reports, and every target is observed again so the page gets the real state at once. An
+  observer with an explicit root (an element, or the document) measures inside the page: the
+  constructor returns the browser's own observer for it.
 
 **Links.** The sandbox stays as it is: no `allow-same-origin`, no `allow-top-navigation`, no
 `allow-popups`. The frame cannot navigate the wrapper or open a window by itself; the wrapper

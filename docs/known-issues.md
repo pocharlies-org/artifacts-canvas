@@ -90,8 +90,9 @@ Each fixed entry names its regression tests.
   measured in the other mode is dropped, and showing the canvas again puts the frame back at its
   canvas height (the native page's height had stuck). Tests: `client/e2e/viewport-units.spec.ts`
   (Chromium, Firefox and WebKit) with `client/dev/artifacts/scroll-deck.html` and
-  `viewport-units.html`. Left: a stylesheet from another origin is not rewritten, media queries on
-  the height are not, and scripts that read `window.innerHeight` still get the frame's full height
+  `viewport-units.html`. Left: a stylesheet loaded with `<link>` is not rewritten (from the opaque
+  origin its rules cannot be read), media queries on the height are not, and scripts that read
+  `window.innerHeight` still get the frame's full height
   (a fixed backdrop that positions itself from it spans the whole page); a deck that scrolls inside
   its own `100vh` container shows one screen of it, with its inner scrolling.
 - [x] **L-7 — In Firefox no message of the artifact reached the canvas (Medium).** The reporter posted

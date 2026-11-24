@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <title>Viewport units test page</title>
 <style>
+  :root{--grad:linear-gradient(rgb(255, 0, 0), rgb(0, 0, 255));--m:7px;--bd:3px solid rgb(255, 0, 0)}
   body{margin:0;font-family:sans-serif}
   .box{background:#cfe3ff;margin:0 0 4px;width:200px}
   #sheet{height:10vh}
@@ -21,6 +22,13 @@
   @keyframes drop{from{transform:translateY(10vh)}to{transform:translateY(10vh)}}
   #kf{height:10px;animation:drop 1000s linear infinite paused}
   @layer base{ #layer{height:6vh} }
+  /* a shorthand from var() overridden by one of its longhands, next to a unit: the shorthand stays */
+  #vbg{min-height:10vh;background:var(--grad);background-color:rgb(1, 2, 3)}
+  #vmar{height:5vh;margin:var(--m);margin-top:3px}
+  /* the unit inside a shorthand set from var(): only the shorthand holds it */
+  #pend{height:0;padding:var(--z, 1px) 0 2vh}
+  /* a ")" inside a quoted url(): what follows it is still the url */
+  #url2{height:10px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Crect transform='rotate(0)' height='10vh' width='1'/%3E%3C/svg%3E")}
   .filler{height:1600px}
 </style>
 </head>
@@ -40,6 +48,11 @@
 <div class="box" id="kf">keyframes</div>
 <div class="box" id="layer">@layer</div>
 <div class="box" id="inline" style="height:20vh">inline 20vh</div>
+<div class="box" id="vbg">background from var()</div>
+<div class="box" id="vmar">margin from var()</div>
+<div class="box" id="pend">padding with var() and 2vh</div>
+<div class="box" id="url2">url with a parenthesis</div>
+<div class="box" id="vin" style="height:20vh;border:var(--bd);border-left-color:rgb(0, 0, 255)">inline border from var()</div>
 <div class="box" id="ins">insertRule 5vh</div>
 <div class="box" id="adopt">adopted 4vh</div>
 <div class="box" id="late">late style 7vh</div>

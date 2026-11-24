@@ -81,10 +81,12 @@
   // Covered: the page's <style> sheets (rules inside @media, @supports, @layer, @container,
   // nesting, @keyframes, @import), constructed and adopted sheets, rules added later (a new
   // <style>, insertRule, replace/replaceSync, a stylesheet <link> once loaded) and inline `style`
-  // attributes, as they are set. Not covered: a stylesheet from another origin (its rules cannot
-  // be read from this opaque origin), media queries on the height, and `innerHeight` in scripts.
+  // attributes, as they are set. Not covered: a stylesheet loaded with <link> (from this opaque
+  // origin every such file is another origin, its rules cannot be read; only a data: URL can),
+  // media queries on the height, the vb family, and `innerHeight` in scripts. The page's scripts
+  // read the rewritten form back (`el.style.height` is the calc() form).
   var UNIT_VAR = '--artifacts-canvas-';
-  var UNIT_RE = /("(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*'|url\([^)]*\)|var\(\s*--artifacts-canvas-v[a-z]+\s*,[^)]*\))|(^|[^\w.\-])([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)((?:s|l|d)?v(?:h|min|max))(?![\w-])/gi;
+  var UNIT_RE = /("(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*'|url\(\s*(?:"(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*'|[^)]*)\s*\)|var\(\s*--artifacts-canvas-v[a-z]+\s*,[^)]*\))|(^|[^\w.\-])([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)((?:s|l|d)?v(?:h|min|max))(?![\w-])/gi;
   var UNIT_QUICK = /\d[sld]?v(?:h|min|max)/i;
 
   /** The CSS text with every vh-family length turned into the variable form (strings and url() untouched). */
@@ -97,12 +99,32 @@
     });
   }
 
+  /** One declaration rewritten in place, with its priority; nothing else of the block is touched. */
+  function fixProp(style, prop) {
+    var v = style.getPropertyValue(prop);
+    if (!v || !UNIT_QUICK.test(v)) return;
+    var n = rewriteUnits(v);
+    if (n !== v) style.setProperty(prop, n, style.getPropertyPriority(prop));
+  }
+
+  /**
+   * Rewrite a declaration block declaration by declaration. Never by assigning cssText back: a
+   * shorthand set from var() and overridden by one of its longhands serialises its other longhands
+   * as empty ("pending substitution"), and assigning that text drops the shorthand for good.
+   */
   function fixDecl(style) {
     if (!style) return;
     var t = style.cssText;
     if (!t || !UNIT_QUICK.test(t)) return;
-    var n = rewriteUnits(t);
-    if (n !== t) style.cssText = n;
+    var props = [];
+    for (var i = 0; i < style.length; i++) props.push(style[i]);
+    for (var j = 0; j < props.length; j++) fixProp(style, props[j]);
+    // a unit inside a shorthand set from var(): its longhands read empty, only the shorthand has it
+    t = style.cssText;
+    if (rewriteUnits(t) === t) return;
+    var re = /(?:^|;)\s*(--[\w-]+|-?[a-zA-Z][\w-]*)\s*:/g;
+    var m;
+    while ((m = re.exec(t))) if (props.indexOf(m[1]) < 0) fixProp(style, m[1]);
   }
 
   function fixRules(rules, depth) {
@@ -187,7 +209,7 @@
       var t = r.target;
       if (r.type === 'attributes') {
         if (t === docEl) applyUnits(); // the page rewrote <html style>: put the variables back
-        if (t.style) fixDecl(t.style);
+        if (t.style && UNIT_QUICK.test(t.getAttribute('style') || '')) fixDecl(t.style);
         continue;
       }
       // text of a <style> changed (characterData on its text, or a child added/removed)
@@ -222,9 +244,17 @@
       fixRule(owner.cssRules[owner.cssRules.length - 1], 0);
     });
     wrapAfter(window.CSSStyleSheet && CSSStyleSheet.prototype, 'replaceSync', function (sheet) { fixSheet(sheet, 0); });
-    wrapAfter(window.CSSStyleSheet && CSSStyleSheet.prototype, 'replace', function (sheet, p) {
-      if (p && typeof p.then === 'function') p.then(function () { fixSheet(sheet, 0); }, function () { /* ignore */ });
-    });
+    // replace(): the page gets a promise that settles as the browser's does (a rejection stays the
+    // page's to handle), once the new rules are rewritten
+    var CSS = window.CSSStyleSheet && CSSStyleSheet.prototype;
+    if (CSS && typeof CSS.replace === 'function') {
+      var origReplace = CSS.replace;
+      CSS.replace = function () {
+        var sheet = this;
+        var p = origReplace.apply(this, arguments);
+        return p && typeof p.then === 'function' ? p.then(function (r) { fixSheet(sheet, 0); return r; }) : p;
+      };
+    }
     if (window.MutationObserver && docEl) {
       // installed before the page's own markup is parsed: each <style> is rewritten before the
       // next script of the page runs (the parser delivers mutations before it runs a script)
@@ -277,17 +307,24 @@
       return;
     }
     var entries = Array.from(s.queue, fullEntry);
+    s.queue.forEach(function (t) { s.reported.add(t); });
     s.queue.clear();
     try { s.callback.call(s.self, entries, s.self); } catch (err) {
       setTimeout(function () { throw err; }); // reported like an error in a real observer's callback
     }
   }
 
+  /**
+   * Report `target` in view, once per canvas-mode period: a callback that observes its target again
+   * (an infinite-scroll sentinel) would otherwise be told again at once, for ever. Delivered after
+   * the current task, as the browser's observer does after a rendering step.
+   */
   function ioQueue(s, target) {
+    if (s.reported.has(target)) return;
     s.queue.add(target);
     if (s.scheduled) return;
     s.scheduled = true;
-    Promise.resolve().then(function () { ioFlush(s); });
+    setTimeout(function () { ioFlush(s); }, 0);
   }
 
   /** Mode changed: canvas mode reports every target again; native mode re-observes for the real state. */
@@ -297,13 +334,14 @@
         s.queue.clear();
         s.targets.forEach(function (t) { s.real.unobserve(t); s.real.observe(t); });
       } else {
+        s.reported = new WeakSet(); // a new canvas-mode period: every target is reported once more
         s.targets.forEach(function (t) { ioQueue(s, t); });
       }
     });
   }
 
   function installIO() {
-    if (typeof RealIO !== 'function' || !ioState || typeof Set !== 'function') return;
+    if (typeof RealIO !== 'function' || !ioState || typeof Set !== 'function' || typeof WeakSet !== 'function') return;
     var stateOf = function (o) {
       var s = ioState.get(o);
       if (!s) throw new TypeError('Illegal invocation');
@@ -316,12 +354,16 @@
       if (options && options.root) return new RealIO(callback, options);
       var self = this;
       // targets in the order observed; queue: observed, not reported yet
-      var s = { self: self, callback: callback, targets: new Set(), queue: new Set(), scheduled: false, real: null };
+      var s = { self: self, callback: callback, targets: new Set(), queue: new Set(), reported: new WeakSet(), scheduled: false, real: null };
       s.real = new RealIO(function (entries) {
         if (native) callback.call(self, entries, self);
       }, options);
       ioState.set(self, s);
-      ioLive.push(s);
+    };
+    // the live list (mode changes) holds an observer only while it observes something
+    var unlist = function (s) {
+      var i = ioLive.indexOf(s);
+      if (i >= 0) ioLive.splice(i, 1);
     };
     var P = IntersectionObserver.prototype;
     P.observe = function (target) {
@@ -329,13 +371,13 @@
       s.real.observe(target); // throws as the browser does for a target that is not an Element
       if (s.targets.has(target)) return;
       s.targets.add(target);
-      if (ioLive.indexOf(s) < 0) ioLive.push(s);
+      if (s.targets.size === 1) ioLive.push(s);
       if (!native) ioQueue(s, target);
     };
     P.unobserve = function (target) {
       var s = stateOf(this);
       s.real.unobserve(target);
-      s.targets.delete(target);
+      if (s.targets.delete(target) && !s.targets.size) unlist(s);
       s.queue.delete(target);
     };
     P.disconnect = function () {
@@ -343,14 +385,14 @@
       s.real.disconnect();
       s.targets.clear();
       s.queue.clear();
-      var i = ioLive.indexOf(s);
-      if (i >= 0) ioLive.splice(i, 1);
+      unlist(s);
     };
     P.takeRecords = function () {
       var s = stateOf(this);
       var real = s.real.takeRecords();
       if (native) return real;
       var out = Array.from(s.queue, fullEntry);
+      s.queue.forEach(function (t) { s.reported.add(t); });
       s.queue.clear();
       return out;
     };
