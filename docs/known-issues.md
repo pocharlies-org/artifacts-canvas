@@ -108,7 +108,8 @@ Each fixed entry names its regression tests.
   not, the followers kept the old view, and a stroke landed off the pointer. Now the stage's scroll
   becomes a camera move once it stops, and the stage goes back to 0 (protocol §3 "The page's own
   navigation"). Tests: `client/e2e/viewport-units.spec.ts` (arrow key in presentation mode, a
-  follower in a smaller window).
+  follower in a smaller window). Left: WebKit keeps such a scroll inside the cross-origin frame, so
+  there the deck's own arrows move nothing (its slide links still work, as anchors).
 
 ## Review of the fv9 branch (security and QA)
 

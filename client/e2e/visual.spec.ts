@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { expect, test } from '@playwright/test';
-import { dragBox, drawStroke, newRoom, open } from './helpers';
+import { dragBox, drawStroke, newRoom, open, showSide } from './helpers';
 
 const OUT = process.env.SCREENSHOT_DIR ?? 'screenshots';
 
@@ -13,6 +13,7 @@ test('screenshots at 1440x900, 390x844 and 360x780', async ({ browser }) => {
   const I = await open(browser, 'Iván', room);
   const d = D.page;
   // Ana: red circle around the hot bars, red hand text
+  await showSide(d, 'right'); // the style panel comes at its screen edge (ui/chrome.ts)
   await d.locator('.sw[data-color="red"]').click();
   await d.keyboard.press('d');
   const ring: [number, number][] = [];
@@ -28,6 +29,7 @@ test('screenshots at 1440x900, 390x844 and 360x780', async ({ browser }) => {
   await d.keyboard.press('Escape');
   await d.keyboard.press('Escape');
   // Ana: highlight the rows of the failing node
+  await showSide(d, 'right');
   await d.locator('.sw[data-color="yellow"]').click();
   await d.keyboard.press('Shift+D');
   await drawStroke(d, [[285, 605], [700, 605], [1150, 605]]);
@@ -35,6 +37,7 @@ test('screenshots at 1440x900, 390x844 and 360x780', async ({ browser }) => {
   await d.keyboard.press('v');
   // Iván: dashed rectangle over the failed KPI
   const i = I.page;
+  await showSide(i, 'right');
   await i.locator('.sw[data-color="blue"]').click();
   await i.getByTestId('seg-dash').locator('[data-value="dashed"]').click();
   await i.getByTestId('seg-fill').locator('[data-value="semi"]').click();
@@ -43,6 +46,7 @@ test('screenshots at 1440x900, 390x844 and 360x780', async ({ browser }) => {
   await i.keyboard.press('Escape');
   // Marta: a note and an arrow
   const m = M.page;
+  await showSide(m, 'right');
   await m.locator('.sw[data-color="yellow"]').click();
   await m.keyboard.press('n');
   await m.mouse.click(1240, 690);
@@ -50,6 +54,7 @@ test('screenshots at 1440x900, 390x844 and 360x780', async ({ browser }) => {
   await m.keyboard.type('¿Coincide con el cambio de nodo del 06/11?');
   await m.keyboard.press('Escape');
   await m.keyboard.press('Escape');
+  await showSide(m, 'right');
   await m.locator('.sw[data-color="orange"]').click();
   await m.keyboard.press('a');
   await dragBox(m, 1150, 660, 770, 640);

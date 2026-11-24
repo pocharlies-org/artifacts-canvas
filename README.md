@@ -88,6 +88,17 @@ npm run e2e:system     # Playwright against the full system (real core, see "Ful
 npm run build          # shared/dist, client/dist (the bundle), server/dist
 ```
 
+On a desktop the canvas shows the page as wide as the window, as the page itself is shown: the
+camera fits the page to the view width (the layout stays the room's, 980 px by default, so drawings
+stay on their element for everyone; only the zoom differs per viewer). Showing the canvas over the
+page keeps the part being read where it was and at the size it had: the reporter says which block
+of the page was at the top of the view (protocol §3 "Reading position"). The side panels (who is
+here, who drew and the history on the left; the style on the right) are hidden and overlay the page:
+each comes when the mouse reaches its screen edge (or a tap on its edge tab, on a touch screen), stays
+while the pointer is on it and goes a second after it leaves; the style panel also shows while shapes
+are selected. They and the title bar are translucent (`--chrome-alpha` in `client/src/ui/styles.css`,
+0.2, with a backdrop blur). The bottom bars (zoom, tools, minimap) stay. A phone keeps its ☰ drawers.
+
 On a phone the toolbar is wider than the screen: it scrolls sideways, and a chevron with a fade on each
 side that still hides tools pages it (`docs/screenshots/phone-390x844.png`,
 `phone-390x844-toolbar-end.png`, `phone-360x780.png`; `client/e2e/phone.spec.ts` clicks every tool at

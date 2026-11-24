@@ -12,7 +12,7 @@ import {
   targetPeer, type FollowPeer, type FollowState,
 } from '../collab/follow';
 import type { Notice } from '../collab/protocol';
-import { ArtifactFrame, type FrameWheel } from '../artifact/frame';
+import { ArtifactFrame, type FrameReading, type FrameWheel } from '../artifact/frame';
 import { canvasUrl, classifyLink, linkContext, type LinkContext } from '../artifact/links';
 import { DEFAULT_BOARD, isDark, opaque, toCss, type Rgba } from '../ui/theme';
 import { Renderer } from '../render/renderer';
@@ -45,6 +45,10 @@ const PRESENT_MAX_ZOOM = 2;
 const PRESENT_TOP = 48;
 /** A scroll of the stage (a page's scrollIntoView) is taken as a camera move once it has been still this long. */
 const STAGE_SCROLL_SETTLE_MS = 200;
+/** After the canvas is shown, the frame's reading position (where the hidden page was read) is taken this long. */
+const READING_WINDOW_MS = 3000;
+/** Under this view width the editor lays out for a phone (the side panels as drawers, the page below the top bars). */
+const PHONE_W = 760;
 
 /** The presenter seen by this tab: who, and whether it is this person in another tab or device. */
 export interface PresenterInfo {
@@ -115,6 +119,8 @@ export class Editor {
   private stamperDetach: (() => void) | null = null;
   private initialCameraSet = false;
   private stageScrollTimer = 0;
+  /** Until when the frame's reading position is taken (the canvas was just shown). */
+  private readingUntil = 0;
 
   constructor(cfg: CanvasConfig, root: HTMLElement, ydoc: Y.Doc, conn: Connection | null, ledger?: Y.Doc) {
     this.cfg = cfg;
@@ -162,6 +168,7 @@ export class Editor {
         if (this.tool === 'interact' && !this.hidden && this.focusInFrame()) this.escape();
       },
       background: (c) => this.applyBackground(c),
+      reading: (r) => this.onReading(r),
     });
     const prefix = (() => {
       const base = (import.meta.env?.BASE_URL as string | undefined) ?? '/_canvas/_/';
@@ -482,6 +489,9 @@ export class Editor {
       this.cameraBeforeHiding = null;
       if (cam && this.initialCameraSet) this.setCamera(cam, 'system');
       else this.resetCamera();
+      // the reporter says where the hidden page was being read; the camera then puts that block
+      // where it was, at the size it had (onReading): showing the canvas never shrinks the page
+      this.readingUntil = performance.now() + READING_WINDOW_MS;
       this.publishPresence({ status: this.tool === 'laser' ? 'cursor.laser' : null, viewport: this.visibleWorld(), following: this.fstate.target?.userId ?? null });
       if (this.fstate.target) this.applyFollow();
     }
@@ -620,8 +630,33 @@ export class Editor {
       this.fitForPresentation();
       return;
     }
-    const z = clampZoom(Math.min(1, (this.viewW - 24) / this.pageWidth));
-    this.setCamera({ z, tx: (this.viewW - this.pageWidth * z) / 2, ty: this.viewW < 760 ? 112 : 70 }, 'system');
+    // a desktop: the page as wide as the view, its top at the top, as the page itself is shown
+    // (the side panels overlay it, ui/chrome.ts); a phone: a margin, below the two top bars
+    const z = this.fitZoom();
+    this.setCamera({ z, tx: (this.viewW - this.pageWidth * z) / 2, ty: this.viewW < PHONE_W ? 112 : 0 }, 'system');
+  }
+
+  /** The zoom at which the page is as wide as the view (a phone keeps a 12 px margin each side). */
+  fitZoom(): number {
+    return clampZoom(this.viewW < PHONE_W ? (this.viewW - 24) / this.pageWidth : this.viewW / this.pageWidth);
+  }
+
+  /**
+   * The canvas was just shown, and the reporter says where the hidden page was being read: a block
+   * of the page, its box on the screen then (left, top, width nw) and in the canvas layout now
+   * (x, y, width w). The camera puts it at the same place and the same width on the screen, so the
+   * text the user was reading does not move or shrink. A page whose column is narrower than the
+   * view (a max-width) keeps its size; a page that fills the width fills it. Never wider than the
+   * view, never under 40 % of that. Taken once, only right after the canvas was shown, and not
+   * while presenting or following.
+   */
+  private onReading(r: FrameReading) {
+    if (performance.now() > this.readingUntil || this.hidden || this.presenting || this.followingUserId) return;
+    this.readingUntil = 0;
+    const fit = this.fitZoom();
+    const z = clampZoom(Math.max(fit * 0.4, Math.min(fit, r.nw / r.w)));
+    this.setCamera({ z, tx: r.left - r.x * z, ty: r.top - r.y * z }, 'system');
+    this.emit('camera');
   }
 
   /**

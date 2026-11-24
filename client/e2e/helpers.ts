@@ -15,7 +15,7 @@ export function newRoom(prefix: string): string {
  * (`?canvas=1`) unless `opts.query` sets `canvas` or `opts.firstVisit` asks for a visit with no
  * query and no stored choice (a first visit opens the canvas hidden: src/ui/canvas-pref.ts).
  */
-export async function open(browser: Browser, name: string, room: string, opts: { artifact?: string; viewport?: { width: number; height: number }; lang?: string; deviceScaleFactor?: number; prodCsp?: boolean; query?: Record<string, string>; mobile?: boolean; initScript?: string; firstVisit?: boolean; colorScheme?: 'light' | 'dark' } = {}): Promise<Opened> {
+export async function open(browser: Browser, name: string, room: string, opts: { artifact?: string; viewport?: { width: number; height: number }; lang?: string; deviceScaleFactor?: number; prodCsp?: boolean; query?: Record<string, string>; mobile?: boolean; initScript?: string; firstVisit?: boolean; colorScheme?: 'light' | 'dark'; fit?: boolean } = {}): Promise<Opened> {
   const ctx = await browser.newContext({
     viewport: opts.viewport ?? { width: 1440, height: 900 }, deviceScaleFactor: opts.deviceScaleFactor, acceptDownloads: true,
     ...(opts.colorScheme ? { colorScheme: opts.colorScheme } : {}),
@@ -31,6 +31,10 @@ export async function open(browser: Browser, name: string, room: string, opts: {
   for (const [k, v] of Object.entries(opts.query ?? {})) q.set(k, v);
   await page.goto(`/_canvas/${opts.artifact ?? 'sample-report.html'}?${q}`);
   await ready(page);
+  // a desktop opened with the canvas shown: the earlier 100 % camera, which the screen geometry of
+  // most specs was written for, unless the spec asks for the default one (`fit`: e2e/chrome-ui.spec.ts)
+  const shown = !opts.firstVisit && opts.query?.canvas !== '0' && !opts.query?.present;
+  if (shown && !opts.fit && !opts.mobile && (opts.viewport?.width ?? 1440) >= 760) await classicCamera(page);
   return { page, close: () => ctx.close() };
 }
 
@@ -39,6 +43,31 @@ export async function ready(page: Page) {
     const c = (window as any).__canvas;
     return c?.editor?.me && c.editor.status === 'synced' && c.editor.pageHeight > 1000;
   });
+}
+
+/**
+ * The camera of the earlier default: 100 %, the page centred, its top under the top bars. The
+ * default now shows the page as wide as the view (editor.ts resetCamera); tests whose screen
+ * geometry was written for 100 % (a point beside the page, a band of a given width) set this one.
+ */
+export async function classicCamera(page: Page) {
+  await page.evaluate(() => {
+    const e = (window as any).__canvas.editor;
+    e.setCamera({ z: 1, tx: (e.viewW - e.pageWidth) / 2, ty: 70 }, 'system');
+  });
+}
+
+/** Bring a side panel on a desktop (the mouse at its screen edge) and keep it (the mouse on it). */
+export async function showSide(page: Page, side: 'left' | 'right') {
+  const vp = page.viewportSize()!;
+  const id = side === 'left' ? 'people-panel' : 'style-panel';
+  await page.mouse.move(side === 'left' ? 3 : vp.width - 3, vp.height / 2);
+  await page.waitForFunction((id) => {
+    const el = document.querySelector(`[data-testid="${id}"]`);
+    return !!el && getComputedStyle(el).visibility === 'visible' && getComputedStyle(el).opacity === '1';
+  }, id);
+  const b = (await page.getByTestId(id).boundingBox())!;
+  await page.mouse.move(b.x + b.width / 2, b.y + 12, { steps: 3 });
 }
 
 export function shapes(page: Page): Promise<any[]> {
