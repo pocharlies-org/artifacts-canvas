@@ -74,3 +74,74 @@ test('2,000 shapes: pan and zoom stay smooth', async ({ browser }) => {
   if (baseline.fps >= 50) expect(fps.fps).toBeGreaterThanOrEqual(30);
   await A.close();
 });
+
+/** A scripted vertical pan of `ms` (the camera moves on every frame, as a wheel or a drag does). */
+async function pan(p: import('@playwright/test').Page, ms = 2000) {
+  return p.evaluate(async (ms) => {
+    const e = (window as any).__canvas.editor;
+    const long: number[] = [];
+    const po = new PerformanceObserver((l) => l.getEntries().forEach((x) => long.push(x.duration)));
+    po.observe({ type: 'longtask' });
+    const frames: number[] = [];
+    const c0 = { ...e.camera };
+    const t0 = performance.now();
+    await new Promise<void>((resolve) => {
+      const tick = (t: number) => {
+        frames.push(t);
+        const k = (t - t0) / 1000;
+        e.setCamera({ z: c0.z, tx: c0.tx, ty: c0.ty - 300 * k }, 'user');
+        if (t - t0 < ms) requestAnimationFrame(tick);
+        else resolve();
+      };
+      requestAnimationFrame(tick);
+    });
+    po.disconnect();
+    const deltas = frames.slice(1).map((f, i) => f - frames[i]).sort((a, b) => a - b);
+    return {
+      fps: Math.round((frames.length - 1) / ((frames.at(-1)! - frames[0]) / 1000)),
+      p95FrameMs: Math.round(deltas[Math.floor(deltas.length * 0.95)] * 10) / 10,
+      longTasks: long.length,
+    };
+  }, ms);
+}
+
+// A heavy page (dev/artifacts/heavy-page.html): a WebGL scene sized to innerWidth x innerHeight and
+// redrawn on every frame, script work on every frame, sections revealed by an IntersectionObserver
+// and a video. In canvas mode the frame is as tall as the page: innerHeight was the page's height
+// (a scene thousands of pixels tall), and every camera move waited for the page's frame
+// (docs/protocol.md §3 "Camera motion"). The gates, in the same browser (see above for why the
+// fps is relative): the scene is one reference screen; the page's animation frames wait while the
+// camera moves and run once it stands still; a pan over it keeps 85 % of the frame rate of a pan
+// over a plain page, with no long task.
+test('a heavy page: the scene is one screen, and a pan does not wait for the page\'s animation', async ({ browser }) => {
+  const frame = (p: import('@playwright/test').Page) => p.frameLocator('iframe.artifact-frame').locator('html');
+  const L = await open(browser, 'Ana', newRoom('perf-light'));
+  await pan(L.page, 500); // warm up
+  const light = await pan(L.page);
+  await L.close();
+
+  const H = await open(browser, 'Ana', newRoom('perf-heavy'), { artifact: 'heavy-page.html' });
+  const state = () => frame(H.page).evaluate(() => ({ ...(window as any).__heavy, dpr: devicePixelRatio, innerH: innerHeight, docH: document.documentElement.scrollHeight }));
+  await expect.poll(async () => (await state()).frames).toBeGreaterThan(5);
+  const s = await state();
+  const REF_H = Math.round((980 * 9) / 16);
+  expect(s.gl).toBe(true);
+  expect(s.innerH).toBe(REF_H);
+  expect(s.cssH).toBe(REF_H);
+  expect(s.h).toBeLessThanOrEqual(Math.ceil(REF_H * s.dpr));
+  expect(s.docH).toBeGreaterThan(10 * REF_H); // the page itself is twelve screens
+
+  await pan(H.page, 500); // warm up
+  await H.page.waitForTimeout(400);
+  const f0 = (await state()).frames;
+  const heavy = await pan(H.page);
+  const f1 = (await state()).frames;
+  // held while the camera moved (a frame or two may run before the first `motion` message lands)
+  expect(f1 - f0).toBeLessThanOrEqual(3);
+  // and running again once it stands still
+  await expect.poll(async () => (await state()).frames, { timeout: 5000 }).toBeGreaterThan(f1 + 5);
+  console.log(`PERF pan over a plain page: ${light.fps} fps, p95 frame ${light.p95FrameMs} ms; over the heavy page: ${heavy.fps} fps, p95 frame ${heavy.p95FrameMs} ms, ${heavy.longTasks} long tasks; scene ${s.w}x${s.h}`);
+  expect(heavy.longTasks).toBe(0);
+  expect(heavy.fps).toBeGreaterThanOrEqual(Math.floor(light.fps * 0.85));
+  await H.close();
+});

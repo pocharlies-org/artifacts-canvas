@@ -754,6 +754,8 @@ export class Editor {
     if (source === 'user' && this.followingUserId) this.stopFollowing();
     this.camera = { tx: c.tx, ty: c.ty, z: clampZoom(c.z) };
     this.world.style.transform = `translate(${this.camera.tx}px, ${this.camera.ty}px) scale(${this.camera.z})`;
+    // the page's animation waits while the camera moves (ArtifactFrame.cameraMoved)
+    if (!this.hidden) this.frame.cameraMoved();
     if (source === 'follow') this.publishFollowedViewport();
     else {
       this.clearFollowSettle();

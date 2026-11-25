@@ -165,11 +165,20 @@ own scripts, changes them in canvas mode only:
   never through the block's `cssText`, so a `var()` shorthand stays; an inline `style` attribute is
   rewritten as written. Strings, `url()` and selectors are not touched. Not covered: a stylesheet loaded with `<link>` (from the opaque origin every
   such file is another origin and its rules cannot be read; a self-contained artifact has none,
-  see known issues L-4), media queries on the height or orientation, the `vb` family, and scripts
-  that read `window.innerHeight` (it stays the frame's height, so scroll-position reveal scripts
-  still see the whole page in view). The page's scripts read the rewritten form back
-  (`el.style.height` is the `calc()` form). Root scroll snapping is off in canvas mode (the page
-  never scrolls there).
+  see known issues L-4), media queries on the height or orientation, and the `vb` family. The
+  page's scripts read the rewritten form back (`el.style.height` is the `calc()` form). Root scroll
+  snapping is off in canvas mode (the page never scrolls there).
+- **The screen height scripts read.** In canvas mode `window.innerHeight`, the root element's
+  `clientHeight` (the viewport height older scripts and jQuery read) and `visualViewport.height`
+  give the reference screen's height (551 for 980), as `100vh` does; in native mode the real
+  ones. A script that sizes a full-screen scene to the screen (`renderer.setSize(innerWidth,
+  innerHeight)`) drew a canvas as tall as the page on every frame (980 x 6615 px on a twelve-screen
+  page), and one that sizes its sections to it grew the page with the frame. When a mode change
+  changes the height the page sees, the page gets a `resize` (its scripts run before the wrapper
+  says the mode, so a page shown as itself first reads the reference height). A script that
+  reveals what lies within `innerHeight` of the top on scroll sees one screen: the page never
+  scrolls in canvas mode, so only the first screen passes its test; the reveal scripts of
+  `IntersectionObserver` see the whole page (below).
 - **Reveal scripts.** Pages that fade sections in as they scroll into view hide them until an
   `IntersectionObserver` reports them. In the frame, a cross-origin child of a transformed board,
   an observer with the implicit root is measured against the wrapper's viewport, so most sections
@@ -190,6 +199,19 @@ own scripts, changes them in canvas mode only:
   the deck. A tab that follows someone, or shows the page as itself, only puts the stage back.
   WebKit keeps such a scroll inside the cross-origin frame: there the deck's own arrows move
   nothing (its slide links still work, as anchors).
+
+**Camera motion** (`ArtifactFrame.cameraMoved`, the reporter's frame hold). Every camera move
+makes the artifact's frame render again: the browser tells the frame which part of it is in
+view, and the move shows only once the frame has rendered. A page that animates on every frame (a
+WebGL scene, labels laid out again each frame) keeps the frame's main thread busy, so a pan waited
+on the page's own animation; with the canvas hidden the page scrolls by itself and does not
+(measured on a deck with a WebGL backdrop: 77 fps and 37 % of frames dropped panning in canvas
+mode, 120 fps scrolling hidden; 114 fps with the hold). So in canvas mode, while the camera moves
+(a pan, a zoom, following a presenter, a glide to a slide), the wrapper says so (`motion`, at most
+every 100 ms) and the reporter holds the page's `requestAnimationFrame` callbacks; once no `motion`
+has come for 250 ms they run, in one frame, with that frame's time, as the browser would have
+called them. A callback cancelled while held never runs. CSS animations, videos and timers go on.
+Native mode never holds.
 
 **Presenting a deck** (`client/src/editor/slides.ts`, `Editor.stepSlide`). In presentation mode
 → ↓ Page Down Space step forward and ← ↑ Page Up ⇧Space step back, whatever the tool (laser, pen,
@@ -310,6 +332,7 @@ clamped):
 | wrapper → frame | `{source:'artifacts-canvas', type:'click', x, y, newTab}` follow the link at (x, y), if any (the select tool's click) |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'bg', color}` the page's background colour (see "Background") |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'reading', x, y, w, left, top, nw}` after the canvas is shown again: the block read in native mode, now at (x, y), w wide (artifact px), was at (left, top), nw wide on the screen; see "Reading position" |
+| wrapper → frame | `{source:'artifacts-canvas', type:'motion'}` the camera moves (canvas mode, at most every 100 ms): the page's animation frames wait until 250 ms after the last one; see "Camera motion" |
 | wrapper → frame | `{source:'artifacts-canvas', type:'mode', native}` `native: true` while the canvas is hidden: the page scrolls on its own (and same-document anchors scroll it) instead of being held still; sent on the frame's first message and on every load |
 | wrapper → frame | `{source:'artifacts-canvas', type:'snapshot', id, rect:{x,y,w,h}, scale, lib}` export request; `lib` is the `vendorUrl` |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'snapshot', id, dataUrl, partial}` a `data:image/png` of `rect`, or `null` when the page could not be captured; `partial: true` when part of it could not be read (an image or a background that did not load is left blank) |

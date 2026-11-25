@@ -99,7 +99,11 @@ async function expectDeckOnBoard(p: Page) {
   // the page is the six screens and the notes, nothing more: the frame is that tall
   expect(Math.abs(d.docH - (6 * REF_H + d.tailH))).toBeLessThan(4);
   expect(Math.abs((await pageHeight(p)) - d.docH)).toBeLessThan(3);
-  expect(d.innerH).toBeGreaterThanOrEqual(d.docH - 2); // the frame shows the whole page, no inner scroll
+  // the frame shows the whole page, no inner scroll
+  const frameH = await p.locator('iframe.artifact-frame').evaluate((f) => parseFloat((f as HTMLIFrameElement).style.height));
+  expect(frameH).toBeGreaterThanOrEqual(d.docH - 2);
+  // and the page's scripts read the reference screen's height, as 100vh is (protocol §3)
+  expect(d.innerH).toBe(Math.round(REF_H));
 }
 
 test('a scroll-snap deck: every section shows on the board, one reference screen high, with a sane font', async ({ browser }) => {
@@ -177,15 +181,17 @@ test("a deck's own navigation (arrow keys, scrollIntoView) moves the camera, not
     await B.close();
     return;
   }
-  // the deck scrolls the next screen into view: the scroll reaches the stage, and becomes a camera move
-  const s5 = await frameOf(A.page).locator('#s5').evaluate((el) => el.getBoundingClientRect().top + window.scrollY);
+  // the deck scrolls the next screen into view: the scroll reaches the stage, and becomes a camera move.
+  // Its script takes the screen whose top is above the middle of its screen (innerHeight / 2, the
+  // reference screen's in canvas mode: protocol §3) as the current one, the first: the next is the second
+  const s2 = await frameOf(A.page).locator('#s2').evaluate((el) => el.getBoundingClientRect().top + window.scrollY);
   await expect.poll(async () => {
     const st = await state(A.page);
-    return st.stage[0] === 0 && st.stage[1] === 0 && Math.abs(st.top - s5) < 3;
+    return st.stage[0] === 0 && st.stage[1] === 0 && Math.abs(st.top - s2) < 3;
   }).toBe(true);
   expect((await state(A.page)).top).not.toBe(before.top);
-  // what the presenter sees is where the camera is: the fifth heading at the top of the screen
-  const h = (await frameOf(A.page).locator('#s5 h2').boundingBox())!;
+  // what the presenter sees is where the camera is: the second heading at the top of the screen
+  const h = (await frameOf(A.page).locator('#s2 h2').boundingBox())!;
   expect(h.y).toBeGreaterThanOrEqual(0);
   expect(h.y).toBeLessThan(A.page.viewportSize()!.height / 2);
   // the follower sees the same part of the page, and its own canvas did not scroll

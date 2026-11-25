@@ -20,7 +20,8 @@ import { stepOf } from '../editor/slides';
  * decides what it opens, artifact/links.ts), a same-document anchor into an `anchor` position,
  * and a wheel that nothing inside the page scrolls into a `wheel` message (the camera pans).
  * The select tool asks the reporter which element is under a point (`probe`) and to follow the
- * link there (`click`); a presentation asks where the page's slides are (`slides`). Every message
+ * link there (`click`); a presentation asks where the page's slides are (`slides`), and a camera
+ * move says so (`motion`: the page's animation frames wait until the camera stands still). Every message
  * is checked: it must come from this frame's window, with the opaque origin "null", the
  * reporter's source tag and the right field types.
  */
@@ -91,6 +92,12 @@ export interface FrameSlides {
 /** Most slide tops taken from one answer. */
 export const MAX_SLIDES = 500;
 
+/**
+ * At most one `motion` message per this many ms while the camera moves; the reporter holds the
+ * page's animation frames 250 ms after the last one it got (docs/protocol.md §3 "Camera motion").
+ */
+export const MOTION_PING_MS = 100;
+
 /** Most a wheel delta may say (one event); anything bigger is clamped. */
 const MAX_WHEEL = 10000;
 const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
@@ -123,6 +130,8 @@ export class ArtifactFrame {
   private probes = new Map<string, (link: boolean) => void>();
   private probeSeq = 0;
   private slideAsks = new Map<string, (s: FrameSlides | null) => void>();
+  /** When the last `motion` message went out (performance.now()). */
+  private motionAt = -Infinity;
 
   constructor(parent: HTMLElement, src: string, width: number, initialHeight: number, private vendorUrl: string, private ev: FrameEvents = {}) {
     this.width = width;
@@ -326,6 +335,20 @@ export class ArtifactFrame {
       });
       win.postMessage({ source: 'artifacts-canvas', type: 'slides', id, hash: hash.slice(0, MAX_LINK_LENGTH) }, '*');
     });
+  }
+
+  /**
+   * The camera moved (canvas mode). Every camera move makes the frame render again, and the move
+   * shows only once it has: the reporter holds the page's animation frames while the camera moves,
+   * so a pan never waits for the page's own animation (docs/protocol.md §3 "Camera motion").
+   */
+  cameraMoved() {
+    const win = this.el.contentWindow;
+    if (this.native || !this.loaded || !win) return;
+    const now = performance.now();
+    if (now - this.motionAt < MOTION_PING_MS) return;
+    this.motionAt = now;
+    win.postMessage({ source: 'artifacts-canvas', type: 'motion' }, '*');
   }
 
   /** Follow the link of the artifact at (x, y) artifact px, if there is one (the select tool's click). */
