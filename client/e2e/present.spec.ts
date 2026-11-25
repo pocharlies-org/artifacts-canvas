@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { newRoom, open, ready } from './helpers';
+import { newRoom, open, ready, shapes } from './helpers';
 
 const frameOf = (p: Page) => p.frameLocator('iframe.artifact-frame');
 
@@ -466,5 +466,173 @@ test('?present=1 on a page of links: the first press on a floating control goes 
   await p.keyboard.press('k');
   await expect.poll(async () => (await presentState(p)).how).toBe('fullscreen');
   expect((await fsAsked(p)).asked[1]).toBe('keydown');
+  await A.close();
+});
+
+/** The tops of the slides of dev/artifacts/slide-deck.html, in artifact px (world px). */
+const slideTops = (p: Page) => frameOf(p).locator('.slide').evaluateAll((els) => els.map((el) => el.getBoundingClientRect().top + window.scrollY));
+
+/**
+ * The slide (1 to 8) whose top is under the presentation badge, where a link or a step puts it
+ * (48 screen px from the top: editor.ts PRESENT_TOP); 0 when none is.
+ */
+async function slideAtTop(p: Page): Promise<number> {
+  const tops = await slideTops(p);
+  const line = await p.evaluate(() => {
+    const e = (window as any).__canvas.editor;
+    return e.visibleWorld().y + 48 / e.camera.z;
+  });
+  return tops.findIndex((y) => Math.abs(y - line) < 3) + 1;
+}
+
+/** Records the person this tab followed before it started presenting (the tab of a `?present=1` link). */
+const followProbe = `(() => {
+  if (window !== window.top) return;
+  window.__followedFirst = null;
+  const t = setInterval(() => {
+    const e = window.__canvas && window.__canvas.editor;
+    if (!e) return;
+    if (e.presenting) return clearInterval(t);
+    if (e.followingUserId) window.__followedFirst = e.followingUserId;
+  }, 10);
+})();`;
+
+test('?present=1 starts at the first slide even when someone presents the last one, ?present=1#s3 at the third, and Presentar keeps the reading position', async ({ browser }) => {
+  const room = newRoom('present-start');
+  // someone already presents the deck, at its last slide
+  const P = await open(browser, 'Pablo', room, { artifact: 'slide-deck.html', query: { present: '1' } });
+  await expect.poll(async () => (await presentState(P.page)).mode).toBe(true);
+  const tops = await slideTops(P.page);
+  expect(tops).toHaveLength(8);
+  await P.page.evaluate((y) => (window as any).__canvas.editor.revealTop({ x: 490, y }), tops[7]);
+  await expect.poll(() => slideAtTop(P.page)).toBe(8);
+  // the link opened in another tab: it joins the room (and follows that presenter) before its page
+  // has loaded, then presents from the first slide, not from where it was following
+  const A = await open(browser, 'Ana', room, { artifact: 'slide-deck.html', query: { present: '1' }, initScript: followProbe, delayFrame: 1500 });
+  await expect.poll(async () => (await presentState(A.page)).mode).toBe(true);
+  expect(await A.page.evaluate(() => (window as any).__followedFirst)).toBe('dev:Pablo');
+  await expect.poll(() => slideAtTop(A.page)).toBe(1);
+  expect((await presentState(A.page)).following).toBeNull();
+  // the same link with #s3 starts at the third slide
+  const C = await open(browser, 'Carla', room, { artifact: 'slide-deck.html', query: { present: '1' }, hash: '#s3' });
+  await expect.poll(async () => (await presentState(C.page)).mode).toBe(true);
+  await expect.poll(() => slideAtTop(C.page)).toBe(3);
+  await expect.poll(() => slideAtTop(A.page)).toBe(1);
+  // a #hash the page does not have: the first slide
+  const N = await open(browser, 'Nora', newRoom('present-start-nohash'), { artifact: 'slide-deck.html', query: { present: '1' }, hash: '#nowhere' });
+  await expect.poll(async () => (await presentState(N.page)).mode).toBe(true);
+  await N.page.waitForTimeout(500);
+  expect(await slideAtTop(N.page)).toBe(1);
+  // Presentar from the board starts where the board is being read (the fifth slide here)
+  const D = await open(browser, 'Dora', newRoom('present-start-board'), { artifact: 'slide-deck.html' });
+  await D.page.evaluate((y) => (window as any).__canvas.editor.revealTop({ x: 490, y }), tops[4]);
+  expect(await nearTop(D.page, '#s5')).toBe(true);
+  await D.page.getByTestId('present').click();
+  await expect.poll(async () => (await presentState(D.page)).mode).toBe(true);
+  await settle(D.page);
+  expect(await nearTop(D.page, '#s5')).toBe(true);
+  for (const t of [P, A, C, N, D]) await t.close();
+});
+
+test('presenting, → ↓ Page Down Space and ← ↑ Page Up ⇧Space step the slides with the laser, the pen and the interact tool; the follower follows; Esc ends it', async ({ browser }) => {
+  const room = newRoom('present-keys');
+  const B = await open(browser, 'Marta', room, { artifact: 'slide-deck.html' });
+  const A = await open(browser, 'Ana', room, { artifact: 'slide-deck.html', query: { present: '1' }, initScript: fsProbe('first') });
+  const p = A.page;
+  await expect.poll(async () => (await presentState(p)).mode).toBe(true);
+  await expect(B.page.getByTestId('banner-text')).toHaveText('Ana está presentando');
+  await expect.poll(() => slideAtTop(p)).toBe(1);
+  const step = async (key: string, slide: number) => {
+    await p.keyboard.press(key);
+    await expect.poll(() => slideAtTop(p), { message: `${key} -> slide ${slide}` }).toBe(slide);
+  };
+  // the laser, the tool presenting starts with
+  expect((await presentState(p)).tool).toBe('laser');
+  await step('ArrowRight', 2);
+  await expect.poll(() => sameView(p, B.page)).toBe(true);
+  // the pen: the keys step, nothing is drawn
+  await p.getByTestId('present-tool-draw').click();
+  expect((await presentState(p)).tool).toBe('draw');
+  await step('ArrowRight', 3);
+  await step('Space', 4);
+  await step('PageDown', 5);
+  await step('ArrowDown', 6);
+  await expect.poll(() => sameView(p, B.page)).toBe(true);
+  await step('ArrowLeft', 5);
+  await step('ArrowUp', 4);
+  await step('PageUp', 3);
+  await step('Shift+Space', 2);
+  await expect.poll(() => sameView(p, B.page)).toBe(true);
+  expect(await shapes(p)).toHaveLength(0);
+  // the interact tool, with the focus in the page: the page has no navigation of its own for the key,
+  // so the reporter hands it over and the canvas steps
+  await p.getByTestId('present-tool-interact').click();
+  await clickInFrame(p, '#s2 h2');
+  expect(await p.evaluate(() => document.activeElement?.classList.contains('artifact-frame'))).toBe(true);
+  await step('ArrowRight', 3);
+  await step('ArrowLeft', 2);
+  await expect.poll(() => sameView(p, B.page)).toBe(true);
+  // the last slide is as far as it goes
+  for (let i = 0; i < 6; i++) await p.keyboard.press('ArrowRight');
+  await expect.poll(() => slideAtTop(p)).toBe(8);
+  await p.keyboard.press('ArrowRight');
+  await p.waitForTimeout(300);
+  expect(await slideAtTop(p)).toBe(8);
+  await expect.poll(() => sameView(p, B.page)).toBe(true);
+  // Esc still ends it
+  await p.keyboard.press('Escape');
+  await expect.poll(async () => (await presentState(p)).mode).toBe(false);
+  await expect(B.page.getByTestId('banner')).toBeHidden();
+  await A.close();
+  await B.close();
+});
+
+test('presenting, typing in a sticky note keeps its keys: Space and the arrows type, the slide stays', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('present-note'), { artifact: 'slide-deck.html', query: { present: '1' }, initScript: fsProbe('all') });
+  const p = A.page;
+  await expect.poll(async () => (await presentState(p)).how).toBe('fallback');
+  await expect.poll(() => slideAtTop(p)).toBe(1);
+  await p.keyboard.press('n');
+  await p.mouse.click(700, 450);
+  await expect(p.getByTestId('text-editor')).toBeFocused();
+  await p.keyboard.type('uno dos');
+  await p.keyboard.press('PageDown');
+  await p.keyboard.press('ArrowLeft');
+  await p.keyboard.press('ArrowRight');
+  await p.keyboard.press('ArrowLeft');
+  await p.keyboard.type('X');
+  await p.keyboard.press('Shift+Space');
+  await expect.poll(async () => (await shapes(p)).find((s) => s.type === 'note')?.text).toBe('uno doX s');
+  await p.waitForTimeout(300);
+  expect(await slideAtTop(p)).toBe(1);
+  // Esc ends the note, not the presentation; then the keys step again, and the note (still
+  // selected) does not move with them
+  await p.keyboard.press('Escape');
+  await expect(p.getByTestId('text-editor')).not.toBeFocused();
+  expect((await presentState(p)).mode).toBe(true);
+  const note = async () => (await shapes(p)).find((s) => s.type === 'note');
+  const at = await note();
+  await p.keyboard.press('ArrowRight');
+  await expect.poll(() => slideAtTop(p)).toBe(2);
+  expect(await note()).toMatchObject({ x: at.x, y: at.y, text: 'uno doX s' });
+  await A.close();
+});
+
+test("presenting, the artifact's own script cannot step the slides or end the presentation through the reporter's messages", async ({ browser }) => {
+  // links-forge.html posts key (Escape, ArrowDown) and slides messages every 400 ms, on its own
+  const A = await open(browser, 'Ana', newRoom('present-forge'), { artifact: 'links-forge.html', query: { present: '1' }, initScript: fsProbe('all') });
+  const p = A.page;
+  await expect.poll(async () => (await presentState(p)).mode).toBe(true);
+  const forged = () => frameOf(p).locator('#forged').textContent().then(Number);
+  await settle(p);
+  const cam = await p.evaluate(() => ({ ...(window as any).__canvas.editor.camera }));
+  // the laser, then the interact tool with the focus on the canvas: nothing of it is taken
+  const n0 = await forged();
+  await expect.poll(forged, { timeout: 6000 }).toBeGreaterThan(n0 + 3);
+  await p.getByTestId('present-tool-interact').click();
+  const n1 = await forged();
+  await expect.poll(forged, { timeout: 6000 }).toBeGreaterThan(Math.min(19, n1 + 3));
+  expect(await p.evaluate(() => (window as any).__canvas.editor.camera)).toEqual(cam);
+  expect(await presentState(p)).toMatchObject({ mode: true, presenting: true, tool: 'interact' });
   await A.close();
 });

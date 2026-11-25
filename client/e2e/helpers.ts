@@ -14,14 +14,23 @@ export function newRoom(prefix: string): string {
  * Open the wrapper as `name` (dev identity) in its own browser context. The canvas is shown
  * (`?canvas=1`) unless `opts.query` sets `canvas` or `opts.firstVisit` asks for a visit with no
  * query and no stored choice (a first visit opens the canvas hidden: src/ui/canvas-pref.ts).
+ * `hash` ends the URL (`#s3`); `delayFrame` holds the artifact's frame back that many ms, so the
+ * room is joined well before the page's load event.
  */
-export async function open(browser: Browser, name: string, room: string, opts: { artifact?: string; viewport?: { width: number; height: number }; lang?: string; deviceScaleFactor?: number; prodCsp?: boolean; query?: Record<string, string>; mobile?: boolean; initScript?: string; firstVisit?: boolean; colorScheme?: 'light' | 'dark'; fit?: boolean } = {}): Promise<Opened> {
+export async function open(browser: Browser, name: string, room: string, opts: { artifact?: string; viewport?: { width: number; height: number }; lang?: string; deviceScaleFactor?: number; prodCsp?: boolean; query?: Record<string, string>; mobile?: boolean; initScript?: string; firstVisit?: boolean; colorScheme?: 'light' | 'dark'; fit?: boolean; hash?: string; delayFrame?: number } = {}): Promise<Opened> {
   const ctx = await browser.newContext({
     viewport: opts.viewport ?? { width: 1440, height: 900 }, deviceScaleFactor: opts.deviceScaleFactor, acceptDownloads: true,
     ...(opts.colorScheme ? { colorScheme: opts.colorScheme } : {}),
     ...(opts.mobile ? { isMobile: true, hasTouch: true } : {}),
   });
   if (opts.initScript) await ctx.addInitScript(opts.initScript);
+  const delay = opts.delayFrame;
+  if (delay) {
+    await ctx.route('**/_canvas/_/frame/**', async (r) => {
+      await new Promise((res) => setTimeout(res, delay));
+      await r.continue();
+    });
+  }
   const page = await ctx.newPage();
   page.on('pageerror', (e) => console.log(`[${name}] pageerror`, e.message));
   const q = new URLSearchParams({ room, as: name });
@@ -29,7 +38,7 @@ export async function open(browser: Browser, name: string, room: string, opts: {
   if (opts.prodCsp) q.set('csp', 'prod'); // the dev server then sends the production wrapper CSP
   if (!opts.firstVisit && !opts.query?.present) q.set('canvas', '1');
   for (const [k, v] of Object.entries(opts.query ?? {})) q.set(k, v);
-  await page.goto(`/_canvas/${opts.artifact ?? 'sample-report.html'}?${q}`);
+  await page.goto(`/_canvas/${opts.artifact ?? 'sample-report.html'}?${q}${opts.hash ?? ''}`);
   await ready(page);
   // a desktop opened with the canvas shown: the earlier 100 % camera, which the screen geometry of
   // most specs was written for, unless the spec asks for the default one (`fit`: e2e/chrome-ui.spec.ts)

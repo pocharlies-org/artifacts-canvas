@@ -17,9 +17,10 @@ Miro-style, and the canvas keeps who drew what. It is the first plugin of
   *Presentar*, a presentation mode: fullscreen, never asked for (an in-page view where the browser has none or
   refuses it; opened from a `?present=1` link, which comes with no click, it goes fullscreen at the first click or key), the
   artifact as wide as the screen, the editing chrome hidden behind a few floating controls (laser, pen, interact,
-  undo, exit), the laser as the tool, and Esc to leave; everyone else follows the presenter's view with a banner
+  undo, exit), the laser as the tool, the arrow keys, Page Up/Down and Space to step a deck's slides with any tool,
+  and Esc to leave; everyone else follows the presenter's view with a banner
   and a "Dejar de seguir" button, the presenter's own other tabs and devices too. `?present=1` on a canvas link
-  opens it straight in presentation mode. *Seguir a* follows one person.
+  opens it straight in presentation mode, at the page top (or at its `#anchor`). *Seguir a* follows one person.
 - **Attribution**: every shape records who created and last edited it, and when. Name tags, a hover card, an
   authors panel with counts and a per-person show/hide toggle, and a history timeline. Attribution is stamped by
   the server from the verified identity into a separate **ledger** document that clients only receive, never
@@ -107,7 +108,8 @@ side that still hides tools pages it (`docs/screenshots/phone-390x844.png`,
 
 Keyboard: V select, H hand (or hold Space), I interact (use the artifact), D pen, ⇧D highlighter, E eraser, A arrow, L line, T text, N note,
 R rectangle, O ellipse, F frame, K laser, ⌘Z / ⇧⌘Z undo/redo, ⌘A, ⌘D duplicate, ⌘G / ⇧⌘G group, ⇧L lock,
-[ / ] back/front, ⇧1 zoom to fit, ⇧0 100%, Delete, Esc (also leaves presentation mode).
+[ / ] back/front, ⇧1 zoom to fit, ⇧0 100%, Delete, Esc (also leaves presentation mode). Presenting: → ↓ Page Down
+Space next slide, ← ↑ Page Up ⇧Space previous.
 
 ## Full system: the canvas as a plugin of the core (Docker Compose)
 
