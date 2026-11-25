@@ -407,6 +407,36 @@ test('?present=1, the first press on the board goes fullscreen; Esc or the exit 
   expect((await fsAsked(X.page)).asked).toHaveLength(1);
   expect((await presentState(X.page)).fullscreen).toBe(false);
   await X.close();
+  // the exit button from the keyboard (Tab to it, Enter): the same
+  const K = await open(browser, 'Ana', newRoom('present-link-exit-key'), link);
+  await expect.poll(async () => (await presentState(K.page)).how).toBe('fallback');
+  await K.page.getByTestId('present-exit').focus();
+  await K.page.keyboard.press('Enter');
+  await expect.poll(async () => (await presentState(K.page)).mode).toBe(false);
+  await K.page.waitForTimeout(300);
+  expect(await fsAsked(K.page)).toMatchObject({ changes: 0 });
+  expect((await fsAsked(K.page)).asked).toHaveLength(1);
+  await K.close();
+});
+
+test('?present=1 on a touch screen: the first tap asks for fullscreen from inside its pointerup, and a tap on the exit button never does', async ({ browser }) => {
+  const touch = { query: { present: '1' }, initScript: fsProbe('first'), viewport: { width: 390, height: 844 }, mobile: true };
+  const T = await open(browser, 'Ana', newRoom('present-link-touch'), touch);
+  await expect.poll(async () => (await presentState(T.page)).how).toBe('fallback');
+  await expectNoPrompt(T.page);
+  await T.page.touchscreen.tap(195, 420);
+  await expect.poll(async () => (await fsAsked(T.page)).asked.length).toBe(2);
+  expect((await fsAsked(T.page)).asked[1]).toBe('pointerup');
+  await expect.poll(async () => (await presentState(T.page)).how).toBe('fullscreen');
+  await T.close();
+  const X = await open(browser, 'Ana', newRoom('present-link-touch-exit'), touch);
+  await expect.poll(async () => (await presentState(X.page)).how).toBe('fallback');
+  await X.page.getByTestId('present-exit').tap();
+  await expect.poll(async () => (await presentState(X.page)).mode).toBe(false);
+  await X.page.waitForTimeout(300);
+  expect(await fsAsked(X.page)).toMatchObject({ changes: 0 });
+  expect((await fsAsked(X.page)).asked).toHaveLength(1);
+  await X.close();
 });
 
 test('?present=1 on a page of links: the first press on a floating control goes fullscreen and sets its tool; a slide link still works, and a page opened from a link presents in the page, asking nothing', async ({ browser }) => {
