@@ -110,6 +110,17 @@ Each fixed entry names its regression tests.
   navigation"). Tests: `client/e2e/viewport-units.spec.ts` (arrow key in presentation mode, a
   follower in a smaller window). Left: WebKit keeps such a scroll inside the cross-origin frame, so
   there the deck's own arrows move nothing (its slide links still work, as anchors).
+- [x] **L-9 — Presenting from a link asked for fullscreen (Low).** A browser grants fullscreen only
+  inside a user gesture, and a page load is none: a `?present=1` link (in a mail, a showcase, or the
+  next page of an artifact opened while presenting) showed the in-page view with an "Entrar en
+  pantalla completa" button, and so did any refused request (Esc, then *Presentar* at once). Now
+  nothing asks: the mode stays maximised in the page, and the presenter's first press on the board or
+  the floating controls, or first key other than Esc, asks for fullscreen from inside its own handler,
+  once, while it still does its job (a laser point, a tool, a slide). Refused again, the page stays
+  maximised. Esc and the exit button end the mode and never ask; *Presentar* goes fullscreen inside
+  its own click, as before; a browser with no Fullscreen API keeps the in-page view. Tests:
+  `client/e2e/present.spec.ts` (the button, the link with a key, a press on the board or a control as
+  the first gesture, a refused request, Esc and the exit button, the next page of a link).
 
 ## Review of the fv9 branch (security and QA)
 

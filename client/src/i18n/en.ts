@@ -182,7 +182,6 @@ export const en: Record<MessageKey, string> = {
   'cursor.viewing': 'viewing',
   'present.badge': 'Presenting · Esc to exit',
   'present.exit': 'Exit the presentation (Esc)',
-  'present.fullscreen': '⛶ Enter full screen',
   'link.blocked': 'That link cannot be opened from the canvas.',
   'canvas.show': 'Show canvas',
   'canvas.hide': 'Hide canvas',

@@ -1,5 +1,42 @@
 import { expect, test, type Page } from '@playwright/test';
-import { newRoom, open } from './helpers';
+import { newRoom, open, ready } from './helpers';
+
+const frameOf = (p: Page) => p.frameLocator('iframe.artifact-frame');
+
+/**
+ * A click on an element of the artifact where it is on the screen, once the camera stands still.
+ * In a headed window that went fullscreen, Playwright's box of an element inside the frame leaves
+ * out the camera's scale (Chromium 1254), so its own click lands beside it: the point comes from
+ * the frame element's box in this page and the element's box in the frame.
+ */
+async function clickInFrame(p: Page, selector: string) {
+  await settle(p);
+  const f = (await p.locator('iframe.artifact-frame').boundingBox())!;
+  const r = await frameOf(p).locator(selector).evaluate((el) => {
+    const b = el.getBoundingClientRect();
+    return { x: b.x, y: b.y, w: b.width, h: b.height, vw: window.innerWidth };
+  });
+  const k = f.width / r.vw;
+  await p.mouse.click(f.x + (r.x + Math.min(r.w / 2, 30)) * k, f.y + (r.y + r.h / 2) * k);
+}
+
+/** Is the element of the artifact in the top third of what the camera shows (world = page px)? */
+async function nearTop(p: Page, selector: string): Promise<boolean> {
+  const y = await frameOf(p).locator(selector).evaluate((el) => el.getBoundingClientRect().top + window.scrollY);
+  const v = await p.evaluate(() => (window as any).__canvas.editor.visibleWorld());
+  return y >= v.y && y - v.y < v.h / 3;
+}
+
+/** Wait until the window size and the camera have stood still for 300 ms. */
+async function settle(p: Page) {
+  let last = '';
+  await expect.poll(async () => {
+    const now = JSON.stringify(await p.evaluate(() => [innerWidth, innerHeight, (window as any).__canvas.editor.camera]));
+    const same = now === last;
+    last = now;
+    return same;
+  }, { intervals: [300] }).toBe(true);
+}
 
 /** Centre and zoom of what a tab sees. */
 const view = (p: Page) => p.evaluate(() => {
@@ -23,6 +60,34 @@ const presentState = (p: Page) => p.evaluate(() => ({
   following: (window as any).__canvas.editor.followingUserId,
   search: location.search,
 }));
+
+/**
+ * Counts the page's fullscreen requests, each with the event being handled when it was made (the
+ * gesture it rides on), and the fullscreen changes. `refuse`: 'first' fails the first request as a
+ * browser does without a gesture (a page load is none, but the test driver's own calls count as
+ * gestures, so the refusal is made certain), 'all' fails every one (a policy), 'none' leaves the
+ * answer to the browser.
+ */
+const fsProbe = (refuse: 'none' | 'first' | 'all') => `(() => {
+  if (window !== window.top) return;
+  const real = Element.prototype.requestFullscreen;
+  window.__fs = { asked: [], changes: 0 };
+  document.addEventListener('fullscreenchange', () => { window.__fs.changes++; });
+  Element.prototype.requestFullscreen = function (o) {
+    const n = window.__fs.asked.push(window.event ? window.event.type : null);
+    if ('${refuse}' === 'all' || ('${refuse}' === 'first' && n === 1)) return Promise.reject(new TypeError('Permissions check failed'));
+    return real.call(this, o);
+  };
+})();`;
+const fsAsked = (p: Page) => p.evaluate(() => (window as any).__fs as { asked: (string | null)[]; changes: number });
+
+/** Nothing in the page asks for fullscreen: presenting shows the badge and the floating controls only. */
+async function expectNoPrompt(p: Page) {
+  await expect(p.getByTestId('present-fullscreen')).toHaveCount(0);
+  await expect(p.locator('button', { hasText: /pantalla completa|full screen/i })).toHaveCount(0);
+  expect(await p.locator('.present-ui > *').evaluateAll((els) => els.map((el) => el.getAttribute('data-testid'))))
+    .toEqual(['present-badge', 'present-controls']);
+}
 
 test('the laser shows a laser cursor, the toolbar marks it, and the others see a laser dot', async ({ browser }) => {
   const room = newRoom('laser-cursor');
@@ -97,18 +162,19 @@ test('the laser on a touch screen shows a dot under the finger', async ({ browse
   await B.close();
 });
 
-test('Presentar enters presentation mode: fullscreen, chrome hidden, laser, badge; Esc leaves it', async ({ browser }) => {
-  const A = await open(browser, 'Ana', newRoom('present-mode'));
+test('Presentar goes fullscreen at once, asking nothing: chrome hidden, laser, badge; Esc and the exit button leave it', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('present-mode'), { initScript: fsProbe('none') });
   const p = A.page;
   await p.keyboard.press('e');
   await expect(p.getByTestId('present')).toHaveAttribute('title', /pantalla completa.*siguen tu vista/);
   await p.getByTestId('present').click();
   await expect.poll(async () => (await presentState(p)).mode).toBe(true);
-  // the click is the gesture fullscreen needs (the refused and missing cases: the next test)
+  // the click is the gesture fullscreen needs: one request, inside it (refused and missing: the next tests)
   await expect.poll(async () => (await presentState(p)).how).toBe('fullscreen');
   const st = await presentState(p);
   expect(st.fullscreen).toBe(true);
-  await expect(p.getByTestId('present-fullscreen')).toBeHidden();
+  expect(await fsAsked(p)).toEqual({ asked: ['click'], changes: 1 });
+  await expectNoPrompt(p);
   expect(st.presenting).toBe(true);
   expect(st.tool).toBe('laser');
   expect(st.search).toContain('present=1');
@@ -163,36 +229,51 @@ test('Esc then "Presentar" at once: the end of the old fullscreen does not end t
   const st = await presentState(p);
   expect(st.presenting).toBe(true);
   expect(st.how).toBe('fallback');
-  // fullscreen is one click away
-  await expect(p.getByTestId('present-fullscreen')).toBeVisible();
-  await p.getByTestId('present-fullscreen').click();
+  // in the page, asking nothing; the next key goes fullscreen and still does its job (the pen)
+  await expectNoPrompt(p);
+  await p.keyboard.press('d');
   await expect.poll(async () => (await presentState(p)).how).toBe('fullscreen');
+  expect((await presentState(p)).tool).toBe('draw');
   await A.close();
 });
 
-test('presentation mode falls back to an in-page view where fullscreen is refused or missing', async ({ browser }) => {
-  // refused (a policy, no gesture): the in-page view and a one-click prompt
-  const refuse = 'Element.prototype.requestFullscreen = function () { return Promise.reject(new TypeError("denied")); };';
-  const A = await open(browser, 'Ana', newRoom('present-refused'), { initScript: refuse });
+test('presentation mode stays in the page, asking nothing, where fullscreen is refused or missing', async ({ browser }) => {
+  // refused (a policy): the in-page view, nothing asked
+  const A = await open(browser, 'Ana', newRoom('present-refused'), { initScript: fsProbe('all') });
   await A.page.getByTestId('present').click();
   await expect.poll(async () => (await presentState(A.page)).how).toBe('fallback');
   await expect(A.page.getByTestId('present-badge')).toBeVisible();
-  await expect(A.page.getByTestId('present-fullscreen')).toBeVisible();
   await expect(A.page.getByTestId('toolbar')).toBeHidden();
+  await expectNoPrompt(A.page);
+  // the next press tries once more from inside it; refused again, the page stays as it is
+  await A.page.mouse.click(700, 450);
+  await expect.poll(async () => (await fsAsked(A.page)).asked).toEqual(['click', 'pointerdown']);
+  await A.page.keyboard.press('k');
+  await A.page.mouse.click(720, 460);
+  await A.page.waitForTimeout(300);
+  expect(await fsAsked(A.page)).toEqual({ asked: ['click', 'pointerdown'], changes: 0 });
+  expect(await presentState(A.page)).toMatchObject({ mode: true, how: 'fallback', presenting: true });
+  await expectNoPrompt(A.page);
   await A.page.keyboard.press('Escape');
   await expect.poll(async () => (await presentState(A.page)).mode).toBe(false);
-  await expect(A.page.getByTestId('present-fullscreen')).toBeHidden();
   await A.close();
-  // no Fullscreen API at all (an iPhone): the in-page view, no prompt
+  // no Fullscreen API at all (an iPhone): the in-page view, nothing asked, a tap changes nothing
   const none = "Object.defineProperty(Document.prototype, 'fullscreenEnabled', { get: () => false }); Element.prototype.requestFullscreen = undefined;";
   const B = await open(browser, 'Ana', newRoom('present-none'), { initScript: none, viewport: { width: 390, height: 844 }, mobile: true });
+  const errors: string[] = [];
+  B.page.on('pageerror', (e) => errors.push(e.message));
   await B.page.evaluate(() => (window as any).__canvas.editor.setTool('select'));
   await B.page.getByTestId('present').tap();
   await expect.poll(async () => (await presentState(B.page)).how).toBe('fallback');
-  await expect(B.page.getByTestId('present-fullscreen')).toBeHidden();
+  await expectNoPrompt(B.page);
   await expect(B.page.getByTestId('present-controls')).toBeVisible();
+  await B.page.touchscreen.tap(195, 420);
+  await B.page.waitForTimeout(300);
+  expect(await presentState(B.page)).toMatchObject({ mode: true, how: 'fallback' });
+  await expectNoPrompt(B.page);
   await B.page.getByTestId('present-exit').tap();
   await expect.poll(async () => (await presentState(B.page)).mode).toBe(false);
+  expect(errors).toEqual([]);
   await B.close();
 });
 
@@ -258,31 +339,34 @@ test("the presenter's own other session follows it; the presenting session does 
   await A2.close();
 });
 
-test('?present=1 opens in presentation mode after load and offers one click for fullscreen', async ({ browser }) => {
+test('?present=1 opens in presentation mode in the page, asking nothing; the first key goes fullscreen and does its job, then the deck steps', async ({ browser }) => {
   const room = newRoom('present-link');
-  const B = await open(browser, 'Marta', room);
-  // A browser refuses fullscreen without a user gesture, and a page load is none. The test
-  // driver's own calls count as gestures, so the refusal is made certain: the first request
-  // fails as the browser's would, later ones go to the real API.
-  const refuseFirst = `(() => {
-    const real = Element.prototype.requestFullscreen;
-    let first = true;
-    Element.prototype.requestFullscreen = function (o) {
-      if (first) { first = false; return Promise.reject(new TypeError('Permissions check failed')); }
-      return real.call(this, o);
-    };
-  })();`;
-  const A = await open(browser, 'Ana', room, { query: { present: '1' }, initScript: refuseFirst });
+  const B = await open(browser, 'Marta', room, { artifact: 'scroll-deck.html' });
+  // a browser refuses fullscreen without a gesture, and a page load is none (fsProbe 'first')
+  const A = await open(browser, 'Ana', room, { artifact: 'scroll-deck.html', query: { present: '1' }, initScript: fsProbe('first') });
   await expect.poll(async () => (await presentState(A.page)).mode).toBe(true);
-  const st = await presentState(A.page);
-  expect(st).toMatchObject({ presenting: true, tool: 'laser' });
-  // refused: the in-page view, and a one-click prompt asks for fullscreen
+  expect(await presentState(A.page)).toMatchObject({ presenting: true, tool: 'laser' });
   await expect.poll(async () => (await presentState(A.page)).how).toBe('fallback');
-  await expect(A.page.getByTestId('present-fullscreen')).toHaveText('⛶ Entrar en pantalla completa');
-  await A.page.getByTestId('present-fullscreen').click();
-  await expect.poll(async () => (await presentState(A.page)).how).toBe('fullscreen');
-  await expect(A.page.getByTestId('present-fullscreen')).toBeHidden();
+  await expect.poll(async () => (await fsAsked(A.page)).asked.length).toBe(1);
+  await A.page.waitForTimeout(300);
+  await expectNoPrompt(A.page);
   await expect(B.page.getByTestId('banner-text')).toHaveText('Ana está presentando');
+  // the first key: fullscreen, asked from inside its keydown, and the key's own job (the interact tool)
+  await A.page.keyboard.press('i');
+  await expect.poll(async () => (await presentState(A.page)).how).toBe('fullscreen');
+  expect((await fsAsked(A.page)).asked[1]).toBe('keydown');
+  expect((await presentState(A.page)).tool).toBe('interact');
+  // the deck's own arrow key steps to the next screen (a click in it first, as before)
+  const top = () => A.page.evaluate(() => (window as any).__canvas.editor.visibleWorld().y);
+  await clickInFrame(A.page, '#s1 p');
+  await A.page.keyboard.press('ArrowDown');
+  const before = await top();
+  await expect.poll(async () => (await top()) !== before).toBe(true);
+  // the camera shows the screen the deck went to
+  const tops = await frameOf(A.page).locator('.scr').evaluateAll((els) => els.map((el) => el.getBoundingClientRect().top + window.scrollY));
+  await expect.poll(async () => { const t = await top(); return tops.some((y) => Math.abs(y - t) < 3); }).toBe(true);
+  expect((await fsAsked(A.page)).asked).toHaveLength(2);
+  expect((await presentState(A.page)).how).toBe('fullscreen');
   // leaving fullscreen by Esc ends the mode
   await A.page.keyboard.press('Escape');
   await expect.poll(async () => (await presentState(A.page)).mode).toBe(false);
@@ -290,4 +374,67 @@ test('?present=1 opens in presentation mode after load and offers one click for 
   await expect(B.page.getByTestId('banner')).toBeHidden();
   await A.close();
   await B.close();
+});
+
+test('?present=1, the first press on the board goes fullscreen; Esc or the exit button as the first gesture never do', async ({ browser }) => {
+  const link = { query: { present: '1' }, initScript: fsProbe('first') };
+  // a press on the board: fullscreen, asked from inside the pointerdown; the laser still points
+  const A = await open(browser, 'Ana', newRoom('present-link-press'), link);
+  await expect.poll(async () => (await presentState(A.page)).how).toBe('fallback');
+  await expectNoPrompt(A.page);
+  await A.page.mouse.click(700, 450);
+  await expect.poll(async () => (await presentState(A.page)).how).toBe('fullscreen');
+  expect((await fsAsked(A.page)).asked[1]).toBe('pointerdown');
+  expect((await presentState(A.page)).tool).toBe('laser');
+  await A.close();
+  // Esc: the mode ends, nothing more asked, never fullscreen
+  const E = await open(browser, 'Ana', newRoom('present-link-esc'), link);
+  await expect.poll(async () => (await presentState(E.page)).how).toBe('fallback');
+  await E.page.keyboard.press('Escape');
+  await expect.poll(async () => (await presentState(E.page)).mode).toBe(false);
+  await E.page.waitForTimeout(300);
+  expect(await fsAsked(E.page)).toMatchObject({ changes: 0 });
+  expect((await fsAsked(E.page)).asked).toHaveLength(1);
+  expect((await presentState(E.page)).fullscreen).toBe(false);
+  await E.close();
+  // the exit button: the same
+  const X = await open(browser, 'Ana', newRoom('present-link-exit'), link);
+  await expect.poll(async () => (await presentState(X.page)).how).toBe('fallback');
+  await X.page.getByTestId('present-exit').click();
+  await expect.poll(async () => (await presentState(X.page)).mode).toBe(false);
+  await X.page.waitForTimeout(300);
+  expect(await fsAsked(X.page)).toMatchObject({ changes: 0 });
+  expect((await fsAsked(X.page)).asked).toHaveLength(1);
+  expect((await presentState(X.page)).fullscreen).toBe(false);
+  await X.close();
+});
+
+test('?present=1 on a page of links: the first press on a floating control goes fullscreen and sets its tool; a slide link still works, and a page opened from a link presents in the page, asking nothing', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('present-link-links'), { artifact: 'links.html', query: { present: '1' }, initScript: fsProbe('first') });
+  const p = A.page;
+  await expect.poll(async () => (await presentState(p)).how).toBe('fallback');
+  await expectNoPrompt(p);
+  // the first press, on the interact control: fullscreen from inside the pointerdown, and the tool
+  await p.getByTestId('present-tool-interact').click();
+  await expect.poll(async () => (await presentState(p)).how).toBe('fullscreen');
+  expect((await fsAsked(p)).asked[1]).toBe('pointerdown');
+  expect((await presentState(p)).tool).toBe('interact');
+  // an anchor of the page brings its target to the top of the view (and back)
+  expect(await nearTop(p, '#section-3')).toBe(false);
+  await clickInFrame(p, '#anchor');
+  await expect.poll(() => nearTop(p, '#section-3')).toBe(true);
+  await clickInFrame(p, '#back');
+  await expect.poll(() => nearTop(p, '#top')).toBe(true);
+  // a link to another page opens it presenting: in the page (no gesture came with the load), nothing asked
+  await clickInFrame(p, '#internal');
+  await p.waitForURL(/\/_canvas\/links-b\.html\?.*present=1/);
+  await ready(p);
+  await expect.poll(async () => (await presentState(p)).mode).toBe(true);
+  await expect.poll(async () => (await presentState(p)).how).toBe('fallback');
+  await p.waitForTimeout(300);
+  await expectNoPrompt(p);
+  await p.keyboard.press('k');
+  await expect.poll(async () => (await presentState(p)).how).toBe('fullscreen');
+  expect((await fsAsked(p)).asked[1]).toBe('keydown');
+  await A.close();
 });

@@ -80,7 +80,8 @@ arrowheads, opacity, bring to front / send to back, group / ungroup, lock / unlo
 - Every participant has a **live cursor** labelled with their name, or with the anonymous pseudonym.
 - Presence avatars sit top right.
 - **Presentar.** The presenter's viewport (scroll and zoom) becomes the one the others follow. For the presenter it is a
-  presentation mode: fullscreen where the browser allows it, the artifact as wide as the screen, the editing chrome
+  presentation mode: fullscreen where the browser allows it, never asked for (opened from a link, at the presenter's
+  first click or key), the artifact as wide as the screen, the editing chrome
   hidden behind a few floating controls, the laser as the tool, Esc to leave. The others get a banner, "<name> está
   presentando", with a "Dejar de seguir" button; the presenter's own other tabs and devices follow too.
   `?present=1` on a canvas link opens it in presentation mode.
