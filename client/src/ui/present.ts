@@ -159,15 +159,14 @@ export function buildPresentation(ed: Editor, root: HTMLElement) {
   // The next gesture after a refusal asks for fullscreen, from inside its handler (the browser
   // wants the gesture there). It only listens: the press or key still does its own job (a laser
   // point, a tool, a slide link). A press goes with a mouse, a release with a finger or a pen
-  // (the events that carry the gesture). Esc and the exit button end the mode instead.
+  // (the events that carry the gesture). Esc and the exit button end the mode instead: a press on
+  // the button, or a key while it has the focus (Enter or Space press it).
   const onGesture = (e: Event) => {
     if (!retryOnGesture || !ed.presenting || fullscreenElement()) return;
+    if (e.target instanceof Node && exit.contains(e.target)) return;
     if (e instanceof KeyboardEvent) {
       if (LONE_KEYS.has(e.key)) return;
-    } else {
-      if ((e.type === 'pointerdown') !== ((e as PointerEvent).pointerType === 'mouse')) return;
-      if (e.target instanceof Node && exit.contains(e.target)) return;
-    }
+    } else if ((e.type === 'pointerdown') !== ((e as PointerEvent).pointerType === 'mouse')) return;
     if (!hasActivation()) return;
     retryOnGesture = false;
     void requestFullscreen().catch(() => undefined);
