@@ -19,6 +19,7 @@
   var timer = setInterval(function () {
     parent.postMessage({ source: s, type: 'link', href: to, newTab: false }, '*');
     parent.postMessage({ source: s, type: 'link', href: 'https://external.test/forged', newTab: true }, '*');
+    parent.postMessage({ source: s, type: 'link', href: new URL('x.zip', location.href).href, newTab: false }, '*');
     parent.postMessage({ source: s, type: 'anchor', x: 0, y: 1200 }, '*');
     parent.postMessage({ source: s, type: 'wheel', dx: 0, dy: 900, mode: 0, zoom: false, shift: false, x: 10, y: 10 }, '*');
     parent.postMessage({ source: s, type: 'key', key: 'Escape' }, '*');

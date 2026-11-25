@@ -144,7 +144,8 @@ arrowheads, opacity, bring to front / send to back, group / ungroup, lock / unlo
 - **A permission leak.** The canvas or its storage must never show anything about an artifact (content, existence,
   drawings, who drew) to someone the gate would deny.
 - **Weaker artifact isolation.** Today every artifact is served with `Content-Security-Policy: sandbox
-  allow-scripts`, which gives it an opaque origin: no cookies, no storage, no same-origin fetch. That must stay true.
+  allow-scripts allow-downloads`, which gives it an opaque origin: no cookies, no storage, no same-origin fetch; a
+  download is the one addition. That must stay true.
   Artifact HTML must never run in an origin that holds the Entra session cookie or can reach the canvas API with the
   user's identity.
 - **Forged attribution.** One user must not be able to draw as another.
@@ -159,8 +160,8 @@ arrowheads, opacity, bring to front / send to back, group / ungroup, lock / unlo
 The first deployment of `artifacts` is a private one; its values live outside this repository. The constraints
 that shape the canvas are:
 
-- **Artifacts are sandboxed.** The artifacts host stamps `Content-Security-Policy: sandbox allow-scripts` on every
-  artifact response. An artifact page cannot hold cookies, storage or same-origin calls, so the canvas cannot run
+- **Artifacts are sandboxed.** The artifacts host stamps `Content-Security-Policy: sandbox allow-scripts allow-downloads`
+  on every artifact response. An artifact page cannot hold cookies, storage or same-origin calls, so the canvas cannot run
   inside the artifact's own document. It needs its own page.
 - **The gate** is one small, stdlib-only, auditable process with a public listener (request-access) and an internal
   forwardAuth listener. It keeps its state in the bucket under its own prefix with a least-privilege S3 user. It has

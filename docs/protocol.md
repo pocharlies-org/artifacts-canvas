@@ -126,8 +126,9 @@ A link to another page keeps `canvas=` when the URL had it.
 The client renders `frameUrl` in `<iframe sandbox="allow-scripts">` — never
 `allow-same-origin` — so the artifact runs in an opaque origin: no cookies, no storage, no
 same-origin access to the wrapper. The frame response MUST also carry
-`Content-Security-Policy: sandbox allow-scripts` (defence in depth; the same header the host
-already stamps on artifacts) and `Cache-Control: no-store`.
+`Content-Security-Policy: sandbox allow-scripts` (defence in depth; the host stamps one token
+wider on the plain artifact, `sandbox allow-scripts allow-downloads`, and the frame stays stricter
+on purpose, see Links) and `Cache-Control: no-store`.
 
 **Reporter injection.** The service MUST insert `client/dist/reporter.js` (or
 `client/public/reporter.js`; same file) as an inline `<script>` right after the opening
@@ -224,6 +225,21 @@ does it for the user, in `client/src/artifact/links.ts`:
   with `noopener,noreferrer`; so does an internal link clicked with ⌘/ctrl/shift, the middle
   button or `target="_blank"`. Everything else (`data:`, `blob:`, `file:`, `mailto:`, …) is
   blocked with a toast.
+- A non-HTML file is saved, not opened. A link to a file under the artifact base (a relative link,
+  or an absolute link to the plain artifact URL or to a canvas URL of the same bucket) whose last
+  path segment has an extension other than `html` or `htm` (any case) is a `download`: the wrapper
+  clicks an `<a download>` on the plain artifact URL `/<bucket>/<key>` in this tab, so the tab stays
+  on its page, for a zip, csv, png, pdf, svg or txt alike. The URL is the artifact base and the
+  sanitised, encoded key, with no query and no fragment; `target="_blank"` and the modifier clicks
+  do not open a window for it, and a failed response (403, 404) leaves the page in place. A path
+  ending in `/` is a page, never a file. The gesture rule of the `link` message below applies, so
+  the artifact's own script can start a download only in the gesture window that rule allows (after
+  a click of the viewer in the artifact), and only of an object the viewer may read. The frame itself
+  never downloads: it has no `allow-downloads`.
+  The core sends `Content-Security-Policy: sandbox allow-scripts allow-downloads` on every artifact
+  read: a page of an artifact can start downloads and still has no same-origin access, no popups and
+  no top navigation. A plugin's frame can stay stricter on purpose: downloads reach the user through
+  the unsandboxed page of the plugin, never through the frame.
 - The artifact's own scripts share the frame with the reporter and can post the same messages,
   so the wrapper checks more than their shape. A `link` or `anchor` message is taken only with
   a user gesture on the wrapper (`navigator.userActivation.isActive`: a click in the frame
