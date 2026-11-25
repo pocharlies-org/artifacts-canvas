@@ -180,7 +180,6 @@ export const es = {
   'cursor.viewing': 'viendo',
   'present.badge': 'Presentando · Esc para salir',
   'present.exit': 'Salir de la presentación (Esc)',
-  'present.fullscreen': '⛶ Entrar en pantalla completa',
   'link.blocked': 'Ese enlace no se puede abrir desde el lienzo.',
   'canvas.show': 'Mostrar canvas',
   'canvas.hide': 'Ocultar canvas',

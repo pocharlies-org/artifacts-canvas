@@ -14,7 +14,8 @@ Miro-style, and the canvas keeps who drew what. It is the first plugin of
   artifact opens that file's canvas, so annotations follow per page. Style panel with 12 colours, fills, strokes (solid, dashed, dotted, sketchy), sizes, fonts,
   arrowheads, opacity, order, group and lock. Per-user undo, zoom, zoom to fit, minimap.
 - **Live**: strokes appear on every screen while they are drawn; live cursors with names; presence avatars;
-  *Presentar*, a presentation mode: fullscreen (an in-page view where the browser has none or refuses it), the
+  *Presentar*, a presentation mode: fullscreen, never asked for (an in-page view where the browser has none or
+  refuses it; opened from a `?present=1` link, which comes with no click, it goes fullscreen at the first click or key), the
   artifact as wide as the screen, the editing chrome hidden behind a few floating controls (laser, pen, interact,
   undo, exit), the laser as the tool, and Esc to leave; everyone else follows the presenter's view with a banner
   and a "Dejar de seguir" button, the presenter's own other tabs and devices too. `?present=1` on a canvas link

@@ -112,6 +112,17 @@ Each fixed entry names its regression tests.
   there the deck's own arrows move nothing (its slide links still work, as anchors).
 - [ ] **L-9 — Script-built `blob:` and `data:` downloads stay blocked in the canvas; on the plain artifact page they work (Medium; a product decision).** A button that builds a file in the artifact's script and downloads it through a `blob:` or `data:` link is refused in the canvas: the reporter stops the click and the wrapper blocks the scheme. The plain artifact page allows downloads, so the same button saves the file there. The frame keeps `sandbox allow-scripts` only; a fix in the canvas needs a hand-off from the frame that checks the viewer's gesture, and is a separate change.
 - [ ] **L-10 — A download link redirected to a sign-in page on the same host saves that page as a file (Low).** The browser follows the redirect like any download and saves the HTML under the page's name (for example `login.html`), where the link named a zip. A redirect to another host navigates the tab to that page, as a plain link does. Seen in a probe with a local server; the gate's own sign-in redirect is not yet checked in a browser.
+- [x] **L-11 — Presenting from a link asked for fullscreen (Low).** A browser grants fullscreen only
+  inside a user gesture, and a page load is none: a `?present=1` link (in a mail, a showcase, or the
+  next page of an artifact opened while presenting) showed the in-page view with an "Entrar en
+  pantalla completa" button, and so did any refused request (Esc, then *Presentar* at once). Now
+  nothing asks: the mode stays maximised in the page, and the presenter's first press on the board or
+  the floating controls, or first key other than Esc, asks for fullscreen from inside its own handler,
+  once, while it still does its job (a laser point, a tool, a slide). Refused again, the page stays
+  maximised. Esc and the exit button end the mode and never ask; *Presentar* goes fullscreen inside
+  its own click, as before; a browser with no Fullscreen API keeps the in-page view. Tests:
+  `client/e2e/present.spec.ts` (the button, the link with a key, a press on the board or a control as
+  the first gesture, a refused request, Esc and the exit button, the next page of a link).
 
 ## Review of the fv9 branch (security and QA)
 

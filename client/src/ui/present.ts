@@ -10,8 +10,11 @@ import { h } from './dom';
  *     the browser allows it, else it stays a maximised in-page view (an iPhone has no
  *     Fullscreen API); the editing chrome is hidden and a few floating controls stay (laser,
  *     pen, interact, undo, exit), with a "Presentando · Esc para salir" badge.
- *   - Fullscreen needs a user gesture. Without one (the deep link) the browser refuses, and a
- *     one-click "Entrar en pantalla completa" button asks for it.
+ *   - Fullscreen needs a user gesture, and the mode never asks for one. Without it (the deep
+ *     link, a page opened from a link while presenting) the browser refuses, and the mode stays
+ *     maximised in the page; the presenter's next gesture (a press on the board or the controls,
+ *     a key other than Esc) then asks for fullscreen from inside its own handler, once, and still
+ *     does its own job. Refused again, the page stays maximised, silently.
  *   - Esc, the exit button, or leaving fullscreen by any other way ends the mode.
  * `document.body.dataset.present` says how it shows: `fullscreen`, `fallback` (in-page) or
  * absent (not presenting); the tests read it.
@@ -51,8 +54,11 @@ function exitFullscreen() {
   else d.webkitExitFullscreen?.();
 }
 
-/** The fullscreen request failed (no gesture, a policy): the one-click prompt shows. */
-let refused = false;
+/**
+ * The mode is on but not fullscreen (refused: no gesture, a policy): the presenter's next gesture
+ * asks for it (buildPresentation's onGesture). One try; nothing shows meanwhile.
+ */
+let retryOnGesture = false;
 
 /** Enter presentation mode; call it from a click (fullscreen needs the gesture) or the deep link. */
 export function startPresentation(ed: Editor) {
@@ -61,27 +67,29 @@ export function startPresentation(ed: Editor) {
 }
 
 function tryFullscreen(ed: Editor) {
-  refused = false;
-  if (fullscreenElement()) return;
-  if (!fullscreenEnabled()) {
-    ed.emit('present');
-    return;
-  }
+  retryOnGesture = false;
+  if (fullscreenElement() || !fullscreenEnabled()) return;
   void requestFullscreen().catch(() => {
-    refused = true;
-    ed.emit('present');
+    if (ed.presenting && !fullscreenElement()) retryOnGesture = true;
   });
 }
+
+/** Does this page have a user gesture now? A browser without the API may: it is tried. */
+function hasActivation(): boolean {
+  const ua = (navigator as Navigator & { userActivation?: { isActive: boolean } }).userActivation;
+  return ua ? ua.isActive : true;
+}
+
+/** Keys that alone are no gesture to ask with (a browser may not count them). */
+const LONE_KEYS = new Set(['Escape', 'Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock', 'Fn', 'Dead', 'Unidentified']);
 
 export function stopPresentation(ed: Editor) {
   ed.setPresenting(false);
 }
 
-/** Badge, floating controls and the fullscreen prompt; keeps body classes and the URL in step. */
+/** Badge and floating controls; keeps body classes and the URL in step, and fullscreen on the next gesture. */
 export function buildPresentation(ed: Editor, root: HTMLElement) {
   const badge = h('div', { class: 'present-badge', 'data-testid': 'present-badge', role: 'status' }, t('present.badge'));
-  const fsBtn = h('button', { class: 'present-fs', 'data-testid': 'present-fullscreen', hidden: true }, t('present.fullscreen'));
-  fsBtn.addEventListener('click', () => tryFullscreen(ed));
 
   const tools: { id: ToolId; icon: string; tip: MessageKey }[] = [
     { id: 'laser', icon: '✦', tip: 'tool.laser' },
@@ -96,7 +104,7 @@ export function buildPresentation(ed: Editor, root: HTMLElement) {
   const exit = h('button', { class: 'tool exit', 'data-tip': t('present.exit'), 'aria-label': t('present.exit'), 'data-testid': 'present-exit', onclick: () => stopPresentation(ed) }, '✕');
   const controls = h('div', { class: 'present-controls', role: 'toolbar', 'data-testid': 'present-controls' },
     ...toolBtns.map((x) => x.b), h('div', { class: 'sep' }), undo, exit);
-  const ui = h('div', { class: 'present-ui' }, badge, fsBtn, controls);
+  const ui = h('div', { class: 'present-ui' }, badge, controls);
   root.append(ui);
 
   const syncTools = () => {
@@ -115,14 +123,13 @@ export function buildPresentation(ed: Editor, root: HTMLElement) {
     document.body.classList.toggle('present-mode', on);
     if (on) document.body.dataset.present = fs ? 'fullscreen' : 'fallback';
     else delete document.body.dataset.present;
-    fsBtn.hidden = !on || fs || !refused || !fullscreenEnabled();
     if (!on && fs && wasFullscreen) {
       // this exit is the mode's own (it ended first): its fullscreenchange comes later, maybe after
       // a new presentation started (Esc, then "Presentar" at once), and must not end that one
       wasFullscreen = false;
       exitFullscreen();
     }
-    if (!on) refused = false;
+    if (!on) retryOnGesture = false;
     // the URL says it too, on every change: a reload presents again, and after the mode ends it does not
     if (on !== lastOn) {
       lastOn = on;
@@ -137,18 +144,37 @@ export function buildPresentation(ed: Editor, root: HTMLElement) {
     const fs = !!fullscreenElement();
     if (fs) {
       wasFullscreen = true;
-      refused = false;
+      retryOnGesture = false;
     } else if (wasFullscreen) {
       wasFullscreen = false;
       // Esc in fullscreen (the browser takes that key) or the browser's own exit: the mode ends
       if (ed.presenting) ed.setPresenting(false);
     } else if (ed.presenting) {
       // the mode's own exit finished after a new presentation started (it could not ask for
-      // fullscreen while the exit was under way): it stays in the page, with the one-click prompt
-      refused = true;
+      // fullscreen while the exit was under way): it stays in the page, and the next gesture asks
+      retryOnGesture = fullscreenEnabled();
     }
     sync();
   };
+  // The next gesture after a refusal asks for fullscreen, from inside its handler (the browser
+  // wants the gesture there). It only listens: the press or key still does its own job (a laser
+  // point, a tool, a slide link). A press goes with a mouse, a release with a finger or a pen
+  // (the events that carry the gesture). Esc and the exit button end the mode instead.
+  const onGesture = (e: Event) => {
+    if (!retryOnGesture || !ed.presenting || fullscreenElement()) return;
+    if (e instanceof KeyboardEvent) {
+      if (LONE_KEYS.has(e.key)) return;
+    } else {
+      if ((e.type === 'pointerdown') !== ((e as PointerEvent).pointerType === 'mouse')) return;
+      if (e.target instanceof Node && exit.contains(e.target)) return;
+    }
+    if (!hasActivation()) return;
+    retryOnGesture = false;
+    void requestFullscreen().catch(() => undefined);
+  };
+  document.addEventListener('pointerdown', onGesture, true);
+  document.addEventListener('pointerup', onGesture, true);
+  document.addEventListener('keydown', onGesture, true);
   document.addEventListener('fullscreenchange', onFsChange);
   document.addEventListener('webkitfullscreenchange', onFsChange);
   ed.on('present', sync);

@@ -160,8 +160,6 @@ body.present-mode .present-ui { display: block; }
 body.present-mode .topleft, body.present-mode .topright, body.present-mode .side, body.present-mode .bottomrow { display: none !important; }
 .present-badge { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 45; background: rgba(17,24,39,.86); color: #fff; font-size: 12.5px; font-weight: 600; padding: 6px 12px; border-radius: 999px; white-space: nowrap; pointer-events: none; }
 .present-badge::before { content: "●"; color: #ff2d55; margin-right: 6px; }
-.present-fs { position: fixed; top: 50px; left: 50%; transform: translateX(-50%); z-index: 46; border: 0; border-radius: 10px; padding: 10px 16px; background: var(--blue); color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; box-shadow: 0 6px 20px rgba(0,0,0,.25); white-space: nowrap; }
-.present-fs[hidden] { display: none; }
 .present-controls { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 45; display: flex; align-items: center; gap: 2px; padding: 6px; background: rgba(17,24,39,.88); border-radius: 14px; box-shadow: 0 6px 20px rgba(0,0,0,.25); }
 .present-controls .tool { color: #e5e7eb; }
 .present-controls .tool:hover { background: rgba(255,255,255,.12); }
