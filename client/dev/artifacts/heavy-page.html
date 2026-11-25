@@ -13,7 +13,8 @@
       SPIN_MS of main thread;
     - many sections that fade in when an IntersectionObserver reports them;
     - a video (a canvas stream, drawn by a timer).
-  window.__heavy says how many frames the scene drew and the canvas's size (client/e2e/perf.spec.ts).
+  window.__heavy says how many frames the scene drew, when (Date.now()), and the canvas's size
+  (client/e2e/perf.spec.ts).
 -->
 <style>
   html, body { margin: 0; background: #0b1020; color: #e5e7eb; font: 16px/1.5 system-ui, sans-serif; }
@@ -78,7 +79,7 @@
   // the WebGL scene, sized to the screen as most 3D pages do
   var canvas = document.getElementById('gl');
   var gl = canvas.getContext('webgl', { antialias: false });
-  var state = window.__heavy = { frames: 0, w: 0, h: 0, cssH: 0, gl: !!gl };
+  var state = window.__heavy = { frames: 0, at: [], w: 0, h: 0, cssH: 0, gl: !!gl };
   var prog = null;
   var uT = null;
   var uR = null;
@@ -118,6 +119,8 @@
   function frame(now) {
     requestAnimationFrame(frame);
     state.frames++;
+    state.at.push(Date.now());
+    if (state.at.length > 4000) state.at.shift();
     var t0 = performance.now();
     if (gl) {
       gl.viewport(0, 0, canvas.width, canvas.height);

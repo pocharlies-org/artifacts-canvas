@@ -359,3 +359,17 @@ test('viewport units from every source of CSS resolve against the reference scre
   await expect.poll(() => share('js')).toBeCloseTo(0.08, 2);
   await A.close();
 });
+
+test('a reveal script that compares with innerHeight on scroll sees the whole page; sizing code sees one screen', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('scroll-reveal'), { artifact: 'scroll-reveal.html' });
+  const f = frameOf(A.page).locator('html');
+  // the page's load check saw one screen; the reporter's scroll after load showed it the whole page
+  await expect.poll(() => f.evaluate(() => Array.from(document.querySelectorAll('.rv')).map((el) => el.classList.contains('in')))).toEqual([true, true, true, true, true, true]);
+  expect(await f.evaluate(() => window.innerHeight)).toBe(Math.round(REF_H));
+  // hidden and shown again: still all there
+  await A.page.evaluate(() => (window as any).__canvas.editor.setCanvasVisible(false));
+  await A.page.evaluate(() => (window as any).__canvas.editor.setCanvasVisible(true));
+  await expect.poll(() => f.evaluate(() => window.innerHeight)).toBe(Math.round(REF_H));
+  expect(await f.evaluate(() => document.querySelectorAll('.rv.in').length)).toBe(6);
+  await A.close();
+});

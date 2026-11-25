@@ -175,10 +175,12 @@ own scripts, changes them in canvas mode only:
   innerHeight)`) drew a canvas as tall as the page on every frame (980 x 6615 px on a twelve-screen
   page), and one that sizes its sections to it grew the page with the frame. When a mode change
   changes the height the page sees, the page gets a `resize` (its scripts run before the wrapper
-  says the mode, so a page shown as itself first reads the reference height). A script that
-  reveals what lies within `innerHeight` of the top on scroll sees one screen: the page never
-  scrolls in canvas mode, so only the first screen passes its test; the reveal scripts of
-  `IntersectionObserver` see the whole page (below).
+  says the mode, so a page shown as itself first reads the reference height). Scroll handlers see
+  the whole page in view, as an `IntersectionObserver` does (below): a page that reveals what lies
+  within `innerHeight` of the top when it scrolls never scrolls in canvas mode, so once the page
+  has loaded, and each time the canvas is shown again, the reporter sends it one `scroll` during
+  which these heights are the page's whole height. A reveal that waits for an animation frame
+  after the scroll, or reads the height only at load, sees one screen.
 - **Reveal scripts.** Pages that fade sections in as they scroll into view hide them until an
   `IntersectionObserver` reports them. In the frame, a cross-origin child of a transformed board,
   an observer with the implicit root is measured against the wrapper's viewport, so most sections
@@ -209,9 +211,11 @@ on the page's own animation; with the canvas hidden the page scrolls by itself a
 mode, 120 fps scrolling hidden; 114 fps with the hold). So in canvas mode, while the camera moves
 (a pan, a zoom, following a presenter, a glide to a slide), the wrapper says so (`motion`, at most
 every 100 ms) and the reporter holds the page's `requestAnimationFrame` callbacks; once no `motion`
-has come for 250 ms they run, in one frame, with that frame's time, as the browser would have
-called them. A callback cancelled while held never runs. CSS animations, videos and timers go on.
-Native mode never holds.
+has come for 250 ms they run, in one frame, in the order they were asked for, with that frame's
+time, as the browser would have called them. A callback cancelled while held never runs. CSS
+animations, videos and timers go on. Native mode never holds, and nor does a snapshot (an export
+taken while a follower's camera moves). A page that animates its own scrolling frame by frame
+(each step a camera move in canvas mode) advances about every 250 ms.
 
 **Presenting a deck** (`client/src/editor/slides.ts`, `Editor.stepSlide`). In presentation mode
 → ↓ Page Down Space step forward and ← ↑ Page Up ⇧Space step back, whatever the tool (laser, pen,

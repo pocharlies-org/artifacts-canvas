@@ -471,7 +471,10 @@
     if (!d || typeof d.get !== 'function' || !d.configurable) return;
     var real = d.get;
     var get = function () {
-      var h = native || (test && !test(this)) ? 0 : refHeight();
+      if (native || (test && !test(this))) return real.call(this);
+      // the whole page, whatever height the frame has reached yet
+      if (wholeView) return Math.max(real.call(this), docEl ? docEl.scrollHeight : 0, document.body ? document.body.scrollHeight : 0);
+      var h = refHeight();
       return h > 0 ? h : real.call(this);
     };
     Object.defineProperty(obj, name, { configurable: true, enumerable: d.enumerable, get: get, set: d.set });
@@ -493,11 +496,25 @@
     seenHeight = h;
   }
 
+  /**
+   * Scroll handlers see the whole page in view, as an IntersectionObserver does (below): a page that
+   * reveals what lies within `innerHeight` of the top when it scrolls never scrolls in canvas mode.
+   * Once the page has loaded, and each time the canvas is shown again, the reporter sends it one
+   * `scroll` during which the height scripts read is the page's whole height.
+   */
+  var wholeView = false;
+  function revealScroll() {
+    if (native) return;
+    wholeView = true;
+    try { document.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (e) { /* ignore */ }
+    wholeView = false;
+  }
+
   function installScreenHeight() {
     screenGetter(window, 'innerHeight', window);
     seenHeight = window.innerHeight;
     var E = window.Element && Element.prototype;
-    if (E) screenGetter(E, 'clientHeight', E, function (el) { return el === document.documentElement && document.compatMode !== 'BackCompat'; });
+    if (E) screenGetter(E, 'clientHeight', E, function (el) { return el === (document.compatMode === 'BackCompat' ? document.body : document.documentElement); });
     var vv = window.visualViewport;
     var V = window.VisualViewport && VisualViewport.prototype;
     if (vv && V) screenGetter(vv, 'height', V);
@@ -515,11 +532,12 @@
   var holdUntil = 0;
   var parked = [];
   var releaseTimer = 0;
-  var flushId = 0;
+  var flushing = null; // the callbacks a flush is running (a cancel still takes one out)
+  var snapshots = 0; // a snapshot (export) never waits for the camera
   var realRaf = window.requestAnimationFrame;
   var realCaf = window.cancelAnimationFrame;
   function nowMs() { return window.performance && performance.now ? performance.now() : Date.now(); }
-  function holding() { return !native && holdUntil > nowMs(); }
+  function holding() { return !native && !snapshots && holdUntil > nowMs(); }
 
   function runFrame(cb, t) {
     try { cb(t); } catch (err) {
@@ -527,14 +545,16 @@
     }
   }
 
+  /** Run the held callbacks in the next frame (a second flush finds none left: harmless). */
   function flushParked() {
-    if (flushId || !parked.length) return;
-    flushId = realRaf.call(window, function (t) {
-      flushId = 0;
+    if (!parked.length) return;
+    realRaf.call(window, function (t) {
       if (holding()) { scheduleRelease(); return; }
       var list = parked;
       parked = [];
-      for (var i = 0; i < list.length; i++) runFrame(list[i].cb, t);
+      flushing = list;
+      for (var i = 0; i < list.length; i++) if (list[i].cb) runFrame(list[i].cb, t);
+      flushing = null;
     });
   }
 
@@ -558,7 +578,8 @@
     window.requestAnimationFrame = function requestAnimationFrame(cb) {
       if (typeof cb !== 'function') return realRaf.call(window, cb); // the browser's TypeError
       var id = realRaf.call(window, function (t) {
-        if (holding()) {
+        // held, or older callbacks still wait for their flush: they go first
+        if (holding() || parked.length) {
           parked.push({ id: id, cb: cb });
           scheduleRelease();
           return;
@@ -574,6 +595,7 @@
           return;
         }
       }
+      if (flushing) for (var j = 0; j < flushing.length; j++) if (flushing[j].id === id) flushing[j].cb = null;
       return realCaf.call(window, id);
     };
   }
@@ -668,6 +690,7 @@
     if (was !== native) {
       try { applyUnits(); } catch (e) { /* ignore */ }
       try { screenHeightChanged(); } catch (e) { /* ignore */ }
+      if (!native) setTimeout(revealScroll, 0);
       try { ioMode(); } catch (e) { /* ignore */ }
       try { if (native) scheduleNote(); else scheduleReading(); } catch (e) { /* ignore */ }
     }
@@ -842,8 +865,12 @@
     var scale = Math.max(0.1, Math.min(4, Number(d.scale) || 1, 16000 / fullH, 16000 / fullW));
     var broken = brokenImages();
     var realFetch = window.fetch;
+    // the camera may move meanwhile (a follower): the export's own animation frames are not held
+    snapshots++;
+    flushParked();
     var restore = function () {
       if (realFetch && window.fetch !== realFetch) window.fetch = realFetch;
+      snapshots = Math.max(0, snapshots - 1);
     };
     loadLib(lib).then(function (H) {
       if (realFetch) window.fetch = countingFetch(realFetch);
@@ -1061,5 +1088,8 @@
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
   else start();
-  window.addEventListener('load', function () { reportTitle(); reportSize(); checkBg(); });
+  window.addEventListener('load', function () {
+    reportTitle(); reportSize(); checkBg();
+    setTimeout(revealScroll, 0); // after the page's own load handlers
+  });
 })();

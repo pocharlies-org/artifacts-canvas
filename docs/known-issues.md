@@ -136,11 +136,14 @@ Each fixed entry names its regression tests.
   screen's height (protocol §3 "The screen height scripts read"). The deck pans at 114 fps (5 %
   dropped). Not the cause, measured and left as they are: the translucent chrome's
   `backdrop-filter`, the page's rounded clip, the zoom level and `will-change` on the board (each off
-  changed nothing). Left: a script that reveals what lies within `innerHeight` of the top on scroll
-  reveals the first screen only (the page never scrolls in canvas mode); an `IntersectionObserver`
-  reveal is not affected. Tests: `client/e2e/perf.spec.ts` with `client/dev/artifacts/heavy-page.html`
-  (the scene is one screen, the page's frames wait during a pan and resume, a pan over it keeps 85 %
-  of a plain page's frame rate).
+  changed nothing). A reveal script that compares positions with `innerHeight` when the page
+  scrolls still reveals the whole page: once loaded the reporter sends it one `scroll` during which
+  the height is the page's. Left: such a script that waits for an animation frame after the scroll,
+  or checks only at load, reveals the first screen; an `IntersectionObserver` reveal is not affected.
+  Tests: `client/e2e/perf.spec.ts` with `client/dev/artifacts/heavy-page.html` (the scene is one
+  screen, no page frame runs during a pan and they resume after it, a pan over it keeps 70 % of a
+  plain page's frame rate in headless CI) and `client/e2e/viewport-units.spec.ts` with
+  `client/dev/artifacts/scroll-reveal.html` (Chromium, Firefox and WebKit).
 
 ## Review of the fv9 branch (security and QA)
 
