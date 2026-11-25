@@ -11,6 +11,9 @@
  *     what opens: docs/protocol.md §3 "Links"), scrolls to same-document anchors through the
  *     parent, and hands the parent the wheel that no element of the page scrolls,
  *   - on the parent's request, says whether there is a link under a point, or follows it,
+ *   - on the parent's request (a presentation), says where the page's slides are and where the
+ *     target of a #hash is, and passes on the keys that step a presentation when the page itself
+ *     leaves them,
  *   - posts the page's background colour (html, else body, else white) when it changes, so the
  *     canvas board can follow it (a theme toggle included),
  *   - in "native" mode (the canvas hidden: the page is shown as itself) lets the page scroll on
@@ -835,8 +838,62 @@
     post({ type: 'wheel', dx: e.deltaX, dy: e.deltaY, mode: e.deltaMode, zoom: zoom, shift: e.shiftKey, x: e.clientX + (window.scrollX || 0), y: e.clientY + (window.scrollY || 0) });
   }, { passive: false });
 
+  // ---- slides (docs/protocol.md §3 "Presenting a deck") ----
+  // A presentation steps the page with the arrow keys, Page Up/Down and Space, whatever the tool:
+  // the wrapper asks where the slides are and brings the next or the previous one to the top, as
+  // it does for a same-document anchor. The slides are the page's scroll-snap points (a deck snaps
+  // its screens); a page without any has none, and the wrapper steps it a screen at a time. Snap
+  // points inside an element that scrolls on its own (a carousel) are left out: the camera cannot
+  // step them.
+  var MAX_SLIDES = 500;
+  var MAX_SCAN = 20000;
+
+  /** Is `el` inside an element of the page that scrolls by itself (it overflows its own box)? */
+  function inScroller(el) {
+    for (var n = el.parentElement; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+      var cs = window.getComputedStyle(n);
+      if ((/(auto|scroll|hidden)/.test(cs.overflowY) && n.scrollHeight > n.clientHeight + 1) ||
+          (/(auto|scroll|hidden)/.test(cs.overflowX) && n.scrollWidth > n.clientWidth + 1)) return true;
+    }
+    return false;
+  }
+
+  /** The tops (document px) of the page's slides (its scroll-snap points), sorted, without duplicates. */
+  function slideTops() {
+    var tops = [];
+    var add = function (y) {
+      y = Math.round(y);
+      if (!(y >= 0 && y < BOARD_MAX)) return;
+      for (var i = 0; i < tops.length; i++) if (Math.abs(tops[i] - y) < 2) return;
+      tops.push(y);
+    };
+    var all = document.body ? document.body.getElementsByTagName('*') : [];
+    for (var i = 0; i < all.length && i < MAX_SCAN && tops.length < MAX_SLIDES; i++) {
+      var a = String(window.getComputedStyle(all[i]).scrollSnapAlign || 'none');
+      if (a === 'none' || a.indexOf('none') === 0) continue; // none, or none in the block axis
+      var r = all[i].getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && !inScroller(all[i])) add(r.top + (window.scrollY || 0));
+    }
+    return tops.sort(function (x, y) { return x - y; });
+  }
+
+  /** The keys that step a presentation (the wrapper's editor/slides.ts has the same list). */
+  var STEP_KEYS = { ArrowRight: 1, ArrowDown: 1, PageDown: 1, ArrowLeft: 1, ArrowUp: 1, PageUp: 1, ' ': 1, Spacebar: 1 };
+
+  /** Is the user typing into the page (a field, an editable element)? */
+  function typingIn(t) {
+    var tag = t && t.localName ? String(t.localName).toLowerCase() : '';
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || !!(t && t.isContentEditable);
+  }
+
   window.addEventListener('keydown', function (e) {
     if (e.key === 'Escape' && !e.defaultPrevented) post({ type: 'key', key: 'Escape' });
+    else if (!native && STEP_KEYS[e.key] === 1 && !e.altKey && !e.ctrlKey && !e.metaKey && !e.isComposing && !typingIn(e.target)) {
+      // after the page's own handlers have run: a key the page took (its own navigation) stays its own
+      setTimeout(function () {
+        if (!e.defaultPrevented) post({ type: 'key', key: e.key, shift: !!e.shiftKey });
+      }, 0);
+    }
   });
 
   // The parent's select tool: a link under a point (probe), and following it (click).
@@ -845,6 +902,11 @@
     var d = e.data;
     if (d && d.source === 'artifacts-canvas' && d.type === 'mode') {
       setNative(d.native === true);
+      return;
+    }
+    if (d && d.source === 'artifacts-canvas' && d.type === 'slides') {
+      var at = typeof d.hash === 'string' && d.hash.length > 1 ? anchorTarget(d.hash) : null;
+      post({ type: 'slides', id: String(d.id || '').slice(0, 32), tops: native ? [] : slideTops(), target: at });
       return;
     }
     if (!d || d.source !== 'artifacts-canvas' || (d.type !== 'probe' && d.type !== 'click')) return;

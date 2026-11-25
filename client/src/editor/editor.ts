@@ -13,6 +13,7 @@ import {
 } from '../collab/follow';
 import type { Notice } from '../collab/protocol';
 import { ArtifactFrame, type FrameReading, type FrameWheel } from '../artifact/frame';
+import { nextSlide, screenStep, stepOf } from './slides';
 import { canvasUrl, classifyLink, downloadUrl, linkContext, type LinkContext } from '../artifact/links';
 import { DEFAULT_BOARD, isDark, opaque, toCss, type Rgba } from '../ui/theme';
 import { Renderer } from '../render/renderer';
@@ -43,6 +44,8 @@ export const FOLLOW_SETTLE_MS = 500;
 const PRESENT_MAX_ZOOM = 2;
 /** Presentation mode: screen px above the page top, under the "Presentando" badge. */
 const PRESENT_TOP = 48;
+/** A presentation opened from a link still shows the page top while the line under the badge is above this (artifact px). */
+const SLIDE_AT_TOP = 8;
 /** A scroll of the stage (a page's scrollIntoView) is taken as a camera move once it has been still this long. */
 const STAGE_SCROLL_SETTLE_MS = 200;
 /** After the canvas is shown, the frame's reading position (where the hidden page was read) is taken this long. */
@@ -166,6 +169,10 @@ export class Editor {
       },
       escape: () => {
         if (this.tool === 'interact' && !this.hidden && this.focusInFrame()) this.escape();
+      },
+      // a step key the page left (it has no navigation of its own for it): as the same key on the canvas
+      step: (dir) => {
+        if (this.presenting && this.tool === 'interact' && this.focusInFrame() && userActivated()) this.stepSlide(dir);
       },
       background: (c) => this.applyBackground(c),
       reading: (r) => this.onReading(r),
@@ -399,18 +406,20 @@ export class Editor {
 
   /**
    * Presentation mode on or off. On: this tab follows nobody, the others (this person's other
-   * tabs too) follow it, the laser is the tool and the artifact fills the screen width. Off:
-   * the tool from before comes back, and the followers are released. Fullscreen is the UI's
+   * tabs too) follow it, the laser is the tool and the artifact fills the screen width, from the
+   * line at the top of the view (*Presentar* keeps the reading position) or, with `fromTop`, from
+   * the page top (a `?present=1` link: wherever the camera was, a presenter it followed included).
+   * Off: the tool from before comes back, and the followers are released. Fullscreen is the UI's
    * part (ui/present.ts): it needs the click that started it.
    */
-  setPresenting(on: boolean) {
+  setPresenting(on: boolean, fromTop = false) {
     if (on === this.fstate.presenting) return;
     if (on && this.hidden) this.setCanvasVisible(true);
     if (on) {
       this.toolBeforePresenting = { tool: this.tool, geo: this.geoKind };
       this.setFollowState(startPresenting(this.fstate));
       if (this.tool !== 'laser') this.setTool('laser');
-      this.fitForPresentation();
+      this.fitForPresentation(fromTop ? 0 : undefined);
     } else {
       this.setFollowState(stopPresenting(this.fstate, this.followPeers(), this.selfClientId()));
       const back = this.toolBeforePresenting;
@@ -680,14 +689,52 @@ export class Editor {
 
   /**
    * Presentation: the artifact page as wide as the screen (up to PRESENT_MAX_ZOOM), the line at
-   * the top of the view kept at the top (the page top, under the badge, when it was in view).
+   * the top of the view kept at the top (the page top, under the badge, when it was in view), or
+   * the line `at` (artifact px; 0: the page top, under the badge).
    */
-  fitForPresentation() {
+  fitForPresentation(at?: number) {
     if (this.viewW <= 0) return;
     const pad = this.viewW < 760 ? 6 : 24;
     const z = clampZoom(Math.min(PRESENT_MAX_ZOOM, (this.viewW - 2 * pad) / this.pageWidth));
-    const top = Math.max(0, this.visibleWorld().y);
+    const top = at ?? Math.max(0, this.visibleWorld().y);
     this.setCamera({ z, tx: (this.viewW - this.pageWidth * z) / 2, ty: top > 0 ? -top * z : PRESENT_TOP }, 'system');
+  }
+
+  /**
+   * A presentation opened from a link with a `#hash` (`?present=1#s3`): its target at the top, under
+   * the badge, once the frame says where it is. Not when the presenter moved first, or the page has
+   * no such target (the presentation stays at the page top).
+   */
+  async presentAt(hash: string) {
+    if (hash.length < 2) return;
+    const s = await this.frame.slides(hash);
+    if (!s?.target || !this.presenting || this.presentLine() > SLIDE_AT_TOP) return;
+    this.revealTop({ x: this.visibleWorld().x + this.visibleWorld().w / 2, y: s.target.y });
+  }
+
+  /** Presentation: the line of the page (artifact px) under the badge, where a slide stepped to sits. */
+  private presentLine(): number {
+    return this.visibleWorld().y + PRESENT_TOP / this.camera.z;
+  }
+
+  /**
+   * Presentation: step to the next (1) or the previous (-1) slide of the page, with any tool (the
+   * arrow keys, Page Up/Down, Space). The frame says where the page's slides are; the camera brings
+   * the one after (or before) the line under the badge to the top, as a same-document anchor does,
+   * and the followers follow. With no slide that way (a page without slides, the notes after the
+   * last one), a screen at a time.
+   */
+  stepSlide(dir: 1 | -1) {
+    if (!this.presenting) return;
+    void this.frame.slides().then((s) => {
+      if (!this.presenting) return;
+      const at = this.presentLine();
+      const slide = s?.tops.length ? nextSlide(s.tops, at, dir) : null;
+      const y = slide ?? screenStep(at, dir, (this.viewH - PRESENT_TOP) / this.camera.z, this.pageHeight);
+      if (y === null) return;
+      const vis = this.visibleWorld();
+      this.revealTop({ x: vis.x + vis.w / 2, y });
+    });
   }
 
   private applyPageWidth() {
@@ -1477,6 +1524,16 @@ export class Editor {
     if (isTyping(e.target) || this.hidden) return;
     const mod = e.metaKey || e.ctrlKey;
     const k = e.key.toLowerCase();
+    // presenting: → ↓ Page Down Space and ← ↑ Page Up ⇧Space step the page, whatever the tool or
+    // the selection (a note just written stays selected: the arrows do not nudge it)
+    if (this.presenting && !mod && !e.altKey) {
+      const dir = stepOf(e.key, e.shiftKey);
+      if (dir) {
+        e.preventDefault();
+        this.stepSlide(dir);
+        return;
+      }
+    }
     if (e.code === 'Space') {
       if (!this.spaceDown) {
         this.spaceDown = true;

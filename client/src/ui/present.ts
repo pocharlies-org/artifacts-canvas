@@ -16,6 +16,11 @@ import { h } from './dom';
  *     a key other than Esc) then asks for fullscreen from inside its own handler, once, and still
  *     does its own job. Refused again, the page stays maximised, silently.
  *   - Esc, the exit button, or leaving fullscreen by any other way ends the mode.
+ *   - "Presentar" starts from where the board is being read; `?present=1` starts at the page top,
+ *     or at the target of the link's `#hash`, whatever the camera showed before the page loaded (it
+ *     may have followed someone else's presentation meanwhile).
+ *   - → ↓ Page Down Space and ← ↑ Page Up ⇧Space step the page's slides with any tool
+ *     (Editor.stepSlide).
  * `document.body.dataset.present` says how it shows: `fullscreen`, `fallback` (in-page) or
  * absent (not presenting); the tests read it.
  */
@@ -60,9 +65,12 @@ function exitFullscreen() {
  */
 let retryOnGesture = false;
 
-/** Enter presentation mode; call it from a click (fullscreen needs the gesture) or the deep link. */
-export function startPresentation(ed: Editor) {
-  ed.setPresenting(true);
+/**
+ * Enter presentation mode; call it from a click (fullscreen needs the gesture) or the deep link
+ * (`fromLink`: from the page top, not from the line the camera shows).
+ */
+export function startPresentation(ed: Editor, fromLink = false) {
+  ed.setPresenting(true, fromLink);
   tryFullscreen(ed);
 }
 
@@ -184,10 +192,16 @@ export function buildPresentation(ed: Editor, root: HTMLElement) {
   sync();
 }
 
-/** `?present=1`: open in presentation mode once the page (and the artifact frame) has loaded. */
+/**
+ * `?present=1`: open in presentation mode once the page (and the artifact frame) has loaded, at the
+ * page top, or at the target of the URL's `#hash` (`?present=1#s3`).
+ */
 export function presentFromUrl(ed: Editor) {
   if (new URLSearchParams(location.search).get('present') !== '1') return;
-  const go = () => startPresentation(ed);
+  const go = () => {
+    startPresentation(ed, true);
+    void ed.presentAt(location.hash);
+  };
   if (document.readyState === 'complete') go();
   else window.addEventListener('load', go, { once: true });
 }

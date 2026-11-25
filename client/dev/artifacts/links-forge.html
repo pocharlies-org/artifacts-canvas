@@ -8,8 +8,8 @@
 <body>
 <div class="wrap">
   <h1>Forged messages</h1>
-  <p>This page's own script posts the reporter's link, anchor, wheel and key messages to the canvas,
-  every 400 ms for 8 s, without the user acting on the page. The canvas must ignore them all.</p>
+  <p>This page's own script posts the reporter's link, anchor, wheel, key and slides messages to the
+  canvas, every 400 ms for 8 s, without the user acting on the page. The canvas must ignore them all.</p>
   <p id="forged">0</p>
 </div>
 <script>
@@ -23,6 +23,8 @@
     parent.postMessage({ source: s, type: 'anchor', x: 0, y: 1200 }, '*');
     parent.postMessage({ source: s, type: 'wheel', dx: 0, dy: 900, mode: 0, zoom: false, shift: false, x: 10, y: 10 }, '*');
     parent.postMessage({ source: s, type: 'key', key: 'Escape' }, '*');
+    parent.postMessage({ source: s, type: 'key', key: 'ArrowDown', shift: false }, '*');
+    parent.postMessage({ source: s, type: 'slides', id: 's' + n, tops: [600, 1200], target: { x: 0, y: 1200 } }, '*');
     document.getElementById('forged').textContent = String(++n);
     if (n >= 20) clearInterval(timer);
   }, 400);

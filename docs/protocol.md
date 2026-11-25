@@ -191,6 +191,24 @@ own scripts, changes them in canvas mode only:
   WebKit keeps such a scroll inside the cross-origin frame: there the deck's own arrows move
   nothing (its slide links still work, as anchors).
 
+**Presenting a deck** (`client/src/editor/slides.ts`, `Editor.stepSlide`). In presentation mode
+→ ↓ Page Down Space step forward and ← ↑ Page Up ⇧Space step back, whatever the tool (laser, pen,
+interact) and whatever is selected; a key typed into a text or a note stays the text's. The
+wrapper asks the reporter where the page's slides are (`slides`): the tops of its scroll-snap
+points (a deck snaps its screens), leaving out those inside an element that scrolls on its own
+(a carousel). The camera brings the first slide below the line under the badge to the top (back:
+the last one above it, so a view in the middle of a slide goes back to that slide's top; the page
+top is always a stop), the same move as a same-document anchor, and the followers follow. With no
+slide that way (a page without snap points, notes after the last slide) a step is most of a
+screen, between the page top and the page end. With the interact tool and the focus in the frame
+the key reaches the page first: when the page's own handler takes it (`preventDefault`, its own
+navigation, see above) nothing more happens; when it leaves it, the reporter passes it on (`key`)
+and the wrapper steps. A presentation opened from a link (`?present=1`) starts at the page top,
+whatever the camera showed while the page loaded (it may have followed someone else's
+presentation of the same page meanwhile), or, with a `#hash` (`?present=1#s3`), at the target of
+that anchor once the reporter has said where it is (`slides` with `hash`; a hash the page lacks
+leaves it at the top). *Presentar* clicked on the board keeps the reading position.
+
 **Reading position.** While the canvas is hidden (native mode) the reporter notes the block the
 user is reading: from 12 % of the view down, the first block box narrower than the view under the
 centre (or a third, or two thirds) of it, outside any fixed or sticky layer, with its box on the
@@ -286,6 +304,8 @@ clamped):
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'anchor', x, y}` a same-document anchor was followed: its target's position in artifact px |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'wheel', dx, dy, mode, zoom, shift, x, y}` a wheel over the artifact that no element of the page scrolled (interact tool) |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'key', key:'Escape'}` Escape pressed in the artifact |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'key', key, shift}` a key that steps a presentation (→ ↓ Page Down Space ← ↑ Page Up), pressed in the artifact outside a field and left by the page's own handlers (canvas mode); see "Presenting a deck" |
+| wrapper → frame | `{source:'artifacts-canvas', type:'slides', id, hash}` where are the page's slides, and the target of `hash` (`''`: none)? Answered `{source:'artifacts-canvas-reporter', type:'slides', id, tops, target}`: the tops of the scroll-snap points in artifact px (at most 500; none in native mode), and `{x, y}` or `null`; the wrapper takes an answer only to an id it asked, and clamps every number to the page |
 | wrapper → frame | `{source:'artifacts-canvas', type:'probe', id, x, y}` is there a link at (x, y)? Answered `{source:'artifacts-canvas-reporter', type:'probe', id, link}` |
 | wrapper → frame | `{source:'artifacts-canvas', type:'click', x, y, newTab}` follow the link at (x, y), if any (the select tool's click) |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'bg', color}` the page's background colour (see "Background") |

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slide deck test page</title>
+<style>
+  /* A deck as a template writes it: no script at all. Slides of a fixed shape (sizes in vw, never
+     vh) stacked down the page, snapping, and a plain #sN link on each to the previous and the next. */
+  :root{--bg:#101826;--fg:#eef2f8;--muted:#9fb0c8;--accent:#5aa9ff;--line:rgba(255,255,255,.1)}
+  html{background:var(--bg);color:var(--fg);scroll-snap-type:y proximity}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.3}
+  .slide{position:relative;box-sizing:border-box;width:100%;aspect-ratio:49/27;padding:4.6vw 6vw 5vw;display:flex;
+    flex-direction:column;justify-content:center;gap:2vw;border-bottom:1px solid var(--line);scroll-snap-align:start}
+  .kicker{margin:0;font-size:clamp(13px,1.6vw,24px);letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:600}
+  h1,h2{margin:0;line-height:1.08}
+  h1{font-size:clamp(32px,6.4vw,104px)}
+  h2{font-size:clamp(26px,4.4vw,72px)}
+  p{font-size:clamp(17px,2.5vw,40px);margin:0;color:var(--muted)}
+  .nav{position:absolute;right:4vw;bottom:2.4vw;display:flex;align-items:center;gap:1vw;font-size:clamp(13px,1.6vw,22px);color:var(--muted)}
+  .nav a{display:inline-block;padding:.2em .6em;border:1px solid var(--line);border-radius:.4em;color:var(--fg);text-decoration:none}
+</style>
+</head>
+<body>
+<section class="slide" id="s1"><p class="kicker">Deck</p><h1>Eight slides, no script</h1><p>Plain links step it.</p>
+  <nav class="nav" aria-label="Slides"><span>1 / 8</span><a href="#s2" aria-label="Next slide">›</a></nav></section>
+<section class="slide" id="s2"><p class="kicker">Two</p><h2>The second slide</h2><p>Each slide is 980 × 540 on the board.</p>
+  <nav class="nav" aria-label="Slides"><a href="#s1" aria-label="Previous slide">‹</a><span>2 / 8</span><a href="#s3" aria-label="Next slide">›</a></nav></section>
+<section class="slide" id="s3"><p class="kicker">Three</p><h2>The third slide</h2><p>A link can open the deck here.</p>
+  <nav class="nav" aria-label="Slides"><a href="#s2" aria-label="Previous slide">‹</a><span>3 / 8</span><a href="#s4" aria-label="Next slide">›</a></nav></section>
+<section class="slide" id="s4"><p class="kicker">Four</p><h2>The fourth slide</h2><p>Arrow keys step it while presenting.</p>
+  <nav class="nav" aria-label="Slides"><a href="#s3" aria-label="Previous slide">‹</a><span>4 / 8</span><a href="#s5" aria-label="Next slide">›</a></nav></section>
+<section class="slide" id="s5"><p class="kicker">Five</p><h2>The fifth slide</h2><p>Followers see the same slide.</p>
+  <nav class="nav" aria-label="Slides"><a href="#s4" aria-label="Previous slide">‹</a><span>5 / 8</span><a href="#s6" aria-label="Next slide">›</a></nav></section>
+<section class="slide" id="s6"><p class="kicker">Six</p><h2>The sixth slide</h2><p>Nothing here moves on its own.</p>
+  <nav class="nav" aria-label="Slides"><a href="#s5" aria-label="Previous slide">‹</a><span>6 / 8</span><a href="#s7" aria-label="Next slide">›</a></nav></section>
+<section class="slide" id="s7"><p class="kicker">Seven</p><h2>The seventh slide</h2><p>Almost done.</p>
+  <nav class="nav" aria-label="Slides"><a href="#s6" aria-label="Previous slide">‹</a><span>7 / 8</span><a href="#s8" aria-label="Next slide">›</a></nav></section>
+<section class="slide" id="s8"><p class="kicker">Eight</p><h2>The last slide</h2><p>Back to the start from here.</p>
+  <nav class="nav" aria-label="Slides"><a href="#s7" aria-label="Previous slide">‹</a><span>8 / 8</span><a href="#s1" aria-label="Back to the first slide">↑</a></nav></section>
+</body>
+</html>

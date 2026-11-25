@@ -1,6 +1,7 @@
 import type { Box } from '../geometry/vec';
 import { MAX_LINK_LENGTH } from './links';
 import { parseColor, type Rgba } from '../ui/theme';
+import { stepOf } from '../editor/slides';
 
 /**
  * The artifact, rendered in a sandboxed iframe (`sandbox="allow-scripts"`, never
@@ -19,8 +20,9 @@ import { parseColor, type Rgba } from '../ui/theme';
  * decides what it opens, artifact/links.ts), a same-document anchor into an `anchor` position,
  * and a wheel that nothing inside the page scrolls into a `wheel` message (the camera pans).
  * The select tool asks the reporter which element is under a point (`probe`) and to follow the
- * link there (`click`). Every message is checked: it must come from this frame's window, with
- * the opaque origin "null", the reporter's source tag and the right field types.
+ * link there (`click`); a presentation asks where the page's slides are (`slides`). Every message
+ * is checked: it must come from this frame's window, with the opaque origin "null", the
+ * reporter's source tag and the right field types.
  */
 export const REPORTER_SOURCE = 'artifacts-canvas-reporter';
 const MAX_HEIGHT = 100000;
@@ -56,6 +58,8 @@ export interface FrameEvents {
   wheel?: (w: FrameWheel) => void;
   /** Escape pressed inside the artifact. */
   escape?: () => void;
+  /** A key that steps a presentation (editor/slides.ts stepOf), pressed inside the artifact and left by the page. */
+  step?: (dir: 1 | -1) => void;
   /** The artifact's background colour (checked: rgb(), rgba() or hex only). */
   background?: (c: Rgba) => void;
   /** Where the hidden page was being read, said once the canvas layout is back (FrameReading). */
@@ -74,6 +78,18 @@ export interface FrameReading {
   top: number;
   nw: number;
 }
+
+/**
+ * Where the page's slides are (the reporter's `slides` answer): their tops in artifact px, sorted,
+ * and the target of the #hash asked about, or null.
+ */
+export interface FrameSlides {
+  tops: number[];
+  target: { x: number; y: number } | null;
+}
+
+/** Most slide tops taken from one answer. */
+export const MAX_SLIDES = 500;
 
 /** Most a wheel delta may say (one event); anything bigger is clamped. */
 const MAX_WHEEL = 10000;
@@ -106,6 +122,7 @@ export class ArtifactFrame {
   private growthStreak = 0;
   private probes = new Map<string, (link: boolean) => void>();
   private probeSeq = 0;
+  private slideAsks = new Map<string, (s: FrameSlides | null) => void>();
 
   constructor(parent: HTMLElement, src: string, width: number, initialHeight: number, private vendorUrl: string, private ev: FrameEvents = {}) {
     this.width = width;
@@ -173,9 +190,26 @@ export class ArtifactFrame {
         this.ev.wheel?.({ dx: clamp(d.dx), dy: clamp(d.dy), mode: d.mode, zoom: d.zoom === true, shift: d.shift === true, x: d.x, y: d.y });
         return;
       }
-      case 'key':
-        if (d.key === 'Escape') this.ev.escape?.();
+      case 'key': {
+        if (d.key === 'Escape') {
+          this.ev.escape?.();
+          return;
+        }
+        const dir = typeof d.key === 'string' ? stepOf(d.key, d.shift === true) : 0;
+        if (dir) this.ev.step?.(dir);
         return;
+      }
+      case 'slides': {
+        const cb = typeof d.id === 'string' ? this.slideAsks.get(d.id) : undefined;
+        if (!cb) return;
+        this.slideAsks.delete(d.id as string);
+        const c = (v: number, hi: number) => Math.max(0, Math.min(hi, v));
+        const tops = Array.isArray(d.tops) ? d.tops.slice(0, MAX_SLIDES).filter(finite).map((y) => c(y, this.height)) : [];
+        const t = d.target as Record<string, unknown> | null;
+        const target = t && typeof t === 'object' && finite(t.x) && finite(t.y) ? { x: c(t.x, this.width), y: c(t.y, this.height) } : null;
+        cb({ tops: tops.sort((a, b) => a - b), target });
+        return;
+      }
       case 'probe': {
         const cb = typeof d.id === 'string' ? this.probes.get(d.id) : undefined;
         if (!cb) return;
@@ -271,6 +305,26 @@ export class ArtifactFrame {
         resolve(link);
       });
       win.postMessage({ source: 'artifacts-canvas', type: 'probe', id, x, y }, '*');
+    });
+  }
+
+  /**
+   * Where are the page's slides, and where is the target of `hash` (a `#id`, or '' for none)?
+   * Resolves null when the frame does not say (no reporter, or no answer in time).
+   */
+  slides(hash = '', timeoutMs = 1000): Promise<FrameSlides | null> {
+    const win = this.el.contentWindow;
+    if (!win || !this.loaded) return Promise.resolve(null);
+    const id = `s${++this.probeSeq}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.slideAsks.delete(id)) resolve(null);
+      }, timeoutMs);
+      this.slideAsks.set(id, (s) => {
+        clearTimeout(timer);
+        resolve(s);
+      });
+      win.postMessage({ source: 'artifacts-canvas', type: 'slides', id, hash: hash.slice(0, MAX_LINK_LENGTH) }, '*');
     });
   }
 

@@ -149,7 +149,7 @@ test('while presenting, an internal link keeps presentation mode on the next pag
 });
 
 test("the artifact's own script cannot navigate, open, pan or press keys through the reporter's messages", async ({ browser }) => {
-  // links-forge.html posts link, anchor, wheel and key messages every 400 ms, on its own
+  // links-forge.html posts link, anchor, wheel, key and slides messages every 400 ms, on its own
   const A = await open(browser, 'Ana', newRoom('links-forge'), { artifact: 'links-forge.html' });
   await serveExternal(A.page);
   const before = A.page.url();
