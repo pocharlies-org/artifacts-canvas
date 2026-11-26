@@ -147,5 +147,52 @@ test('a heavy page: the scene is one screen, and a pan does not wait for the pag
   console.log(`PERF pan over a plain page: ${light.fps} fps, p95 frame ${light.p95FrameMs} ms; over the heavy page: ${heavy.fps} fps, p95 frame ${heavy.p95FrameMs} ms, ${heavy.longTasks} long tasks, ${during} page frames during the pan; scene ${s.w}x${s.h}`);
   expect(heavy.longTasks).toBeLessThanOrEqual(1);
   expect(heavy.fps).toBeGreaterThanOrEqual(Math.floor(light.fps * 0.7));
+  // the frame-time budget: the slowest 5 % of the pan's frames take at most two frames of the
+  // plain page's (at 60 Hz, 34 ms: before this fix a real Chrome window dropped to 34 ms at 120 Hz)
+  expect(heavy.p95FrameMs).toBeLessThanOrEqual(Math.max(light.p95FrameMs, 1000 / 60) * 2 + 1);
   await H.close();
+});
+
+// The hold keeps the browser's rules for the page's frames (docs/protocol.md §3 "Camera motion"):
+// held while the camera moves, then run in one frame in the order they were asked for; one
+// cancelled while held, or by a callback of the same flush, never runs. And a page that cancels
+// frame ids it never got (here, every id around its own, all the time) cannot cancel the flush:
+// its held loops would wait for good.
+test('held animation frames run once the camera stands still, in order, and the page cannot cancel the flush', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('perf-hold'));
+  const f = A.page.frameLocator('iframe.artifact-frame').locator('html');
+  const panning = pan(A.page, 1500);
+  await A.page.waitForTimeout(400); // the camera moves: the first `motion` message is in
+  await f.evaluate(() => {
+    const w = window as any;
+    const log: { k: string; t: number; at: number }[] = (w.__hold = []);
+    const note = (k: string) => (t: number) => log.push({ k, t, at: Date.now() });
+    let c = 0;
+    const a = requestAnimationFrame((t) => {
+      note('a')(t);
+      cancelAnimationFrame(c); // cancelled by a callback of the same flush
+    });
+    const b = requestAnimationFrame(note('b'));
+    c = requestAnimationFrame(note('c'));
+    const d = requestAnimationFrame(note('d'));
+    setTimeout(() => cancelAnimationFrame(d), 100); // cancelled while held
+    // between any two tasks (a message loop, not a clamped timer) until the camera has long
+    // stood still: whatever frame the reporter asks for, this cancels it before it comes
+    const mine = new Set([a, b, c, d]);
+    const stopAt = Date.now() + 3500;
+    const ch = new MessageChannel();
+    ch.port1.onmessage = () => {
+      if (Date.now() > stopAt) return;
+      const p = requestAnimationFrame(() => {});
+      for (let i = Math.max(1, p - 50); i <= p + 50; i++) if (!mine.has(i)) cancelAnimationFrame(i);
+      ch.port2.postMessage(0);
+    };
+    ch.port2.postMessage(0);
+  });
+  const p = await panning;
+  await expect.poll(() => f.evaluate(() => (window as any).__hold.map((x: { k: string }) => x.k)), { timeout: 5000 }).toEqual(['a', 'b']);
+  const log = await f.evaluate(() => (window as any).__hold as { k: string; t: number; at: number }[]);
+  expect(log[0].t).toBe(log[1].t); // in one frame
+  expect(log[0].at).toBeGreaterThan(p.wall[1]); // after the camera stood still
+  await A.close();
 });

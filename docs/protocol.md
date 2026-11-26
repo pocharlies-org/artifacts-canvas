@@ -212,7 +212,9 @@ mode, 120 fps scrolling hidden; 114 fps with the hold). So in canvas mode, while
 (a pan, a zoom, following a presenter, a glide to a slide), the wrapper says so (`motion`, at most
 every 100 ms) and the reporter holds the page's `requestAnimationFrame` callbacks; once no `motion`
 has come for 250 ms they run, in one frame, in the order they were asked for, with that frame's
-time, as the browser would have called them. A callback cancelled while held never runs. CSS
+time, as the browser would have called them. A callback cancelled while held, or by an earlier
+callback of the same flush, never runs; the flush itself is a frame whose id the page never got, so
+it cannot cancel it. CSS
 animations, videos and timers go on. Native mode never holds, and nor does a snapshot (an export
 taken while a follower's camera moves). A page that animates its own scrolling frame by frame
 (each step a camera move in canvas mode) advances about every 250 ms.

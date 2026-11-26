@@ -533,6 +533,7 @@
   var parked = [];
   var releaseTimer = 0;
   var flushing = null; // the callbacks a flush is running (a cancel still takes one out)
+  var flushId = 0; // the frame the next flush waits for: the page never got this id, it cannot cancel it
   var snapshots = 0; // a snapshot (export) never waits for the camera
   var realRaf = window.requestAnimationFrame;
   var realCaf = window.cancelAnimationFrame;
@@ -545,10 +546,15 @@
     }
   }
 
-  /** Run the held callbacks in the next frame (a second flush finds none left: harmless). */
+  /**
+   * Run the held callbacks in the next frame. One flush at a time, and the page cannot cancel it: a
+   * page that cancels ids it never got (a "cancel every frame" loop) would otherwise leave its held
+   * loops waiting for good.
+   */
   function flushParked() {
-    if (!parked.length) return;
-    realRaf.call(window, function (t) {
+    if (!parked.length || flushId) return;
+    flushId = realRaf.call(window, function (t) {
+      flushId = 0;
       if (holding()) { scheduleRelease(); return; }
       var list = parked;
       parked = [];
@@ -589,6 +595,7 @@
       return id;
     };
     window.cancelAnimationFrame = function cancelAnimationFrame(id) {
+      if (flushId && id === flushId) return; // the reporter's own flush, not one of the page's frames
       for (var i = 0; i < parked.length; i++) {
         if (parked[i].id === id) {
           parked.splice(i, 1);
@@ -868,7 +875,10 @@
     // the camera may move meanwhile (a follower): the export's own animation frames are not held
     snapshots++;
     flushParked();
+    var restored = false;
     var restore = function () {
+      if (restored) return; // once per snapshot: a throw after it (the catch) must not count twice
+      restored = true;
       if (realFetch && window.fetch !== realFetch) window.fetch = realFetch;
       snapshots = Math.max(0, snapshots - 1);
     };

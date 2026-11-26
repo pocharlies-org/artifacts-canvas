@@ -142,7 +142,9 @@ Each fixed entry names its regression tests.
   or checks only at load, reveals the first screen; an `IntersectionObserver` reveal is not affected.
   Tests: `client/e2e/perf.spec.ts` with `client/dev/artifacts/heavy-page.html` (the scene is one
   screen, no page frame runs during a pan and they resume after it, a pan over it keeps 70 % of a
-  plain page's frame rate in headless CI) and `client/e2e/viewport-units.spec.ts` with
+  plain page's frame rate in headless CI and its slowest 5 % of frames within two of the plain
+  page's; held frames run in one frame and in order, a cancel while held or during the flush holds,
+  and a page that cancels ids it never got cannot cancel the flush) and `client/e2e/viewport-units.spec.ts` with
   `client/dev/artifacts/scroll-reveal.html` (Chromium, Firefox and WebKit).
 
 ## Review of the fv9 branch (security and QA)
