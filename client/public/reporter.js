@@ -18,10 +18,13 @@
  *     canvas board can follow it (a theme toggle included),
  *   - in "native" mode (the canvas hidden: the page is shown as itself) lets the page scroll on
  *     its own, as the plain artifact does,
- *   - in canvas mode, resolves the page's `vh`-family lengths against a fixed reference screen
- *     (the frame's width, 16:9) instead of the page's own height, and lets an
- *     IntersectionObserver report the whole page as in view (sections that a script reveals on
- *     scroll): the whole page is on the board.
+ *   - in canvas mode, resolves the page's `vh`-family lengths, and the screen height its scripts
+ *     read (`innerHeight`), against a fixed reference screen (the frame's width, 16:9) instead of
+ *     the page's own height, and lets an IntersectionObserver report the whole page as in view
+ *     (sections that a script reveals on scroll): the whole page is on the board,
+ *   - in canvas mode, while the canvas camera moves (the parent says so), holds the page's
+ *     animation frames and runs them once it stands still: a pan never waits for the page's own
+ *     animation.
  * It reads no cookies or storage (it has none) and sends nothing anywhere else.
  * Copyright 2026 Daniel Ibáñez. Licensed under the Apache License, Version 2.0.
  */
@@ -86,8 +89,8 @@
   // <style>, insertRule, replace/replaceSync, a stylesheet <link> once loaded) and inline `style`
   // attributes, as they are set. Not covered: a stylesheet loaded with <link> (from this opaque
   // origin every such file is another origin, its rules cannot be read; only a data: URL can),
-  // media queries on the height, the vb family, and `innerHeight` in scripts. The page's scripts
-  // read the rewritten form back (`el.style.height` is the calc() form).
+  // media queries on the height and the vb family. The page's scripts read the rewritten form back
+  // (`el.style.height` is the calc() form). Scripts get the same screen (installScreenHeight).
   var UNIT_VAR = '--artifacts-canvas-';
   var UNIT_RE = /("(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*'|url\(\s*(?:"(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*'|[^)]*)\s*\)|var\(\s*--artifacts-canvas-v[a-z]+\s*,[^)]*\))|(^|[^\w.\-])([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)((?:s|l|d)?v(?:h|min|max))(?![\w-])/gi;
   var UNIT_QUICK = /\d[sld]?v(?:h|min|max)/i;
@@ -450,8 +453,164 @@
     window.IntersectionObserver = IntersectionObserver;
   }
 
+  // ---- the screen height scripts read (docs/protocol.md §3 "Viewport units and reveal scripts") ----
+  // In canvas mode the frame is as tall as the page, so `innerHeight` was the page's own height: a
+  // script that sizes a full-screen canvas to it (a WebGL scene, `setSize(innerWidth, innerHeight)`)
+  // drew a canvas thousands of pixels tall on every frame, and one that sizes sections to it grew
+  // the page with the frame. In canvas mode the window's `innerHeight`, the root element's
+  // `clientHeight` (the viewport height of older scripts) and `visualViewport.height` give the
+  // reference screen's height, as `100vh` does; in native mode the real ones.
+  function refHeight() {
+    var w = window.innerWidth || 0;
+    return w > 0 ? Math.round((w * 9) / 16) : 0;
+  }
+
+  /** Replace `obj[name]`'s getter: the reference height in canvas mode, else the browser's. */
+  function screenGetter(obj, name, owner, test) {
+    var d = Object.getOwnPropertyDescriptor(owner, name);
+    if (!d || typeof d.get !== 'function' || !d.configurable) return;
+    var real = d.get;
+    var get = function () {
+      if (native || (test && !test(this))) return real.call(this);
+      // the whole page, whatever height the frame has reached yet
+      if (wholeView) return Math.max(real.call(this), docEl ? docEl.scrollHeight : 0, document.body ? document.body.scrollHeight : 0);
+      var h = refHeight();
+      return h > 0 ? h : real.call(this);
+    };
+    Object.defineProperty(obj, name, { configurable: true, enumerable: d.enumerable, get: get, set: d.set });
+  }
+
+  /**
+   * The page's scripts run before the parent says the mode (the reporter starts in canvas mode): a
+   * page shown as itself read the reference height at load. When the mode changes the height they
+   * see, they get a `resize`, as for any change of their viewport.
+   */
+  var seenHeight = -1;
+  function screenHeightChanged() {
+    var h = window.innerHeight;
+    if (seenHeight >= 0 && h !== seenHeight) {
+      setTimeout(function () {
+        try { window.dispatchEvent(new Event('resize')); } catch (e) { /* ignore */ }
+      }, 0);
+    }
+    seenHeight = h;
+  }
+
+  /**
+   * Scroll handlers see the whole page in view, as an IntersectionObserver does (below): a page that
+   * reveals what lies within `innerHeight` of the top when it scrolls never scrolls in canvas mode.
+   * Once the page has loaded, and each time the canvas is shown again, the reporter sends it one
+   * `scroll` during which the height scripts read is the page's whole height.
+   */
+  var wholeView = false;
+  function revealScroll() {
+    if (native) return;
+    wholeView = true;
+    try { document.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (e) { /* ignore */ }
+    wholeView = false;
+  }
+
+  function installScreenHeight() {
+    screenGetter(window, 'innerHeight', window);
+    seenHeight = window.innerHeight;
+    var E = window.Element && Element.prototype;
+    if (E) screenGetter(E, 'clientHeight', E, function (el) { return el === (document.compatMode === 'BackCompat' ? document.body : document.documentElement); });
+    var vv = window.visualViewport;
+    var V = window.VisualViewport && VisualViewport.prototype;
+    if (vv && V) screenGetter(vv, 'height', V);
+  }
+
+  // ---- animation frames while the camera moves (docs/protocol.md §3 "Camera motion") ----
+  // A camera move makes this frame render again (the browser tells it what part of it is in view),
+  // and the move is on screen only once it has. A page that animates on every frame (a WebGL scene,
+  // labels laid out again each frame) keeps this frame's main thread busy, so a pan waited on the
+  // page's animation: in native mode the page's own scrolling does not. While the parent says the
+  // camera moves (a `motion` message at most every 100 ms), the page's requestAnimationFrame
+  // callbacks are held; once it has stood still for HOLD_MS they run, in one frame, as the browser
+  // would have. CSS animations, videos and timers go on.
+  var HOLD_MS = 250;
+  var holdUntil = 0;
+  var parked = [];
+  var releaseTimer = 0;
+  var flushing = null; // the callbacks a flush is running (a cancel still takes one out)
+  var flushId = 0; // the frame the next flush waits for: the page never got this id, it cannot cancel it
+  var snapshots = 0; // a snapshot (export) never waits for the camera
+  var realRaf = window.requestAnimationFrame;
+  var realCaf = window.cancelAnimationFrame;
+  function nowMs() { return window.performance && performance.now ? performance.now() : Date.now(); }
+  function holding() { return !native && !snapshots && holdUntil > nowMs(); }
+
+  function runFrame(cb, t) {
+    try { cb(t); } catch (err) {
+      setTimeout(function () { throw err; }); // reported like an error in the browser's own callback
+    }
+  }
+
+  /**
+   * Run the held callbacks in the next frame. One flush at a time, and the page cannot cancel it: a
+   * page that cancels ids it never got (a "cancel every frame" loop) would otherwise leave its held
+   * loops waiting for good.
+   */
+  function flushParked() {
+    if (!parked.length || flushId) return;
+    flushId = realRaf.call(window, function (t) {
+      flushId = 0;
+      if (holding()) { scheduleRelease(); return; }
+      var list = parked;
+      parked = [];
+      flushing = list;
+      for (var i = 0; i < list.length; i++) if (list[i].cb) runFrame(list[i].cb, t);
+      flushing = null;
+    });
+  }
+
+  function scheduleRelease() {
+    if (releaseTimer) return;
+    releaseTimer = setTimeout(function () {
+      releaseTimer = 0;
+      if (holding()) scheduleRelease();
+      else flushParked();
+    }, Math.max(0, holdUntil - nowMs()) + 1);
+  }
+
+  /** The camera moved (the parent's `motion` message): hold the page's frames HOLD_MS more. */
+  function cameraMoved() {
+    if (native) return;
+    holdUntil = nowMs() + HOLD_MS;
+  }
+
+  function installFrameHold() {
+    if (typeof realRaf !== 'function' || typeof realCaf !== 'function') return;
+    window.requestAnimationFrame = function requestAnimationFrame(cb) {
+      if (typeof cb !== 'function') return realRaf.call(window, cb); // the browser's TypeError
+      var id = realRaf.call(window, function (t) {
+        // held, or older callbacks still wait for their flush: they go first
+        if (holding() || parked.length) {
+          parked.push({ id: id, cb: cb });
+          scheduleRelease();
+          return;
+        }
+        cb(t);
+      });
+      return id;
+    };
+    window.cancelAnimationFrame = function cancelAnimationFrame(id) {
+      if (flushId && id === flushId) return; // the reporter's own flush, not one of the page's frames
+      for (var i = 0; i < parked.length; i++) {
+        if (parked[i].id === id) {
+          parked.splice(i, 1);
+          return;
+        }
+      }
+      if (flushing) for (var j = 0; j < flushing.length; j++) if (flushing[j].id === id) flushing[j].cb = null;
+      return realCaf.call(window, id);
+    };
+  }
+
   try { installIO(); } catch (e) { /* the page keeps the browser's observer */ }
   try { installUnits(); } catch (e) { /* the page keeps the real units */ }
+  try { installScreenHeight(); } catch (e) { /* the page keeps the real height */ }
+  try { installFrameHold(); } catch (e) { /* the page's frames are never held */ }
 
   // ---- reading position (docs/protocol.md §3 "Reading position") ----
   // While the page is shown as itself (native mode) the reporter keeps the block the user is
@@ -531,8 +690,14 @@
   function setNative(on) {
     var was = native;
     native = !!on;
+    if (native) {
+      holdUntil = 0; // the page scrolls itself: its frames run at once
+      flushParked();
+    }
     if (was !== native) {
       try { applyUnits(); } catch (e) { /* ignore */ }
+      try { screenHeightChanged(); } catch (e) { /* ignore */ }
+      if (!native) setTimeout(revealScroll, 0);
       try { ioMode(); } catch (e) { /* ignore */ }
       try { if (native) scheduleNote(); else scheduleReading(); } catch (e) { /* ignore */ }
     }
@@ -707,8 +872,15 @@
     var scale = Math.max(0.1, Math.min(4, Number(d.scale) || 1, 16000 / fullH, 16000 / fullW));
     var broken = brokenImages();
     var realFetch = window.fetch;
+    // the camera may move meanwhile (a follower): the export's own animation frames are not held
+    snapshots++;
+    flushParked();
+    var restored = false;
     var restore = function () {
+      if (restored) return; // once per snapshot: a throw after it (the catch) must not count twice
+      restored = true;
       if (realFetch && window.fetch !== realFetch) window.fetch = realFetch;
+      snapshots = Math.max(0, snapshots - 1);
     };
     loadLib(lib).then(function (H) {
       if (realFetch) window.fetch = countingFetch(realFetch);
@@ -904,6 +1076,10 @@
       setNative(d.native === true);
       return;
     }
+    if (d && d.source === 'artifacts-canvas' && d.type === 'motion') {
+      cameraMoved();
+      return;
+    }
     if (d && d.source === 'artifacts-canvas' && d.type === 'slides') {
       var at = typeof d.hash === 'string' && d.hash.length > 1 ? anchorTarget(d.hash) : null;
       post({ type: 'slides', id: String(d.id || '').slice(0, 32), tops: native ? [] : slideTops(), target: at });
@@ -922,5 +1098,8 @@
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
   else start();
-  window.addEventListener('load', function () { reportTitle(); reportSize(); checkBg(); });
+  window.addEventListener('load', function () {
+    reportTitle(); reportSize(); checkBg();
+    setTimeout(revealScroll, 0); // after the page's own load handlers
+  });
 })();

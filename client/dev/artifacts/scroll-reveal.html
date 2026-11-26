@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Scroll reveal</title>
+<!--
+  Sections hidden until the page has scrolled them within innerHeight of the top: the check runs
+  on load and on every scroll, with no IntersectionObserver (client/e2e/viewport-units.spec.ts).
+-->
+<style>
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; }
+  section { height: 600px; padding: 32px; box-sizing: border-box; border-bottom: 1px solid #ddd; }
+  .rv { opacity: 0; transition: opacity .3s; }
+  .rv.in { opacity: 1; }
+</style>
+</head>
+<body>
+<section><h2 class="rv">One</h2></section>
+<section><h2 class="rv">Two</h2></section>
+<section><h2 class="rv">Three</h2></section>
+<section><h2 class="rv">Four</h2></section>
+<section><h2 class="rv">Five</h2></section>
+<section><h2 class="rv">Six</h2></section>
+<script>
+(function () {
+  var els = Array.prototype.slice.call(document.querySelectorAll('.rv'));
+  function check() {
+    var h = window.innerHeight;
+    els.forEach(function (el) { if (el.getBoundingClientRect().top < h * 0.9) el.classList.add('in'); });
+  }
+  window.addEventListener('scroll', check);
+  check();
+})();
+</script>
+</body>
+</html>

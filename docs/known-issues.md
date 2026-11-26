@@ -91,10 +91,9 @@ Each fixed entry names its regression tests.
   canvas height (the native page's height had stuck). Tests: `client/e2e/viewport-units.spec.ts`
   (Chromium, Firefox and WebKit) with `client/dev/artifacts/scroll-deck.html` and
   `viewport-units.html`. Left: a stylesheet loaded with `<link>` is not rewritten (from the opaque
-  origin its rules cannot be read), media queries on the height are not, and scripts that read
-  `window.innerHeight` still get the frame's full height
-  (a fixed backdrop that positions itself from it spans the whole page); a deck that scrolls inside
-  its own `100vh` container shows one screen of it, with its inner scrolling.
+  origin its rules cannot be read), media queries on the height are not; a deck that scrolls inside
+  its own `100vh` container shows one screen of it, with its inner scrolling. Scripts that read
+  `window.innerHeight` got the frame's full height until L-12.
 - [x] **L-7 — In Firefox no message of the artifact reached the canvas (Medium).** The reporter posted
   to the parent's origin from `location.ancestorOrigins`. Firefox now has it, but masks it as `"null"`
   for a frame with `referrerpolicy="no-referrer"`, and `postMessage` throws on `"null"`: size, title,
@@ -123,6 +122,30 @@ Each fixed entry names its regression tests.
   its own click, as before; a browser with no Fullscreen API keeps the in-page view. Tests:
   `client/e2e/present.spec.ts` (the button, the link with a key, a press on the board or a control as
   the first gesture, a refused request, Esc and the exit button, the next page of a link).
+- [x] **L-12 — Panning in canvas mode was much slower than scrolling the page with the canvas hidden
+  (Medium).** Measured in Chrome with a scripted 5 s wheel gesture (1440 x 879 window, DPR 1): a deck
+  with a WebGL backdrop panned at 77 fps with 37 % of its frames dropped, against 120 fps scrolling
+  hidden; a plain report and a showcase of videos and CSS animations lost 5 to 6 %. Two causes. Every
+  camera move makes the artifact's frame render again (the browser tells it what part is in view)
+  and the move shows once it has, so a page that animates on every frame made the pan wait for its
+  animation (with the page's animation frames stopped, the same pan ran at 116 to 118 fps); hidden,
+  the page scrolls by itself and nothing waits. And `innerHeight` was the frame's height, so a scene
+  sized with `setSize(innerWidth, innerHeight)` drew 980 x 6615 px on every frame of a twelve-screen
+  page. Now, while the camera moves, the reporter holds the page's animation frames and runs them
+  once it stands still (protocol §3 "Camera motion"), and in canvas mode scripts read the reference
+  screen's height (protocol §3 "The screen height scripts read"). The deck pans at 114 fps (5 %
+  dropped). Not the cause, measured and left as they are: the translucent chrome's
+  `backdrop-filter`, the page's rounded clip, the zoom level and `will-change` on the board (each off
+  changed nothing). A reveal script that compares positions with `innerHeight` when the page
+  scrolls still reveals the whole page: once loaded the reporter sends it one `scroll` during which
+  the height is the page's. Left: such a script that waits for an animation frame after the scroll,
+  or checks only at load, reveals the first screen; an `IntersectionObserver` reveal is not affected.
+  Tests: `client/e2e/perf.spec.ts` with `client/dev/artifacts/heavy-page.html` (the scene is one
+  screen, no page frame runs during a pan and they resume after it, a pan over it keeps 70 % of a
+  plain page's frame rate in headless CI and its slowest 5 % of frames within two of the plain
+  page's; held frames run in one frame and in order, a cancel while held or during the flush holds,
+  and a page that cancels ids it never got cannot cancel the flush) and `client/e2e/viewport-units.spec.ts` with
+  `client/dev/artifacts/scroll-reveal.html` (Chromium, Firefox and WebKit).
 
 ## Review of the fv9 branch (security and QA)
 
