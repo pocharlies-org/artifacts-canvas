@@ -36,10 +36,10 @@ test('a dark artifact: the board takes its background, the chrome goes dark, the
   expect(await frameBg(A.page)).toBe('rgb(11, 11, 15)');
   for (const k of ['stage', 'page', 'frame', 'body'] as const) expect(l[k], k).toBe('rgb(11, 11, 15)');
   expect(l.darkClass).toBe(true);
-  // dark panels: toolbar, top bar, the "who drew" / history box (the last two translucent over the page)
+  // dark panels: toolbar, top bar, the "who drew" / history box (the last two near-opaque over the page)
   expect(l.toolbar, 'toolbar').toBe('rgb(31, 41, 55)');
-  expect(l.topleft, 'topleft').toBe('rgba(31, 41, 55, 0.35)');
-  expect(l.authors, 'authors').toBe('rgba(31, 41, 55, 0.2)');
+  expect(l.topleft, 'topleft').toBe('rgba(31, 41, 55, 0.94)');
+  expect(l.authors, 'authors').toBe('rgba(31, 41, 55, 0.88)');
   // the default ink stays black and is drawn near-white on it (e2e/board-ink.spec.ts)
   expect(l.style).toBe('black');
   await A.page.keyboard.press('d');
@@ -61,7 +61,7 @@ test('a light artifact: a white board, light chrome, black default stroke, as be
   await expect.poll(async () => (await look(A.page)).stage).toBe('rgb(255, 255, 255)');
   const l = await look(A.page);
   expect(await frameBg(A.page)).toBe('rgb(255, 255, 255)');
-  expect(l).toMatchObject({ darkClass: false, dark: false, style: 'black', toolbar: 'rgb(255, 255, 255)', topleft: 'rgba(255, 255, 255, 0.35)', authors: 'rgba(255, 255, 255, 0.2)' });
+  expect(l).toMatchObject({ darkClass: false, dark: false, style: 'black', toolbar: 'rgb(255, 255, 255)', topleft: 'rgba(255, 255, 255, 0.94)', authors: 'rgba(255, 255, 255, 0.88)' });
   await A.page.keyboard.press('d');
   await drawStroke(A.page, [[500, 420], [560, 440], [620, 430]]);
   await expect.poll(async () => (await shapes(A.page)).map((s) => s.color)).toEqual(['black']);

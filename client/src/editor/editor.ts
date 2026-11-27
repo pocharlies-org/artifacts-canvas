@@ -853,7 +853,7 @@ export class Editor {
     if (n) {
       if (!this.frame.scroller) {
         this.enterScroller(n);
-        this.showCamera({ tx: cam.tx, ty: -n.y * cam.z, z: cam.z }, source);
+        this.showCamera({ tx: cam.tx, ty: lineTy(n.y, cam.z), z: cam.z }, source);
         return;
       }
       // the view's height changed: the window follows it
@@ -863,7 +863,7 @@ export class Editor {
         this.placeWindow();
       }
       // sideways (or a new view's zoom) at once, at the line the document is at
-      if (cam.tx !== this.camera.tx || cam.z !== this.camera.z) this.showCamera({ tx: cam.tx, ty: -this.scrollAt * cam.z, z: cam.z }, source);
+      if (cam.tx !== this.camera.tx || cam.z !== this.camera.z) this.showCamera({ tx: cam.tx, ty: lineTy(this.scrollAt, cam.z), z: cam.z }, source);
       if (Math.abs(n.y - this.intendedY()) >= 0.5) this.requestScroll(n.y, source);
       return;
     }
@@ -894,7 +894,7 @@ export class Editor {
   intendedCamera(): Camera {
     if (!this.frame.scroller) return this.camera;
     const y = this.intendedY();
-    return y === this.scrollAt ? this.camera : { ...this.camera, ty: -y * this.camera.z };
+    return y === this.scrollAt ? this.camera : { ...this.camera, ty: lineTy(y, this.camera.z) };
   }
 
   /** Native scroll: the line the document is going to (or is at, as asked: it snaps to its pixels). */
@@ -995,7 +995,7 @@ export class Editor {
       if (Math.abs(y - want) > 2 && want > 2 && want < max - 2) {
         if (++this.scrollRefusals >= SCROLL_REFUSALS) {
           this.scrollRefused = true;
-          const cam = { ...this.camera, ty: -want * this.camera.z };
+          const cam = { ...this.camera, ty: lineTy(want, this.camera.z) };
           this.leaveScroller();
           this.showCamera(cam, source);
           return;
@@ -1007,7 +1007,7 @@ export class Editor {
     this.scrollAt = y;
     this.placeWindow();
     const z = this.camera.z;
-    this.showCamera({ tx: this.camera.tx, ty: -y * z, z }, source);
+    this.showCamera({ tx: this.camera.tx, ty: lineTy(y, z), z }, source);
     if (!pending && this.followingUserId) this.applyFollow();
   }
 
@@ -1778,7 +1778,7 @@ export class Editor {
     if (key === 'Home' || key === 'End') {
       // the end: the page's last screen (natively, the window's last line, camera.ts nativeScroll)
       const end = Math.max(0, this.frame.scroller ? Math.floor(this.pageHeight) - this.frame.windowH - 1 : this.pageHeight - vis.h);
-      this.setCamera({ ...cam, ty: -(key === 'Home' ? 0 : end) * cam.z });
+      this.setCamera({ ...cam, ty: lineTy(key === 'Home' ? 0 : end, cam.z) });
       return;
     }
     if (key === 'ArrowLeft' || key === 'ArrowRight') return;
@@ -1903,6 +1903,11 @@ function el(tag: string, cls: string): HTMLElement {
   const e = document.createElement(tag);
   e.className = cls;
   return e;
+}
+
+/** The camera's ty that puts world line `y` at the top of the view (never -0: a camera at the page top is ty 0). */
+function lineTy(y: number, z: number): number {
+  return 0 - y * z;
 }
 
 function round(n: number) {
