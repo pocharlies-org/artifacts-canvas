@@ -44,6 +44,33 @@ export function fitBox(box: Box, w: number, h: number, pad = 40, maxZ = 1): Came
   return { z, tx: w / 2 - (box.x + box.w / 2) * z, ty: h / 2 - (box.y + box.h / 2) * z };
 }
 
+/** Where the artifact's document is scrolled to show a camera natively, and how tall its frame is then. */
+export interface NativeScroll {
+  /** The document's scroll (artifact px): the world line at the top of the view. */
+  y: number;
+  /** The frame's height (artifact px): the view's height at this zoom, rounded up. */
+  winH: number;
+}
+
+/**
+ * Native scroll (docs/design.md §6.4). At the zoom the page is read at (`homeZ`: as wide as the
+ * view, or the presentation's), the artifact's own document scrolls inside a frame as tall as the
+ * view, and the frame stays put on the screen: camera `c` is then the document scrolled to `y`.
+ * Null when the transform shows it: another zoom, the view past the page top or end, or a page no
+ * taller than the view. The window stops 1 px short of the page end (the reporter rounds the page's
+ * height up, the document's own end can be a fraction higher); a view up to 2 px past that stop
+ * still scrolls natively, to the stop.
+ */
+export function nativeScroll(c: Camera, homeZ: number, viewH: number, pageHeight: number): NativeScroll | null {
+  if (!(viewH > 0) || !(homeZ > 0) || !(c.z > 0) || Math.abs(c.z - homeZ) > homeZ * 1e-6) return null;
+  const winH = Math.ceil(viewH / c.z - 1e-6);
+  const max = Math.floor(pageHeight) - winH - 1;
+  if (max < 1) return null;
+  const y = -c.ty / c.z;
+  if (!(y >= -0.5 && y <= max + 2)) return null;
+  return { y: Math.min(max, Math.max(0, y)), winH };
+}
+
 /** Camera showing the same world rect another person sees (follow / presenter mode). */
 export function matchViewport(rect: Box, w: number, h: number): Camera {
   const z = clampZoom(Math.min(w / Math.max(rect.w, 1), h / Math.max(rect.h, 1)));

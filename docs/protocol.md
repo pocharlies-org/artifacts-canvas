@@ -142,7 +142,9 @@ scope for v1; the service may wrap them in a minimal HTML page.
 the artifact's full content height. It never scrolls; the canvas camera pans and zooms the
 iframe and the drawings together, so world coordinates are artifact CSS pixels and
 annotations stay on the element they were drawn on. Wheel and touch go to the canvas, except
-with the interact tool (below), where the artifact takes the pointer.
+with the interact tool (below), where the artifact takes the pointer. With native scroll on (opt-in),
+at the zoom the page is read at the frame is instead a window as tall as the view and the document
+scrolls in it ("Native scroll" below); world coordinates are the same.
 
 **Viewport units and reveal scripts.** A frame as tall as the page breaks two things that pages
 written as a "deck" of full-screen sections rely on, so the reporter, which runs before the page's
@@ -167,7 +169,7 @@ own scripts, changes them in canvas mode only:
   such file is another origin and its rules cannot be read; a self-contained artifact has none,
   see known issues L-4), media queries on the height or orientation, and the `vb` family. The
   page's scripts read the rewritten form back (`el.style.height` is the `calc()` form). Root scroll
-  snapping is off in canvas mode (the page never scrolls there).
+  snapping is off in canvas mode (the page scrolls there only as the wrapper asks: native scroll).
 - **The screen height scripts read.** In canvas mode `window.innerHeight`, the root element's
   `clientHeight` (the viewport height older scripts and jQuery read) and `visualViewport.height`
   give the reference screen's height (551 for 980), as `100vh` does; in native mode the real
@@ -194,7 +196,8 @@ own scripts, changes them in canvas mode only:
   observer with an explicit root (an element, or the document) measures inside the page: the
   constructor returns the browser's own observer for it.
 - **The page's own navigation.** A deck moves between its screens with `scrollIntoView()` (arrow
-  keys, its slide links). The frame cannot scroll in canvas mode, so the browser scrolls the
+  keys, its slide links). With native scroll (opt-in) the document scrolls, and the camera, and the
+  followers, follow it (`pos`, below). Otherwise the frame cannot scroll in canvas mode, so the browser scrolls the
   frame's ancestors instead: the wrapper's stage, a scroll container. The wrapper turns that into
   a camera move once the scroll has stopped (200 ms): the stage goes back to 0 and the camera
   shows what the page scrolled to, so the presenter's viewport, and the followers with it, follow
@@ -209,15 +212,39 @@ WebGL scene, labels laid out again each frame) keeps the frame's main thread bus
 on the page's own animation; with the canvas hidden the page scrolls by itself and does not
 (measured on a deck with a WebGL backdrop: 77 fps and 37 % of frames dropped panning in canvas
 mode, 120 fps scrolling hidden; 114 fps with the hold). So in canvas mode, while the camera moves
-(a pan, a zoom, following a presenter, a glide to a slide), the wrapper says so (`motion`, at most
-every 100 ms) and the reporter holds the page's `requestAnimationFrame` callbacks; once no `motion`
-has come for 250 ms they run, in one frame, in the order they were asked for, with that frame's
-time, as the browser would have called them. A callback cancelled while held, or by an earlier
+(a pan, a zoom, following a presenter, a glide to a slide, a native scroll), the wrapper says so
+(`motion`, at most every 100 ms) and the reporter holds the page's `requestAnimationFrame`
+callbacks and pauses its running animations (`document.getAnimations()`: CSS animations and
+transitions, the Web Animations API; one the page paused or finished stays as it is); once no
+`motion` has come for 250 ms the callbacks run, in one frame, in the order they were asked for, with
+that frame's time, as the browser would have called them, and the animations go on from where they
+were (`play()`; a CSS animation the API played no longer follows `animation-play-state`). A callback cancelled while held, or by an earlier
 callback of the same flush, never runs; the flush itself is a frame whose id the page never got, so
-it cannot cancel it. CSS
-animations, videos and timers go on. Native mode never holds, and nor does a snapshot (an export
+it cannot cancel it. Videos and
+timers go on. Native mode never holds, and nor does a snapshot (an export
 taken while a follower's camera moves). A page that animates its own scrolling frame by frame
 (each step a camera move in canvas mode) advances about every 250 ms.
+
+**Native scroll** (`Editor.setCamera`, `camera.ts nativeScroll`, design §6.4; opt-in, `?scroll=native`
+on the canvas URL, off by default). At the zoom the
+page is read at (as wide as the view, or the presentation's) with the view inside the page, the
+frame is a window as tall as the view (its height in artifact px, rounded up) and the wrapper moves
+the document instead of the frame: `scroll-to` with the line at the top of the view, and the
+reporter scrolls there at once (`behavior: 'instant'`) and answers `pos` with where the document
+is and the last request it applied. Between requests it posts `pos` on every scroll (the page's own
+navigation). The wrapper puts the window at that line of the page and the camera with it; a camera
+change that lands elsewhere (a zoom, past the page top or end) ends it, and the frame is as tall as
+the page again with the document at its top. A period starts with a `mode` message carrying
+`scroller: true`, its `epoch` and the line to start at; until the window has its size (the resize
+races the message) the reporter applies that line again on `resize`, and says nothing for up to
+1 s. Every `pos` carries the epoch and the wrapper drops one of another. The root keeps
+`overflow: hidden` (no scrollbar, no user scrolling: the wheel goes to the wrapper, which asks)
+and no snapping. A document that stays elsewhere three times in a row (a page that scrolls itself
+back) keeps the transform for the rest of the visit. The reporter says it can do this with
+`canScroll` in its `size` message; a wrapper never asks a reporter that has not said it.
+Page keys outside a presentation (on the board: Page Up/Down, Home, End, and ↑ ↓ with nothing
+selected; in the frame with the interact tool, the step keys the page left) scroll a little or a
+screen, natively or with the camera, with or without the option.
 
 **Presenting a deck** (`client/src/editor/slides.ts`, `Editor.stepSlide`). In presentation mode
 → ↓ Page Down Space step forward and ← ↑ Page Up ⇧Space step back, whatever the tool (laser, pen,
@@ -325,21 +352,23 @@ clamped):
 
 | Direction | Message |
 |---|---|
-| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'size', w, h, native}` content size, on load and on every resize; `native` is the mode it was measured in, and the wrapper drops a size of the other mode (a mode change still on its way). When the canvas is shown again the frame goes back to the last canvas-mode height, not the native page's |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'size', w, h, native, canScroll}` content size, on load and on every resize; `native` is the mode it was measured in, and the wrapper drops a size of the other mode (a mode change still on its way). When the canvas is shown again the frame goes back to the last canvas-mode height, not the native page's. `canScroll: true`: this reporter does native scroll |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'title', title}` |
-| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'scroll', x, y}` the artifact tried to scroll: the wrapper pans there |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'scroll', x, y}` the artifact tried to scroll (canvas mode, no native scroll): the wrapper pans there |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'pos', x, y, seq, epoch}` native scroll: the document is scrolled to `y` (artifact px); `seq` is the last `scroll-to` applied, `epoch` the period's; see "Native scroll" |
+| wrapper → frame | `{source:'artifacts-canvas', type:'scroll-to', y, seq, epoch}` native scroll: scroll the document to `y` artifact px, instantly; answered with `pos` |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'link', href, newTab}` a link was clicked (`href` absolute, as the frame resolved it; `''` when over 4096 characters); see "Links" |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'anchor', x, y}` a same-document anchor was followed: its target's position in artifact px |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'wheel', dx, dy, mode, zoom, shift, x, y}` a wheel over the artifact that no element of the page scrolled (interact tool) |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'key', key:'Escape'}` Escape pressed in the artifact |
-| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'key', key, shift}` a key that steps a presentation (→ ↓ Page Down Space ← ↑ Page Up), pressed in the artifact outside a field and left by the page's own handlers (canvas mode); see "Presenting a deck" |
+| frame → wrapper | `{source:'artifacts-canvas-reporter', type:'key', key, shift}` a key that steps a presentation (→ ↓ Page Down Space ← ↑ Page Up), pressed in the artifact outside a field and left by the page's own handlers (canvas mode); see "Presenting a deck" (outside a presentation, with the interact tool, it scrolls: "Native scroll") |
 | wrapper → frame | `{source:'artifacts-canvas', type:'slides', id, hash}` where are the page's slides, and the target of `hash` (`''`: none)? Answered `{source:'artifacts-canvas-reporter', type:'slides', id, tops, target}`: the tops of the scroll-snap points in artifact px (at most 500; none in native mode), and `{x, y}` or `null`; the wrapper takes an answer only to an id it asked, and clamps every number to the page |
 | wrapper → frame | `{source:'artifacts-canvas', type:'probe', id, x, y}` is there a link at (x, y)? Answered `{source:'artifacts-canvas-reporter', type:'probe', id, link}` |
 | wrapper → frame | `{source:'artifacts-canvas', type:'click', x, y, newTab}` follow the link at (x, y), if any (the select tool's click) |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'bg', color}` the page's background colour (see "Background") |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'reading', x, y, w, left, top, nw}` after the canvas is shown again: the block read in native mode, now at (x, y), w wide (artifact px), was at (left, top), nw wide on the screen; see "Reading position" |
-| wrapper → frame | `{source:'artifacts-canvas', type:'motion'}` the camera moves (canvas mode, at most every 100 ms): the page's animation frames wait until 250 ms after the last one; see "Camera motion" |
-| wrapper → frame | `{source:'artifacts-canvas', type:'mode', native}` `native: true` while the canvas is hidden: the page scrolls on its own (and same-document anchors scroll it) instead of being held still; sent on the frame's first message and on every load |
+| wrapper → frame | `{source:'artifacts-canvas', type:'motion'}` the camera moves (canvas mode, at most every 100 ms): the page's animation frames and its animations wait until 250 ms after the last one; see "Camera motion" |
+| wrapper → frame | `{source:'artifacts-canvas', type:'mode', native, scroller, epoch, y}` `native: true` while the canvas is hidden: the page scrolls on its own (and same-document anchors scroll it) instead of being held still; `scroller: true` (canvas mode): native scroll, a period `epoch` that starts at line `y`; sent on the frame's first message, on every load and when native scroll starts or ends. In canvas mode the reporter listens to `wheel` (the interact tool's), in native mode it does not |
 | wrapper → frame | `{source:'artifacts-canvas', type:'snapshot', id, rect:{x,y,w,h}, scale, lib}` export request; `lib` is the `vendorUrl` |
 | frame → wrapper | `{source:'artifacts-canvas-reporter', type:'snapshot', id, dataUrl, partial}` a `data:image/png` of `rect`, or `null` when the page could not be captured; `partial: true` when part of it could not be read (an image or a background that did not load is left blank) |
 

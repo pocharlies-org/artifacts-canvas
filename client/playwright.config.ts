@@ -2,7 +2,7 @@ import { defineConfig, devices } from '@playwright/test';
 
 const PORT = Number(process.env.E2E_PORT ?? 5180);
 const CROSS_BROWSER = !!process.env.CI || process.env.E2E_CROSS_BROWSER === '1';
-const CROSS_BROWSER_SPECS = /viewport-units\.spec\.ts$/;
+const CROSS_BROWSER_SPECS = /(viewport-units|native-scroll-engines)\.spec\.ts$/;
 
 export default defineConfig({
   testDir: './e2e',
@@ -19,8 +19,8 @@ export default defineConfig({
   },
   projects: [
     { name: 'chromium', use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 900 } } },
-    // What the reporter does inside the artifact's page (viewport units, IntersectionObserver)
-    // depends on each engine's CSSOM: those specs also run in Firefox and WebKit, in CI and with
+    // What the reporter does inside the artifact's page (viewport units, IntersectionObserver, the
+    // document's native scroll) depends on each engine: those specs also run in Firefox and WebKit, in CI and with
     // E2E_CROSS_BROWSER=1 (`npx playwright install firefox webkit` first).
     ...(CROSS_BROWSER
       ? [

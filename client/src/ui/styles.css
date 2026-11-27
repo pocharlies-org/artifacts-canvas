@@ -9,11 +9,11 @@
   /* the artifact's own background (the reporter says it; ui/theme.ts): the board takes it */
   --board: #ffffff;
   /* Translucent chrome over the page (desktop: the side panels and the title bar). One knob: the
-     panel's background opacity, 0.2 = 80 % transparent. The blur and a light/dark shift of what is
-     behind keep the text legible on any page; the title bar is a little stronger. */
-  --chrome-alpha: .2;
+     panel's background opacity. Near-opaque, with no backdrop blur: a backdrop-filter over the
+     page made the browser draw the whole window again on every step of a pan or a scroll. A text
+     halo keeps the side panels legible; the title bar is a little stronger. */
+  --chrome-alpha: .88;
   --panel-rgb: 255, 255, 255;
-  --chrome-backdrop: blur(14px) saturate(1.3) brightness(1.12);
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; color: var(--ink); background: var(--board); overscroll-behavior: none; }
@@ -38,6 +38,7 @@ button { font: inherit; color: inherit; }
 .stage[data-cursor="ns-resize"] { cursor: ns-resize; }
 .stage[data-cursor="ew-resize"] { cursor: ew-resize; }
 .world { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
+/* the page box: the frame, as tall as the page, or (native scroll, editor.ts setCamera) the view's window at the line the document is scrolled to */
 .page { position: absolute; left: 0; top: 0; background: var(--board); border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow: hidden; }
 .artifact-frame { display: block; border: 0; background: var(--board); pointer-events: none; }
 /* the interact tool: the artifact takes the pointer (links, buttons, inner scrolling) */
@@ -145,8 +146,10 @@ svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-e
 .bottomleft { padding: 6px; display: flex; gap: 4px; align-items: center; font-size: 12.5px; flex: 0 0 auto; }
 .zoom-pct { min-width: 44px; text-align: center; border: 0; background: none; cursor: pointer; font-size: 12.5px; }
 .bottomright { width: 170px; height: 110px; padding: 6px; flex: 0 0 auto; }
-.mini { width: 100%; height: 100%; border-radius: 6px; overflow: hidden; }
+.mini { position: relative; width: 100%; height: 100%; border-radius: 6px; overflow: hidden; }
 .minimap { width: 100%; height: 100%; display: block; cursor: pointer; }
+/* my viewport on the map: moved, never painted into it (render/minimap.ts) */
+.minimap-view { position: absolute; left: 0; top: 0; border: 2px solid #2563eb; pointer-events: none; will-change: transform; }
 
 .toast { position: fixed; left: 50%; bottom: 76px; transform: translate(-50%, 20px); background: #111827; color: #fff; font-size: 12.5px; padding: 8px 12px; border-radius: 8px; opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 60; max-width: 90vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
@@ -187,7 +190,7 @@ body.canvas-hidden .quiet-bar { display: flex; position: fixed; right: 12px; bot
 .quiet-link { color: #374151; padding: 0 10px 0 2px; white-space: nowrap; }
 
 /* ---------- dark artifacts: dark chrome (body.theme-dark, from the artifact's background) ---------- */
-body.theme-dark { --ink: #e5e7eb; --muted: #9ca3af; --line: #374151; --panel: #1f2937; --panel-rgb: 31, 41, 55; --chrome-backdrop: blur(14px) saturate(1.3) brightness(.62); }
+body.theme-dark { --ink: #e5e7eb; --muted: #9ca3af; --line: #374151; --panel: #1f2937; --panel-rgb: 31, 41, 55; }
 body.theme-dark .panel { box-shadow: 0 2px 12px rgba(0,0,0,.55); border: 1px solid #374151; }
 body.theme-dark .page { box-shadow: none; }
 body.theme-dark .pill { background: #374151; color: #e5e7eb; }
@@ -228,9 +231,8 @@ body.theme-dark .prow.annotating .tag { color: #4ade80; }
   .people.side { transform: translateX(-10px); }
   .stylepanel.side { transform: translateX(10px); }
   .side.shown { opacity: 1; visibility: visible; transform: none; transition: opacity .16s ease, transform .16s ease, visibility 0s; }
-  .side, .topleft { -webkit-backdrop-filter: var(--chrome-backdrop); backdrop-filter: var(--chrome-backdrop); }
   .side { background: rgba(var(--panel-rgb), var(--chrome-alpha)); text-shadow: 0 0 3px rgba(var(--panel-rgb), .85); }
-  .topleft { background: rgba(var(--panel-rgb), calc(var(--chrome-alpha) + .15)); }
+  .topleft { background: rgba(var(--panel-rgb), calc(var(--chrome-alpha) + .06)); }
   body.theme-dark .side, body.theme-dark .topleft { border-color: rgba(255, 255, 255, .14); }
   .side .seg, .side .btn { background: rgba(var(--panel-rgb), .35); }
   /* the handles: a thin tab on each edge (a touch screen taps it; a mouse only comes near) */

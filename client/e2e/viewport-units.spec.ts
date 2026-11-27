@@ -146,7 +146,10 @@ test('presentation mode shows the sections, and a follower in a smaller window g
   const [da, db] = [await deck(A.page), await deck(B.page)];
   expect(db.docH).toBeCloseTo(da.docH, 0);
   expect(db.fontSize).toBe(da.fontSize);
-  expect(db.sections.map((s) => [s.top, s.h])).toEqual(da.sections.map((s) => [s.top, s.h]));
+  // to a hundredth of a px: the presenter's page may be scrolled (native scroll), and a top read back
+  // through a fractional scroll offset carries the engine's sub-pixel rounding
+  const r2 = (v: number) => Math.round(v * 100) / 100;
+  expect(db.sections.map((s) => [r2(s.top), r2(s.h)])).toEqual(da.sections.map((s) => [r2(s.top), r2(s.h)]));
   expect(db.sections.every((s) => s.inClass && s.opacity.every((o) => o === 1))).toBe(true);
   await A.page.keyboard.press('Escape');
   await A.close();

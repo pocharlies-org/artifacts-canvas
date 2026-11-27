@@ -18,7 +18,7 @@ import { canvasUrl, classifyLink, downloadUrl, linkContext, type LinkContext } f
 import { DEFAULT_BOARD, isDark, opaque, toCss, type Rgba } from '../ui/theme';
 import { Renderer } from '../render/renderer';
 import {
-  type Camera, clampZoom, fitBox, matchViewport, nextZoomStep, screenToWorld, visibleWorld, worldToScreen, zoomAt,
+  type Camera, type NativeScroll, clampZoom, fitBox, matchViewport, nativeScroll, nextZoomStep, screenToWorld, visibleWorld, worldToScreen, zoomAt,
 } from './camera';
 import { type Box, type Pt, unionBoxes } from '../geometry/vec';
 import { shapeBounds, topShapeAt, FONT_SIZE, NOTE_FONT_SIZE, NOTE_SIZE } from '../geometry/shapes';
@@ -52,6 +52,13 @@ const STAGE_SCROLL_SETTLE_MS = 200;
 const READING_WINDOW_MS = 3000;
 /** Under this view width the editor lays out for a phone (the side panels as drawers, the page below the top bars). */
 const PHONE_W = 760;
+/** Nobody follows this tab and it does not present: its own viewport goes out at most this often. */
+export const VIEWPORT_IDLE_MS = 1000;
+/** Native scroll: after this many requests the page did not follow, it is off for the document (it scrolls itself back). */
+const SCROLL_REFUSALS = 3;
+/** Page keys: an arrow scrolls this many screen px; a page, this share of the view. */
+const ARROW_SCROLL = 40;
+const PAGE_SCROLL = 0.9;
 
 /** The presenter seen by this tab: who, and whether it is this person in another tab or device. */
 export interface PresenterInfo {
@@ -124,6 +131,32 @@ export class Editor {
   private stageScrollTimer = 0;
   /** Until when the frame's reading position is taken (the canvas was just shown). */
   private readingUntil = 0;
+  /**
+   * Native scroll (docs/design.md §6.4): where the artifact's document is scrolled, as the reporter
+   * last said (artifact px); the frame's window sits at that line of the page.
+   */
+  private scrollAt = 0;
+  /** The scroll last asked for, until the reporter says it applied it (its `seq`); null: none pending. */
+  private scrollWant: number | null = null;
+  /**
+   * The scroll last asked for, kept after the answer: the document snaps a scroll to its own pixels,
+   * and the next move starts from the line asked for, not from the snapped one (a wheel would drift).
+   */
+  private scrollAsked: number | null = null;
+  private scrollWantSeq = 0;
+  private scrollSeq = 0;
+  private scrollSource: 'user' | 'follow' | 'system' = 'system';
+  /** Requests in a row the document did not follow; at SCROLL_REFUSALS native scroll is off for it. */
+  private scrollRefusals = 0;
+  private scrollRefused = false;
+  /** The page box's corners, as last written (rounded only at the page's own top and end). */
+  private pageCorners = '';
+  /** Somebody follows this tab (a peer's `following` is this user): its viewport goes out at the send rate. */
+  private followed = false;
+  /** This tab's viewport, when nobody follows it and it does not present (VIEWPORT_IDLE_MS). */
+  private readonly viewportPace = new Throttle(() => VIEWPORT_IDLE_MS);
+  /** The awareness change being set is this tab's own viewport or cursor: nothing the chrome shows. */
+  private quietPresence = false;
 
   constructor(cfg: CanvasConfig, root: HTMLElement, ydoc: Y.Doc, conn: Connection | null, ledger?: Y.Doc) {
     this.cfg = cfg;
@@ -151,9 +184,12 @@ export class Editor {
     this.frame = new ArtifactFrame(this.page, cfg.frameUrl, this.pageWidth, this.pageHeight, cfg.vendorUrl, {
       size: (_w, h) => {
         this.pageHeight = h;
-        if (!this.hidden) this.page.style.height = `${h}px`;
+        if (!this.hidden && !this.frame.scroller) this.page.style.height = `${h}px`;
         this.emit('camera');
+        // native scroll or transform: the page's height says which (and how far it scrolls)
+        this.syncScroller();
       },
+      scrolled: (y, seq) => this.onScrolled(y, seq),
       title: () => this.emit('status'),
       scroll: (x, y) => this.panTo({ x, y }),
       // The artifact's own scripts share the frame with the reporter and can post the same
@@ -171,8 +207,10 @@ export class Editor {
         if (this.tool === 'interact' && !this.hidden && this.focusInFrame()) this.escape();
       },
       // a step key the page left (it has no navigation of its own for it): as the same key on the canvas
-      step: (dir) => {
-        if (this.presenting && this.tool === 'interact' && this.focusInFrame() && userActivated()) this.stepSlide(dir);
+      step: (dir, key) => {
+        if (this.tool !== 'interact' || !this.focusInFrame() || !userActivated()) return;
+        if (this.presenting) this.stepSlide(dir);
+        else this.scrollKey(key, dir);
       },
       background: (c) => this.applyBackground(c),
       reading: (r) => this.onReading(r),
@@ -237,7 +275,7 @@ export class Editor {
         this.notice = n;
         this.emit('notice');
       });
-      conn.awareness.on('change', () => this.onAwareness());
+      conn.awareness.on('change', (_c: unknown, origin: unknown) => this.onAwareness(origin));
       conn.provider.on('sync', (synced: boolean) => {
         if (synced) {
           this.doc.ensurePageWidth(cfg.pageWidth);
@@ -317,12 +355,41 @@ export class Editor {
     if (!this.conn || !this.me) {
       return;
     }
-    setPresence(this.conn.awareness, this.pendingPresence);
+    // this tab's own viewport or cursor changes nothing the chrome shows (the avatars, who is
+    // here): the awareness change it raises in this tab is not a presence change (onAwareness)
+    this.quietPresence = Object.keys(this.pendingPresence).every((k) => k === 'viewport' || k === 'cursor');
+    try {
+      setPresence(this.conn.awareness, this.pendingPresence);
+    } finally {
+      this.quietPresence = false;
+    }
     this.pendingPresence = {};
   }
 
-  private onAwareness() {
+  /**
+   * This tab's viewport goes out to the room: at the send rate while it presents or somebody
+   * follows it, else at most every VIEWPORT_IDLE_MS (the last one always goes): a pan or a scroll
+   * no one follows is not a stream of awareness messages.
+   */
+  private publishViewport() {
     if (!this.conn) return;
+    if (this.presenting || this.followed) {
+      this.viewportPace.cancel();
+      this.publishPresence({ viewport: this.visibleWorld() });
+      return;
+    }
+    this.viewportPace.schedule(() => this.publishPresence({ viewport: this.visibleWorld() }));
+  }
+
+  private onAwareness(origin?: unknown) {
+    if (!this.conn) return;
+    if (origin === 'local' && this.quietPresence) return;
+    if (origin !== 'local') {
+      const me = this.me?.id;
+      const followed = !!me && peers(this.conn.awareness).some((p) => p.state.following === me);
+      if (followed && !this.followed && this.viewportPace.pending) this.viewportPace.flush();
+      this.followed = followed;
+    }
     const now = performance.now();
     for (const p of peers(this.conn.awareness)) {
       if (p.state.laser && p.state.laser.pts.length) this.laserSeen.set(p.clientId, { at: now, now: p.state.laser.now });
@@ -431,6 +498,8 @@ export class Editor {
       if (this.fstate.target) this.applyFollow();
     }
     this.publishPresence({ presenting: on, viewport: this.visibleWorld() }, true);
+    // the zoom the page is read at changed (the presentation's, or the view's again)
+    this.syncScroller();
     this.emit('present');
     this.emit('follow');
   }
@@ -480,7 +549,7 @@ export class Editor {
       this.hideHover();
       this.setLaserPointer(null);
       this.laser = [];
-      this.cameraBeforeHiding = { ...this.camera };
+      this.cameraBeforeHiding = { ...this.intendedCamera() };
       this.hidden = true;
       // what the others had of this tab goes away; it views (publishPresence keeps it so from now on)
       this.publishPresence({ cursor: null, viewport: null, laser: null, presenting: false }, true);
@@ -510,6 +579,7 @@ export class Editor {
 
   /** Hidden: the frame takes the whole view at scale 1, and the page scrolls on its own. */
   private layoutHidden() {
+    this.leaveScroller();
     this.page.style.width = `${this.viewW}px`;
     this.page.style.height = `${this.viewH}px`;
     this.frame.setNative(true, this.viewW, this.viewH);
@@ -622,9 +692,10 @@ export class Editor {
 
   /** Bring the world point `p` near the top of the view, under the top panels (an anchor of the artifact). */
   revealTop(p: Pt) {
-    const z = this.camera.z;
-    const vis = this.visibleWorld();
-    const tx = p.x >= vis.x && p.x <= vis.x + vis.w ? this.camera.tx : this.viewW / 2 - p.x * z;
+    const cam = this.intendedCamera();
+    const z = cam.z;
+    const vis = visibleWorld(cam, this.viewW, this.viewH);
+    const tx = p.x >= vis.x && p.x <= vis.x + vis.w ? cam.tx : this.viewW / 2 - p.x * z;
     const margin = this.presenting ? PRESENT_TOP : this.viewW < 760 ? 112 : 70;
     this.setCamera({ z, tx, ty: margin - p.y * z });
   }
@@ -645,6 +716,8 @@ export class Editor {
     else if (this.followingUserId) this.applyFollow();
     // fullscreen on or off, a phone turned: the page fills the new width, the same line at the top
     else if (this.presenting && r.width > 0) this.fitForPresentation();
+    // the same camera; native scroll's window takes the view's new height (or the transform takes over)
+    else this.syncScroller();
     this.emit('camera');
   }
 
@@ -667,6 +740,17 @@ export class Editor {
   /** The zoom at which the page is as wide as the view (a phone keeps a 12 px margin each side). */
   fitZoom(): number {
     return clampZoom(this.viewW < PHONE_W ? (this.viewW - 24) / this.pageWidth : this.viewW / this.pageWidth);
+  }
+
+  /** Presentation: the zoom at which the page is as wide as the screen (up to PRESENT_MAX_ZOOM). */
+  presentZoom(): number {
+    const pad = this.viewW < 760 ? 6 : 24;
+    return clampZoom(Math.min(PRESENT_MAX_ZOOM, (this.viewW - 2 * pad) / this.pageWidth));
+  }
+
+  /** The zoom the page is read at: native scroll works at this one (docs/design.md §6.4). */
+  homeZoom(): number {
+    return this.presenting ? this.presentZoom() : this.fitZoom();
   }
 
   /**
@@ -694,9 +778,8 @@ export class Editor {
    */
   fitForPresentation(at?: number) {
     if (this.viewW <= 0) return;
-    const pad = this.viewW < 760 ? 6 : 24;
-    const z = clampZoom(Math.min(PRESENT_MAX_ZOOM, (this.viewW - 2 * pad) / this.pageWidth));
-    const top = at ?? Math.max(0, this.visibleWorld().y);
+    const z = this.presentZoom();
+    const top = at ?? Math.max(0, visibleWorld(this.intendedCamera(), this.viewW, this.viewH).y);
     this.setCamera({ z, tx: (this.viewW - this.pageWidth * z) / 2, ty: top > 0 ? -top * z : PRESENT_TOP }, 'system');
   }
 
@@ -714,7 +797,8 @@ export class Editor {
 
   /** Presentation: the line of the page (artifact px) under the badge, where a slide stepped to sits. */
   private presentLine(): number {
-    return this.visibleWorld().y + PRESENT_TOP / this.camera.z;
+    const cam = this.intendedCamera();
+    return visibleWorld(cam, this.viewW, this.viewH).y + PRESENT_TOP / cam.z;
   }
 
   /**
@@ -732,7 +816,7 @@ export class Editor {
       const slide = s?.tops.length ? nextSlide(s.tops, at, dir) : null;
       const y = slide ?? screenStep(at, dir, (this.viewH - PRESENT_TOP) / this.camera.z, this.pageHeight);
       if (y === null) return;
-      const vis = this.visibleWorld();
+      const vis = visibleWorld(this.intendedCamera(), this.viewW, this.viewH);
       this.revealTop({ x: vis.x + vis.w / 2, y });
     });
   }
@@ -749,20 +833,183 @@ export class Editor {
     this.resetCamera();
   }
 
-  /** source 'user' stops following; 'follow' and 'system' do not. */
+  /**
+   * Move the camera; source 'user' stops following, 'follow' and 'system' do not.
+   *
+   * Two ways to show it (docs/design.md §6.4). By default the transform. With native scroll on
+   * (`?scroll=native`), at the zoom the page is read at (homeZoom), with the
+   * view inside the page, the artifact's document scrolls itself: the frame is a
+   * window as tall as the view that stays put on the screen, the document is asked to scroll to
+   * the line at the top of the view, and the camera follows once the reporter says where it is
+   * (onScrolled), so the page moves without the frame moving and the drawings follow one frame
+   * later. A horizontal move shows at once. Anything else (a zoom, the view past the page top or
+   * end) is the transform: the frame as tall as the page, panned and zoomed with the drawings.
+   * Either way the camera maps world px (artifact px) to the screen the same way, so every viewer,
+   * presenter and followers, sees the same part of the page and the drawings stay on it.
+   */
   setCamera(c: Camera, source: 'user' | 'follow' | 'system' = 'user') {
     if (source === 'user' && this.followingUserId) this.stopFollowing();
-    this.camera = { tx: c.tx, ty: c.ty, z: clampZoom(c.z) };
-    this.world.style.transform = `translate(${this.camera.tx}px, ${this.camera.ty}px) scale(${this.camera.z})`;
+    const cam = { tx: c.tx, ty: c.ty, z: clampZoom(c.z) };
+    const n = this.nativeOf(cam);
+    if (n) {
+      if (!this.frame.scroller) {
+        this.enterScroller(n);
+        this.showCamera({ tx: cam.tx, ty: lineTy(n.y, cam.z), z: cam.z }, source);
+        return;
+      }
+      // the view's height changed: the window follows it
+      if (n.winH !== this.frame.windowH) {
+        this.frame.setScroller(true, n.winH);
+        this.page.style.height = `${n.winH}px`;
+        this.placeWindow();
+      }
+      // sideways (or a new view's zoom) at once, at the line the document is at
+      if (cam.tx !== this.camera.tx || cam.z !== this.camera.z) this.showCamera({ tx: cam.tx, ty: lineTy(this.scrollAt, cam.z), z: cam.z }, source);
+      if (Math.abs(n.y - this.intendedY()) >= 0.5) this.requestScroll(n.y, source);
+      return;
+    }
+    if (this.frame.scroller) this.leaveScroller();
+    this.showCamera(cam, source);
+  }
+
+  /** Put the camera on the screen (the world's transform) and tell whoever needs to know. */
+  private showCamera(cam: Camera, source: 'user' | 'follow' | 'system') {
+    this.camera = cam;
+    this.world.style.transform = `translate(${cam.tx}px, ${cam.ty}px) scale(${cam.z})`;
     // the page's animation waits while the camera moves (ArtifactFrame.cameraMoved)
     if (!this.hidden) this.frame.cameraMoved();
     if (source === 'follow') this.publishFollowedViewport();
     else {
       this.clearFollowSettle();
-      this.publishPresence({ viewport: this.visibleWorld() });
+      this.publishViewport();
     }
     if (this.editingId) this.positionTextarea();
     this.emit('camera');
+  }
+
+  /**
+   * The camera this tab is going to: the one on the screen, or, while a native scroll is on its
+   * way, the one it asked for. Moves made from the camera (a wheel, a drag, a slide step) start
+   * from it, so a fast wheel adds up instead of starting each step from where the page still is.
+   */
+  intendedCamera(): Camera {
+    if (!this.frame.scroller) return this.camera;
+    const y = this.intendedY();
+    return y === this.scrollAt ? this.camera : { ...this.camera, ty: lineTy(y, this.camera.z) };
+  }
+
+  /** Native scroll: the line the document is going to (or is at, as asked: it snaps to its pixels). */
+  private intendedY(): number {
+    if (this.scrollWant !== null) return this.scrollWant;
+    const a = this.scrollAsked;
+    return a !== null && Math.abs(a - this.scrollAt) <= 1 ? a : this.scrollAt;
+  }
+
+  /** Native scroll is on: the frame is a window of the view and the document scrolls in it. */
+  get nativeScrolling(): boolean {
+    return this.frame.scroller;
+  }
+
+  /** How `cam` shows natively, or null when the transform shows it (camera.ts nativeScroll). */
+  private nativeOf(cam: Camera): NativeScroll | null {
+    if (!this.cfg.nativeScroll || this.hidden || this.scrollRefused || !this.frame.canScroll || !this.initialCameraSet) return null;
+    return nativeScroll(cam, this.homeZoom(), this.viewH, this.pageHeight);
+  }
+
+  /** The camera stays; whether native scroll or the transform shows it follows the page and the view. */
+  private syncScroller() {
+    if (this.hidden || !this.initialCameraSet || this.viewW <= 0) return;
+    const cam = this.intendedCamera();
+    const n = this.nativeOf(cam);
+    if (!!n === this.frame.scroller && (!n || (n.winH === this.frame.windowH && Math.abs(n.y - this.intendedY()) < 0.5))) return;
+    this.setCamera(cam, 'system');
+  }
+
+  /** Start native scroll: the frame becomes the view's window at line `n.y`, the document goes there. */
+  private enterScroller(n: NativeScroll) {
+    this.scrollAt = n.y;
+    // the period's first position is the line it starts at (the reporter says it once it is there)
+    this.scrollWant = n.y;
+    this.scrollAsked = n.y;
+    this.scrollSeq = 0;
+    this.scrollWantSeq = 0;
+    this.scrollSource = 'system';
+    this.frame.setScroller(true, n.winH, n.y);
+    this.page.style.height = `${n.winH}px`;
+    this.placeWindow();
+  }
+
+  /** End native scroll: the frame is as tall as the page again, its top at the page top. */
+  private leaveScroller() {
+    this.scrollWant = null;
+    this.scrollAsked = null;
+    this.scrollAt = 0;
+    if (!this.frame.scroller) return;
+    this.frame.setScroller(false);
+    if (!this.hidden) this.page.style.height = `${this.pageHeight}px`;
+    this.page.style.transform = '';
+    this.setCorners('');
+  }
+
+  /** The frame's window at the line the document is scrolled to: the page shows where it is in the world. */
+  private placeWindow() {
+    this.page.style.transform = `translate(0px, ${this.scrollAt}px)`;
+    // rounded only where the window is at the page's own top or end
+    const top = this.scrollAt <= 0.5;
+    const end = this.scrollAt + this.frame.windowH >= this.pageHeight - 1.5;
+    this.setCorners(top && end ? '' : top ? '6px 6px 0 0' : end ? '0 0 6px 6px' : '0');
+  }
+
+  private setCorners(v: string) {
+    if (v === this.pageCorners) return;
+    this.pageCorners = v;
+    this.page.style.borderRadius = v;
+  }
+
+  /** Native scroll: ask the document to scroll to `y`; the camera follows when it is there (onScrolled). */
+  private requestScroll(y: number, source: 'user' | 'follow' | 'system') {
+    this.scrollWant = y;
+    this.scrollAsked = y;
+    this.scrollWantSeq = ++this.scrollSeq;
+    this.scrollSource = source;
+    this.frame.scrollTo(y, this.scrollWantSeq);
+    // the page's animation waits while it scrolls, as while the camera moves
+    this.frame.cameraMoved();
+  }
+
+  /**
+   * The reporter says where the document is (native scroll): the window goes there and the camera
+   * with it, so the drawings move with the page. An answer to the last request ends it; a scroll
+   * nobody asked for is the page's own navigation (a deck's arrows, scrollIntoView): the camera
+   * follows it, and the followers with it. A follower's page that moved by itself goes back to
+   * the view it follows.
+   */
+  private onScrolled(y: number, seq: number) {
+    if (this.hidden || !this.frame.scroller) return;
+    const pending = this.scrollWant !== null;
+    const source: 'user' | 'follow' | 'system' = pending ? this.scrollSource : this.followingUserId ? 'follow' : 'user';
+    if (pending && seq >= this.scrollWantSeq) {
+      const want = this.scrollWant!;
+      this.scrollWant = null;
+      const max = this.pageHeight - this.frame.windowH;
+      // asked for a line the page has and it stayed elsewhere: the page scrolls itself back
+      if (Math.abs(y - want) > 2 && want > 2 && want < max - 2) {
+        if (++this.scrollRefusals >= SCROLL_REFUSALS) {
+          this.scrollRefused = true;
+          const cam = { ...this.camera, ty: lineTy(want, this.camera.z) };
+          this.leaveScroller();
+          this.showCamera(cam, source);
+          return;
+        }
+      } else this.scrollRefusals = 0;
+    }
+    // the page's own scroll: the line asked for no longer stands for where it is
+    if (!pending) this.scrollAsked = null;
+    this.scrollAt = y;
+    this.placeWindow();
+    const z = this.camera.z;
+    this.showCamera({ tx: this.camera.tx, ty: lineTy(y, z), z }, source);
+    if (!pending && this.followingUserId) this.applyFollow();
   }
 
   private followSettle: ReturnType<typeof setTimeout> | null = null;
@@ -800,11 +1047,12 @@ export class Editor {
 
   zoomBy(dir: 1 | -1, anchor?: Pt) {
     const a = anchor ?? { x: this.viewW / 2, y: this.viewH / 2 };
-    this.setCamera(zoomAt(this.camera, nextZoomStep(this.camera.z, dir), a));
+    const cam = this.intendedCamera();
+    this.setCamera(zoomAt(cam, nextZoomStep(cam.z, dir), a));
   }
 
   zoomTo(z: number) {
-    this.setCamera(zoomAt(this.camera, z, { x: this.viewW / 2, y: this.viewH / 2 }));
+    this.setCamera(zoomAt(this.intendedCamera(), z, { x: this.viewW / 2, y: this.viewH / 2 }));
   }
 
   pageBox(): Box {
@@ -845,7 +1093,8 @@ export class Editor {
   }
 
   panBy(dx: number, dy: number, source: 'user' | 'system' = 'user') {
-    this.setCamera({ ...this.camera, tx: this.camera.tx + dx, ty: this.camera.ty + dy }, source);
+    const cam = this.intendedCamera();
+    this.setCamera({ ...cam, tx: cam.tx + dx, ty: cam.ty + dy }, source);
   }
 
   // ------------------------------------------------------------------ shapes & selection
@@ -1506,14 +1755,36 @@ export class Editor {
   /** A wheel: ctrl/⌘ (or a trackpad pinch) zooms at `anchor` (screen px), else it pans. */
   wheel(w: Omit<FrameWheel, 'x' | 'y'>, anchor: Pt) {
     if (w.zoom) {
+      const cam = this.intendedCamera();
       const factor = Math.exp(-w.dy * (w.mode === 1 ? 0.05 : 0.0025) * 4);
-      this.setCamera(zoomAt(this.camera, this.camera.z * factor, anchor));
+      this.setCamera(zoomAt(cam, cam.z * factor, anchor));
       return;
     }
     const k = w.mode === 1 ? 16 : w.mode === 2 ? this.viewH : 1;
-    const dx = w.shift && !w.dx ? w.dy : w.dx;
+    let dx = w.shift && !w.dx ? w.dy : w.dx;
     const dy = w.shift && !w.dx ? 0 : w.dy;
+    // native scroll: a mostly vertical wheel scrolls the page; the sideways drift of a trackpad
+    // would move the frame on every step
+    if (this.frame.scroller && Math.abs(dy) >= Math.abs(dx)) dx = 0;
     this.panBy(-dx * k, -dy * k);
+  }
+
+  /**
+   * A page key outside a presentation: ↑ ↓ a little, Page Up/Down and Space a screen, Home/End the
+   * page's top and end (natively at the zoom the page is read at, else a pan of the camera).
+   */
+  scrollKey(key: string, dir: 1 | -1) {
+    const cam = this.intendedCamera();
+    const vis = visibleWorld(cam, this.viewW, this.viewH);
+    if (key === 'Home' || key === 'End') {
+      // the end: the page's last screen (natively, the window's last line, camera.ts nativeScroll)
+      const end = Math.max(0, this.frame.scroller ? Math.floor(this.pageHeight) - this.frame.windowH - 1 : this.pageHeight - vis.h);
+      this.setCamera({ ...cam, ty: lineTy(key === 'Home' ? 0 : end, cam.z) });
+      return;
+    }
+    if (key === 'ArrowLeft' || key === 'ArrowRight') return;
+    const step = key === 'ArrowUp' || key === 'ArrowDown' ? ARROW_SCROLL : this.viewH * PAGE_SCROLL;
+    this.panBy(0, -dir * step);
   }
 
   /** The artifact handed over a wheel (interact tool): the same as a wheel on the canvas. */
@@ -1568,6 +1839,12 @@ export class Editor {
     }
     if (e.key === 'Escape') {
       this.escape();
+      return;
+    }
+    // page keys (the arrows only with nothing selected: then they nudge it); Space is the hand
+    if (e.key === 'PageDown' || e.key === 'PageUp' || e.key === 'Home' || e.key === 'End' || ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && !this.selection.size)) {
+      this.scrollKey(e.key, e.key === 'PageUp' || e.key === 'Home' || e.key === 'ArrowUp' ? -1 : 1);
+      e.preventDefault();
       return;
     }
     if (e.key === 'Enter' && this.selection.size === 1) {
@@ -1627,6 +1904,11 @@ function el(tag: string, cls: string): HTMLElement {
   const e = document.createElement(tag);
   e.className = cls;
   return e;
+}
+
+/** The camera's ty that puts world line `y` at the top of the view (never -0: a camera at the page top is ty 0). */
+function lineTy(y: number, z: number): number {
+  return 0 - y * z;
 }
 
 function round(n: number) {

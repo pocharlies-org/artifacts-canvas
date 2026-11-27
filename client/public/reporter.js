@@ -23,8 +23,10 @@
  *     the page's own height, and lets an IntersectionObserver report the whole page as in view
  *     (sections that a script reveals on scroll): the whole page is on the board,
  *   - in canvas mode, while the canvas camera moves (the parent says so), holds the page's
- *     animation frames and runs them once it stands still: a pan never waits for the page's own
- *     animation.
+ *     animation frames and pauses its animations, and lets them go on once it stands still: a pan
+ *     never waits for the page's own animation,
+ *   - in canvas mode at the zoom the page is read at (native scroll: the frame is a window as tall
+ *     as the view), scrolls the document where the parent asks and says where it is.
  * It reads no cookies or storage (it has none) and sends nothing anywhere else.
  * Copyright 2026 Daniel Ibáñez. Licensed under the Apache License, Version 2.0.
  */
@@ -56,8 +58,9 @@
     var w = Math.max(d ? d.scrollWidth : 0, b ? b.scrollWidth : 0);
     if (Math.abs(h - lastH) < 1) return;
     lastH = h;
-    // the mode it was measured in: the wrapper drops a size of the other mode (a mode change on its way)
-    post({ type: 'size', w: w, h: h, native: native });
+    // the mode it was measured in: the wrapper drops a size of the other mode (a mode change on its way);
+    // canScroll: this reporter scrolls the document for the parent (native scroll)
+    post({ type: 'size', w: w, h: h, native: native, canScroll: true });
   }
 
   function reportTitle() {
@@ -526,8 +529,9 @@
   // labels laid out again each frame) keeps this frame's main thread busy, so a pan waited on the
   // page's animation: in native mode the page's own scrolling does not. While the parent says the
   // camera moves (a `motion` message at most every 100 ms), the page's requestAnimationFrame
-  // callbacks are held; once it has stood still for HOLD_MS they run, in one frame, as the browser
-  // would have. CSS animations, videos and timers go on.
+  // callbacks are held and its running animations (CSS animations and transitions, the Web
+  // Animations API) are paused; once it has stood still for HOLD_MS the frames run, in one frame, as
+  // the browser would have, and the animations go on from where they were. Videos and timers go on.
   var HOLD_MS = 250;
   var holdUntil = 0;
   var parked = [];
@@ -537,8 +541,37 @@
   var snapshots = 0; // a snapshot (export) never waits for the camera
   var realRaf = window.requestAnimationFrame;
   var realCaf = window.cancelAnimationFrame;
+  var heldAnims = null; // the animations the hold paused, until it ends
   function nowMs() { return window.performance && performance.now ? performance.now() : Date.now(); }
   function holding() { return !native && !snapshots && holdUntil > nowMs(); }
+
+  /** Pause the page's running animations for the hold (once per hold: a pan's later messages find them paused). */
+  function pauseAnimations() {
+    if (heldAnims || typeof document.getAnimations !== 'function') return;
+    heldAnims = [];
+    var all;
+    try { all = document.getAnimations(); } catch (e) { return; }
+    for (var i = 0; i < all.length; i++) {
+      var a = all[i];
+      if (a.playState !== 'running') continue; // one the page paused or finished stays as it is
+      try { a.pause(); heldAnims.push(a); } catch (e) { /* ignore */ }
+    }
+  }
+
+  /** The hold is over: the animations it paused go on from where they were. */
+  function resumeAnimations() {
+    var list = heldAnims;
+    heldAnims = null;
+    if (!list) return;
+    for (var i = 0; i < list.length; i++) {
+      try { if (list[i].playState === 'paused') list[i].play(); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function release() {
+    resumeAnimations();
+    flushParked();
+  }
 
   function runFrame(cb, t) {
     try { cb(t); } catch (err) {
@@ -569,14 +602,16 @@
     releaseTimer = setTimeout(function () {
       releaseTimer = 0;
       if (holding()) scheduleRelease();
-      else flushParked();
+      else release();
     }, Math.max(0, holdUntil - nowMs()) + 1);
   }
 
-  /** The camera moved (the parent's `motion` message): hold the page's frames HOLD_MS more. */
+  /** The camera moved (the parent's `motion` message): hold the page's frames and animations HOLD_MS more. */
   function cameraMoved() {
     if (native) return;
     holdUntil = nowMs() + HOLD_MS;
+    pauseAnimations();
+    scheduleRelease();
   }
 
   function installFrameHold() {
@@ -690,9 +725,10 @@
   function setNative(on) {
     var was = native;
     native = !!on;
+    syncWheel();
     if (native) {
-      holdUntil = 0; // the page scrolls itself: its frames run at once
-      flushParked();
+      holdUntil = 0; // the page scrolls itself: its frames and animations run at once
+      release();
     }
     if (was !== native) {
       try { applyUnits(); } catch (e) { /* ignore */ }
@@ -787,9 +823,85 @@
     }, wait);
   }
 
+  // ---- native scroll (docs/protocol.md §3 "Native scroll") ----
+  // At the zoom the page is read at, the parent makes the frame a window as tall as the view and
+  // the document scrolls in it: the parent asks (`scroll-to`, the page's own navigation too) and
+  // the reporter says where the document is (`pos`), at once after a request and on every scroll,
+  // so the parent puts the window and the drawings there. The root still has no scrollbar and no
+  // snapping, so the layout is the canvas one. A period starts with the mode message; its `epoch`
+  // goes with every `pos`, so the parent drops a late one.
+  var scroller = false;
+  var scrollEpoch = 0;
+  var scrollSeq = 0; // the last request applied
+  var wantY = null; // a request the window is not tall enough for yet (its new size is on its way)
+  var wantUntil = 0;
+  var wantTimer = 0;
+  var postedX = -1;
+  var postedY = -1;
+  var postedSeq = -1;
+  var postedEpoch = -1;
+
+  function postPos(force) {
+    var x = window.scrollX || 0;
+    var y = window.scrollY || 0;
+    if (!force && x === postedX && y === postedY && scrollSeq === postedSeq && scrollEpoch === postedEpoch) return;
+    postedX = x; postedY = y; postedSeq = scrollSeq; postedEpoch = scrollEpoch;
+    post({ type: 'pos', x: x, y: y, seq: scrollSeq, epoch: scrollEpoch });
+  }
+
+  function scrollDoc(y) {
+    // instant, whatever the page's own scroll-behavior says
+    try { window.scrollTo({ left: 0, top: y, behavior: 'instant' }); } catch (e) { window.scrollTo(0, y); }
+  }
+
+  /**
+   * Scroll to `y` and say where the document is. Right after a period starts the frame may still be
+   * as tall as the page (the parent's resize and this message race): the request waits for the
+   * window (a resize) up to wantUntil, and only then is the position said.
+   */
+  function scrollTarget(y) {
+    scrollDoc(y);
+    if (Math.abs((window.scrollY || 0) - y) >= 1 && nowMs() < wantUntil) {
+      wantY = y;
+      if (!wantTimer) {
+        wantTimer = setTimeout(function () {
+          wantTimer = 0;
+          if (wantY === null || !scroller) return;
+          wantY = null;
+          postPos(true);
+        }, Math.max(0, wantUntil - nowMs()) + 1);
+      }
+      return;
+    }
+    wantY = null;
+    postPos(true);
+  }
+
+  function setScroller(on, epoch, y) {
+    var was = scroller;
+    scroller = !!on;
+    wantY = null;
+    if (scroller) {
+      scrollEpoch = isFinite(Number(epoch)) ? Number(epoch) : 0;
+      scrollSeq = 0;
+      wantUntil = nowMs() + 1000;
+      scrollTarget(isFinite(Number(y)) ? Math.max(0, Number(y)) : 0);
+    } else if (was) {
+      scrollDoc(0); // the whole page again (canvas mode), or the plain page from its top (native mode)
+    }
+  }
+
+  window.addEventListener('resize', function () {
+    if (scroller && wantY !== null) scrollTarget(wantY);
+  });
+
   window.addEventListener('scroll', function () {
     if (native) {
       scheduleNote(); // the page scrolls itself; the reporter notes where it is read
+      return;
+    }
+    if (scroller) {
+      if (wantY === null) postPos(false); // the page's own navigation, a clamp; a request said it already
       return;
     }
     var x = window.scrollX || 0;
@@ -1002,13 +1114,24 @@
     return false;
   }
 
-  window.addEventListener('wheel', function (e) {
+  function onWheel(e) {
     if (native || e.defaultPrevented) return; // the page scrolls itself, or its own widget took it
     var zoom = e.ctrlKey || e.metaKey;
     if (!zoom && scrollsInside(e.target, e.deltaX, e.deltaY)) return;
     e.preventDefault();
     post({ type: 'wheel', dx: e.deltaX, dy: e.deltaY, mode: e.deltaMode, zoom: zoom, shift: e.shiftKey, x: e.clientX + (window.scrollX || 0), y: e.clientY + (window.scrollY || 0) });
-  }, { passive: false });
+  }
+
+  // Only in canvas mode: a listener that may cancel a wheel makes the browser wait for this page's
+  // main thread before it scrolls, and in native mode the page scrolls itself.
+  var wheelOn = false;
+  function syncWheel() {
+    if (wheelOn === !native) return;
+    wheelOn = !native;
+    if (wheelOn) window.addEventListener('wheel', onWheel, { passive: false });
+    else window.removeEventListener('wheel', onWheel, { passive: false });
+  }
+  syncWheel();
 
   // ---- slides (docs/protocol.md §3 "Presenting a deck") ----
   // A presentation steps the page with the arrow keys, Page Up/Down and Space, whatever the tool:
@@ -1073,7 +1196,19 @@
     if (e.source !== parentWin) return;
     var d = e.data;
     if (d && d.source === 'artifacts-canvas' && d.type === 'mode') {
+      var toScroller = d.native !== true && d.scroller === true;
+      if (scroller && !toScroller) setScroller(false);
       setNative(d.native === true);
+      if (toScroller && (!scroller || d.epoch !== scrollEpoch)) setScroller(true, d.epoch, d.y);
+      return;
+    }
+    if (d && d.source === 'artifacts-canvas' && d.type === 'scroll-to') {
+      if (!scroller || native || d.epoch !== scrollEpoch) return;
+      var sy = Number(d.y);
+      var sq = Number(d.seq);
+      if (!isFinite(sy) || !isFinite(sq)) return;
+      scrollSeq = sq;
+      scrollTarget(Math.max(0, sy));
       return;
     }
     if (d && d.source === 'artifacts-canvas' && d.type === 'motion') {
