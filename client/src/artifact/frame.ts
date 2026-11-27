@@ -15,6 +15,11 @@ import { stepOf } from '../editor/slides';
  * reporter script (public/reporter.js) that the server injects into the artifact HTML; it only
  * posts {size, title, scroll} and, on request, a PNG snapshot for export.
  *
+ * Native scroll (design §6.4): at the zoom the page is read at, the frame is instead a window as
+ * tall as the view (`setScroller`), the wrapper asks the reporter to scroll the document
+ * (`scrollTo`) and the reporter says where it is (`pos`): the window sits at that line of the
+ * page, so world coordinates stay artifact pixels and the frame does not move on the screen.
+ *
  * Interacting with the artifact (docs/protocol.md §3 "Links"): with the interact tool the frame
  * takes the pointer, and the reporter turns a click on a link into a `link` message (the wrapper
  * decides what it opens, artifact/links.ts), a same-document anchor into an `anchor` position,
@@ -60,7 +65,9 @@ export interface FrameEvents {
   /** Escape pressed inside the artifact. */
   escape?: () => void;
   /** A key that steps a presentation (editor/slides.ts stepOf), pressed inside the artifact and left by the page. */
-  step?: (dir: 1 | -1) => void;
+  step?: (dir: 1 | -1, key: string) => void;
+  /** Native scroll: the document is scrolled to `y` artifact px; `seq`, the last scroll request it applied. */
+  scrolled?: (y: number, seq: number) => void;
   /** The artifact's background colour (checked: rgb(), rgba() or hex only). */
   background?: (c: Rgba) => void;
   /** Where the hidden page was being read, said once the canvas layout is back (FrameReading). */
@@ -132,6 +139,15 @@ export class ArtifactFrame {
   private slideAsks = new Map<string, (s: FrameSlides | null) => void>();
   /** When the last `motion` message went out (performance.now()). */
   private motionAt = -Infinity;
+  /** The reporter can scroll its document for the wrapper (it said so in its `size` message). */
+  canScroll = false;
+  /** Native scroll: the frame is a window `windowH` artifact px tall and the document scrolls in it. */
+  scroller = false;
+  windowH = 0;
+  /** Changes with every scroller period: a `pos` of another one is late and dropped. */
+  private scrollEpoch = 0;
+  /** Where the document goes when a scroller period starts (sent with the mode). */
+  private entryY = 0;
 
   constructor(parent: HTMLElement, src: string, width: number, initialHeight: number, private vendorUrl: string, private ev: FrameEvents = {}) {
     this.width = width;
@@ -205,7 +221,7 @@ export class ArtifactFrame {
           return;
         }
         const dir = typeof d.key === 'string' ? stepOf(d.key, d.shift === true) : 0;
-        if (dir) this.ev.step?.(dir);
+        if (dir) this.ev.step?.(dir, d.key as string);
         return;
       }
       case 'slides': {
@@ -231,6 +247,7 @@ export class ArtifactFrame {
         // about this one. In canvas mode a page measured at the view's units could be taken for
         // the canvas layout, and the frame would grow with it.
         if (typeof d.native === 'boolean' && d.native !== this.native) return;
+        if (d.canScroll === true) this.canScroll = true;
         const h = Number(d.h);
         if (!isFinite(h) || h <= 0) return;
         const nh = Math.min(MAX_HEIGHT, Math.ceil(h));
@@ -240,10 +257,11 @@ export class ArtifactFrame {
         else this.growthStreak = 0;
         if (this.growthStreak > 20) return;
         this.height = nh;
-        // native mode: the page scrolls inside a frame the size of the view; only its height is noted
+        // native mode: the page scrolls inside a frame the size of the view; only its height is noted.
+        // Native scroll: the frame is a window of the view's height, the page's height is noted too.
         if (!this.native) {
           this.canvasHeight = nh;
-          this.el.style.height = `${nh}px`;
+          if (!this.scroller) this.el.style.height = `${nh}px`;
         }
         this.ev.size?.(this.width, nh);
         return;
@@ -261,6 +279,13 @@ export class ArtifactFrame {
           x: c(d.x as number, 0, this.width), y: c(d.y as number, 0, this.height), w: Math.min(w, this.width),
           left: c(d.left as number, -MAX_HEIGHT, MAX_HEIGHT), top: c(d.top as number, -MAX_HEIGHT, MAX_HEIGHT), nw: Math.min(nw, MAX_HEIGHT),
         });
+        return;
+      }
+      case 'pos': {
+        // native scroll: where the document is; a report of an earlier period (or mode) is late
+        if (!this.scroller || this.native || d.epoch !== this.scrollEpoch) return;
+        if (!finite(d.y) || !finite(d.seq)) return;
+        this.ev.scrolled?.(Math.max(0, Math.min(this.height, d.y)), d.seq);
         return;
       }
       case 'title':
@@ -351,6 +376,37 @@ export class ArtifactFrame {
     win.postMessage({ source: 'artifacts-canvas', type: 'motion' }, '*');
   }
 
+  /**
+   * Native scroll on: the frame becomes a window `h` artifact px tall and, when a period starts, the
+   * document goes to `y` (the reporter applies it again once the window has its size). Already on,
+   * only the window's height follows (the view changed). Off: the frame is as tall as the page
+   * again and the document goes back to its top. Canvas mode only.
+   */
+  setScroller(on: boolean, h = 0, y = 0) {
+    if (this.native) return;
+    if (on) {
+      this.windowH = h;
+      this.el.style.height = `${h}px`;
+      if (this.scroller) return;
+      this.scroller = true;
+      this.scrollEpoch++;
+      this.entryY = y;
+      this.sendMode();
+    } else if (this.scroller) {
+      this.scroller = false;
+      this.scrollEpoch++;
+      this.el.style.height = `${this.canvasHeight}px`;
+      this.sendMode();
+    }
+  }
+
+  /** Native scroll: scroll the document to `y` artifact px; the reporter answers `pos` with `seq`. */
+  scrollTo(y: number, seq: number) {
+    const win = this.el.contentWindow;
+    if (!this.scroller || !win) return;
+    win.postMessage({ source: 'artifacts-canvas', type: 'scroll-to', y, seq, epoch: this.scrollEpoch }, '*');
+  }
+
   /** Follow the link of the artifact at (x, y) artifact px, if there is one (the select tool's click). */
   clickAt(x: number, y: number, newTab: boolean) {
     this.el.contentWindow?.postMessage({ source: 'artifacts-canvas', type: 'click', x, y, newTab }, '*');
@@ -363,6 +419,11 @@ export class ArtifactFrame {
   setNative(on: boolean, w = 0, h = 0) {
     if (on !== this.native) this.growthStreak = 0;
     this.native = on;
+    if (this.scroller) {
+      // native scroll is a canvas-mode layout: either way the frame starts again as tall as the page
+      this.scroller = false;
+      this.scrollEpoch++;
+    }
     // the frame scrolls only in native mode (the canvas pans it otherwise)
     this.el.setAttribute('scrolling', on ? 'auto' : 'no');
     if (on) {
@@ -381,7 +442,7 @@ export class ArtifactFrame {
   private sendMode() {
     const win = this.el.contentWindow;
     if (!win) return;
-    win.postMessage({ source: 'artifacts-canvas', type: 'mode', native: this.native }, '*');
+    win.postMessage({ source: 'artifacts-canvas', type: 'mode', native: this.native, scroller: this.scroller, epoch: this.scrollEpoch, y: this.entryY }, '*');
   }
 
   /** With the interact tool the frame takes the pointer (links, buttons, inner scrolling). */

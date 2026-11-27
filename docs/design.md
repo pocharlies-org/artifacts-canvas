@@ -232,6 +232,49 @@ as a direction, but a builder may change one with a stated reason.
   orphans.
 - Images pasted onto the canvas are stored under the same canvas prefix with the same expiry, behind a size cap.
 
+### 6.4 Scrolling: native or transform (builder's decision, 2026-11-27)
+
+The camera maps world px (the artifact's CSS px at the room's `pageWidth`) to the screen: `screen =
+world * z + t`. Two ways show a camera, and every viewer may use either, so presenter and followers
+see the same part of the page and the drawings stay on it:
+
+- **Transform** (any camera): the frame is as tall as the page and never scrolls; the world layer,
+  frame and drawings together, is translated and scaled. Every step of a pan moves the frame, and
+  the browser shows the step only once the artifact's own process has drawn the frame again: a
+  pan step waited for the page (7 to 10 ms more than the page scrolling itself, measured in Chrome).
+- **Native scroll** (at the zoom the page is read at: as wide as the view, or the presentation's,
+  with the view inside the page): the frame is a window as tall as the view that stays put on the
+  screen, and the artifact's own document scrolls in it. The wrapper asks the reporter to scroll
+  to the line at the top of the view; the reporter scrolls (instantly, whatever the page's
+  `scroll-behavior`) and says where the document is; the wrapper puts the window at that line
+  of the page and sets the camera from it. The frame does not move, so nothing waits for it. The
+  page keeps its canvas layout (the reference screen's `vh` and `innerHeight`, no scrollbar, no
+  snapping); only what depends on the frame's own height changes (a `position: fixed` element
+  stays in the window, as on the page itself).
+
+What goes which way:
+
+- A wheel or a trackpad, the page keys, a drag, the minimap, a slide step, a same-document anchor,
+  following someone: whatever lands on a camera at the reading zoom inside the page scrolls
+  natively (a mostly vertical wheel loses its sideways drift; a sideways move shows at once).
+- Zooming (ctrl or ⌘ + wheel, a pinch, the zoom buttons) and panning past the page top or end use
+  the transform; back at the reading zoom inside the page, the next camera scrolls natively again.
+- The page's own navigation (a deck's arrows, `scrollIntoView`) scrolls the document; the camera
+  follows it and so do the followers, as it did through the stage before.
+- The drawings follow the page one frame later (the reporter's answer comes after the page has
+  scrolled); accepted. Moves made from the camera start from the scroll last asked for, so a fast
+  wheel adds up.
+- A page that scrolls itself back (three requests in a row not followed) keeps the transform for
+  the rest of its visit.
+
+The per-step work of the wrapper is kept to what changes: the zoom % is written only when its
+rounded value changes, this tab's own viewport changes nothing the chrome shows and goes out at
+most once a second unless it presents or someone follows it, the minimap's viewport is an element
+moved over a map painted only when it changes (at most 30 times a second), and the chrome has no
+`backdrop-filter` (a blur behind a panel made the browser draw the whole window on every step).
+While the camera moves the reporter holds the page's animation frames and pauses its running
+animations (protocol §3 "Camera motion").
+
 ## 7. Left to the builder
 
 - Front-end stack and build. Raw TS + Canvas/SVG or a small framework. The bundle is self-contained, served by the

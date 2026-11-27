@@ -146,6 +146,34 @@ Each fixed entry names its regression tests.
   page's; held frames run in one frame and in order, a cancel while held or during the flush holds,
   and a page that cancels ids it never got cannot cancel the flush) and `client/e2e/viewport-units.spec.ts` with
   `client/dev/artifacts/scroll-reveal.html` (Chromium, Firefox and WebKit).
+- [x] **L-13 — Each step of a pan in canvas mode reached the screen later than a scroll of the hidden
+  page (Medium).** Frame rates matched after L-12, but a trace of input to screen showed canvas mode
+  5 to 16 ms behind (median 28.6 against 23.1 ms on a deck, 39.6 against 23.4 ms on a page of CSS
+  animations, trackpad-like input in Chrome). Causes, by size: every camera step moved the frame, and
+  the browser showed the step only once the artifact's process had drawn the frame again (6 to
+  8 ms per step); the wrapper itself rewrote the zoom %, rebuilt the avatars and who is here for its
+  own viewport and repainted the minimap on every step; a `backdrop-filter` on the title bar made
+  the browser draw the whole window on every step; the page's CSS animations kept painting while the
+  camera moved (the hold covered only `requestAnimationFrame`); and with the canvas hidden the
+  reporter's wheel listener, which may cancel, made the first wheel event of each gesture wait for
+  the page's main thread (about 15 ms). Now, at the zoom the page is read at, the artifact's
+  document scrolls itself in a frame that stays put (design §6.4, protocol §3 "Native scroll"); the
+  zoom % is written only when it changes; this tab's own viewport changes nothing the chrome shows
+  and goes out at most once a second unless it presents or someone follows it; the minimap moves an
+  element over a map painted only when it changes (at most 30 times a second); the chrome is
+  near-opaque with no blur; the hold also pauses the page's animations; and the wheel listener
+  exists only in canvas mode. Left: the drawings follow a native scroll one frame later; zooming and
+  panning past the page still move the frame; a `position: fixed` element stays in the window while
+  the page scrolls natively (as on the page itself) and sits at the page top with the transform; a
+  CSS animation the hold paused and played no longer follows the page's `animation-play-state`.
+  Tests: `client/e2e/native-scroll.spec.ts` with `client/dev/artifacts/sections.html` (the frame
+  stays put and the document scrolls, a drawing stays on the page, a follower shows the same part
+  natively, past the page top and back, page keys, a zoom moves the frame and the reading zoom
+  scrolls natively again, a deck steps in both ways and its own navigation moves the followers, no
+  zoom % write and no presence per step, animations paused during camera motion and resumed, no
+  wheel listener that may cancel with the canvas hidden), `client/e2e/native-scroll-engines.spec.ts`
+  (Chromium, Firefox and WebKit), `client/tests/native-scroll.test.ts` and
+  `client/e2e/perf.spec.ts`.
 
 ## Review of the fv9 branch (security and QA)
 

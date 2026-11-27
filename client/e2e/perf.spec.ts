@@ -196,3 +196,49 @@ test('held animation frames run once the camera stands still, in order, and the 
   expect(log[0].at).toBeGreaterThan(p.wall[1]); // after the camera stood still
   await A.close();
 });
+
+// Native scroll (docs/design.md §6.4, known issues L-13): at the zoom the page is read at, a wheel
+// scrolls the page's own document in a frame that stays put, so no step of the scroll waits for the
+// frame to be drawn again where the camera moved it. The gate is structural (headless frame timing
+// is noise, see above): the frame's box on the screen is the same on every frame of a wheel scroll
+// over the heavy page, the document scrolled, and the page's animation frames were held meanwhile.
+test('the default view scrolls the heavy page natively: the frame never moves during a wheel scroll', async ({ browser }) => {
+  const H = await open(browser, 'Ana', newRoom('perf-native'), { artifact: 'heavy-page.html', fit: true });
+  const p = H.page;
+  const f = p.frameLocator('iframe.artifact-frame').locator('html');
+  await expect.poll(() => p.evaluate(() => (window as any).__canvas.editor.nativeScrolling)).toBe(true);
+  await expect.poll(() => f.evaluate(() => (window as any).__heavy.frames)).toBeGreaterThan(5);
+  await p.evaluate(() => {
+    const w = window as any;
+    const el = document.querySelector('iframe.artifact-frame')!;
+    w.__boxes = new Set<string>();
+    w.__stop = false;
+    const tick = () => {
+      const b = el.getBoundingClientRect();
+      w.__boxes.add([b.x, b.y, b.width, b.height].map((v) => v.toFixed(2)).join(','));
+      if (!w.__stop) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+  const wall0 = Date.now();
+  await p.mouse.move(720, 450);
+  for (let i = 0; i < 40; i++) await p.mouse.wheel(0, 30);
+  const wall1 = Date.now();
+  await expect.poll(() => f.evaluate(() => window.scrollY)).toBeGreaterThan(600);
+  const boxes = await p.evaluate(() => {
+    const w = window as any;
+    w.__stop = true;
+    return [...w.__boxes];
+  });
+  expect(boxes).toHaveLength(1);
+  expect(await p.evaluate(() => (window as any).__canvas.editor.nativeScrolling)).toBe(true);
+  // the camera is where the document is
+  const [vy, sy] = [await p.evaluate(() => (window as any).__canvas.editor.visibleWorld().y), await f.evaluate(() => window.scrollY)];
+  expect(Math.abs(vy - sy)).toBeLessThan(0.5);
+  // held while it scrolled (the first `motion` message on its way: 150 ms)
+  const at: number[] = await f.evaluate(() => (window as any).__heavy.at);
+  const during = at.filter((t) => t > wall0 + 150 && t <= wall1).length;
+  console.log(`PERF native scroll over the heavy page: ${boxes.length} frame position(s), ${during} page frames during ${wall1 - wall0} ms of wheel`);
+  expect(during).toBeLessThanOrEqual(Math.max(2, Math.ceil((wall1 - wall0) / 250)));
+  await H.close();
+});

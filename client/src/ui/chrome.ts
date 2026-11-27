@@ -463,12 +463,23 @@ function bottomLeft(ed: Editor): HTMLElement {
   const undo = h('button', { class: 'tool', 'data-tip': t('ctl.undo'), 'aria-label': t('ctl.undo'), 'data-testid': 'undo', onclick: () => ed.undo() }, '↶');
   const redo = h('button', { class: 'tool', 'data-tip': t('ctl.redo'), 'aria-label': t('ctl.redo'), 'data-testid': 'redo', onclick: () => ed.redo() }, '↷');
   const pct = h('button', { class: 'zoom-pct', 'data-testid': 'zoom-pct', title: '100%', onclick: () => ed.zoomTo(1) });
-  const update = () => {
-    pct.textContent = `${Math.round(ed.camera.z * 100)}%`;
-    undo.disabled = !ed.doc.canUndo();
-    redo.disabled = !ed.doc.canRedo();
+  // the camera changes on every step of a pan: the text is written only when the rounded zoom
+  // changes (a rewrite lays the bar out and paints it again, every step)
+  let shown = '';
+  const updateZoom = () => {
+    const text = `${Math.round(ed.camera.z * 100)}%`;
+    if (text === shown) return;
+    shown = text;
+    pct.textContent = text;
   };
-  ed.on('camera', update);
+  const update = () => {
+    updateZoom();
+    const u = !ed.doc.canUndo();
+    const r = !ed.doc.canRedo();
+    if (undo.disabled !== u) undo.disabled = u;
+    if (redo.disabled !== r) redo.disabled = r;
+  };
+  ed.on('camera', updateZoom);
   ed.on('doc', update);
   ed.on('history', update);
   ed.doc.undoManager.on('stack-item-added', update);

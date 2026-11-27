@@ -139,7 +139,7 @@ test('the style panel shows while shapes are selected, to style them', async ({ 
 });
 
 for (const page of [{ name: 'light', artifact: 'sample-report.html', rgb: '255, 255, 255' }, { name: 'dark', artifact: 'dark.html', rgb: '31, 41, 55' }]) {
-  test(`the side panels and the title bar are translucent with a blur, and their text stays legible (${page.name} page)`, async ({ browser }) => {
+  test(`the side panels and the title bar are near-opaque with no blur, and their text stays legible (${page.name} page)`, async ({ browser }) => {
     const A = await open(browser, 'Ana', newRoom(`glass-${page.name}`), { artifact: page.artifact, fit: true });
     const p = A.page;
     await expect.poll(() => p.evaluate(() => document.body.classList.contains('theme-dark'))).toBe(page.name === 'dark');
@@ -147,14 +147,15 @@ for (const page of [{ name: 'light', artifact: 'sample-report.html', rgb: '255, 
     await expect.poll(() => shown(p, 'people-panel')).toBe(true);
     const side = await look(p, 'people-panel');
     expect(side.bg).toContain(page.rgb);
-    expect(alpha(side.bg)).toBeCloseTo(0.2, 2); // 80 % transparent: --chrome-alpha
-    expect(side.backdrop).toContain('blur(14px)');
+    expect(alpha(side.bg)).toBeCloseTo(0.88, 2); // --chrome-alpha
+    // no backdrop-filter: a blur behind a panel made every step of a pan draw the whole window again
+    expect(['', 'none']).toContain(side.backdrop);
     const bar = await p.locator('.panel.topleft').evaluate((el) => {
       const cs = getComputedStyle(el);
       return { bg: cs.backgroundColor, backdrop: cs.backdropFilter || (cs as any).webkitBackdropFilter || '' };
     });
-    expect(alpha(bar.bg)).toBeCloseTo(0.35, 2); // a little stronger
-    expect(bar.backdrop).toContain('blur(14px)');
+    expect(alpha(bar.bg)).toBeCloseTo(0.94, 2); // a little stronger
+    expect(['', 'none']).toContain(bar.backdrop);
     // the top right bar is as it was (opaque)
     expect(alpha(await p.locator('.panel.topright').evaluate((el) => getComputedStyle(el).backgroundColor))).toBe(1);
     // legible: the heading and the title stand out of what is behind them
