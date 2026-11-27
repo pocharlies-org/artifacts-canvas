@@ -265,7 +265,9 @@ What goes which way, with native scroll on:
   follows it and so do the followers, as it did through the stage before.
 - The drawings follow the page one frame later (the reporter's answer comes after the page has
   scrolled); accepted. Moves made from the camera start from the scroll last asked for, so a fast
-  wheel adds up.
+  wheel adds up, and a page that lands each scroll up to 2 px off (its own pixel grid) does not
+  drift.
+- A page that reloads or navigates itself starts native scroll again at the line on the screen.
 - A page that scrolls itself back (three requests in a row not followed) keeps the transform for
   the rest of its visit.
 

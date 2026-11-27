@@ -237,7 +237,14 @@ change that lands elsewhere (a zoom, past the page top or end) ends it, and the 
 the page again with the document at its top. A period starts with a `mode` message carrying
 `scroller: true`, its `epoch` and the line to start at; until the window has its size (the resize
 races the message) the reporter applies that line again on `resize`, and says nothing for up to
-1 s. Every `pos` carries the epoch and the wrapper drops one of another. The root keeps
+1 s, unless the page scrolls itself meanwhile (the document is neither at the line asked for nor
+where the request left it): that is said at once, with the request's `seq` (the wrapper takes it
+as the answer), and the reporter stops waiting. Every `pos` carries
+the epoch and the wrapper drops one of another. A document that lands a request within 2 px of the
+line (it snaps the scroll to pixels of its own) followed it, and the next move starts from the line
+asked for. A new document in the frame (the page reloads or navigates itself) has a reporter that
+starts over: the wrapper ends the period on the frame's `load` and starts one at the line on the
+screen, and a request the old document never answered is dropped. The root keeps
 `overflow: hidden` (no scrollbar, no user scrolling: the wheel goes to the wrapper, which asks)
 and no snapping. A document that stays elsewhere three times in a row (a page that scrolls itself
 back) keeps the transform for the rest of the visit. The reporter says it can do this with

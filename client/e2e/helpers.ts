@@ -15,9 +15,10 @@ export function newRoom(prefix: string): string {
  * (`?canvas=1`) unless `opts.query` sets `canvas` or `opts.firstVisit` asks for a visit with no
  * query and no stored choice (a first visit opens the canvas hidden: src/ui/canvas-pref.ts).
  * `hash` ends the URL (`#s3`); `delayFrame` holds the artifact's frame back that many ms, so the
- * room is joined well before the page's load event.
+ * room is joined well before the page's load event; `holdIdentityMs` holds the relay's identity
+ * message (its first) back that many ms, so the room's presence reaches the tab before its identity.
  */
-export async function open(browser: Browser, name: string, room: string, opts: { artifact?: string; viewport?: { width: number; height: number }; lang?: string; deviceScaleFactor?: number; prodCsp?: boolean; query?: Record<string, string>; mobile?: boolean; initScript?: string; firstVisit?: boolean; colorScheme?: 'light' | 'dark'; fit?: boolean; hash?: string; delayFrame?: number } = {}): Promise<Opened> {
+export async function open(browser: Browser, name: string, room: string, opts: { artifact?: string; viewport?: { width: number; height: number }; lang?: string; deviceScaleFactor?: number; prodCsp?: boolean; query?: Record<string, string>; mobile?: boolean; initScript?: string; firstVisit?: boolean; colorScheme?: 'light' | 'dark'; fit?: boolean; hash?: string; delayFrame?: number; holdIdentityMs?: number } = {}): Promise<Opened> {
   const ctx = await browser.newContext({
     viewport: opts.viewport ?? { width: 1440, height: 900 }, deviceScaleFactor: opts.deviceScaleFactor, acceptDownloads: true,
     ...(opts.colorScheme ? { colorScheme: opts.colorScheme } : {}),
@@ -29,6 +30,22 @@ export async function open(browser: Browser, name: string, room: string, opts: {
     await ctx.route('**/_canvas/_/frame/**', async (r) => {
       await new Promise((res) => setTimeout(res, delay));
       await r.continue();
+    });
+  }
+  const hold = opts.holdIdentityMs;
+  if (hold) {
+    await ctx.routeWebSocket(/\/_canvas\/_\/ws\//, (ws) => {
+      const server = ws.connectToServer();
+      let held = false;
+      server.onMessage((m) => {
+        // MSG_IDENTITY (100) is one byte: the relay's identity message
+        if (!held && typeof m !== 'string' && m[0] === 100) {
+          held = true;
+          setTimeout(() => ws.send(m), hold);
+          return;
+        }
+        ws.send(m);
+      });
     });
   }
   const page = await ctx.newPage();

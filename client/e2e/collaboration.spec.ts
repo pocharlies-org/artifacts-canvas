@@ -115,6 +115,34 @@ test('undo is per user: it only reverts my own change', async ({ browser }) => {
   await B.close();
 });
 
+test('undo and redo start greyed, also in a room that already has drawings, and follow this tab\'s own steps', async ({ browser }) => {
+  const room = newRoom('undo-start');
+  const A = await open(browser, 'Ana', room);
+  const [undoA, redoA] = [A.page.getByTestId('undo'), A.page.getByTestId('redo')];
+  await expect(undoA).toBeDisabled();
+  await expect(redoA).toBeDisabled();
+  await A.page.keyboard.press('r');
+  await dragBox(A.page, 400, 300, 500, 380);
+  await expect(undoA).toBeEnabled();
+  await expect(redoA).toBeDisabled();
+  // another tab opens the room with that rectangle in it: nothing of its own to undo
+  const B = await open(browser, 'Marta', room);
+  await expect.poll(async () => (await shapes(B.page)).length).toBe(1);
+  await expect(B.page.getByTestId('undo')).toBeDisabled();
+  await expect(B.page.getByTestId('redo')).toBeDisabled();
+  // its camera moving does not change that
+  await B.page.evaluate(() => (window as any).__canvas.editor.panBy(0, -120));
+  await expect(B.page.getByTestId('undo')).toBeDisabled();
+  await undoA.click();
+  await expect(undoA).toBeDisabled();
+  await expect(redoA).toBeEnabled();
+  await redoA.click();
+  await expect(undoA).toBeEnabled();
+  await expect(redoA).toBeDisabled();
+  await A.close();
+  await B.close();
+});
+
 test('the laser pointer is live for others and never stored', async ({ browser }) => {
   const room = newRoom('laser');
   const A = await open(browser, 'Ana', room);

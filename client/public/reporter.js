@@ -834,6 +834,7 @@
   var scrollEpoch = 0;
   var scrollSeq = 0; // the last request applied
   var wantY = null; // a request the window is not tall enough for yet (its new size is on its way)
+  var wantAt = null; // where that request left the document (a scroll event there is the reporter's own)
   var wantUntil = 0;
   var wantTimer = 0;
   var postedX = -1;
@@ -861,8 +862,10 @@
    */
   function scrollTarget(y) {
     scrollDoc(y);
-    if (Math.abs((window.scrollY || 0) - y) >= 1 && nowMs() < wantUntil) {
+    var at = window.scrollY || 0;
+    if (Math.abs(at - y) >= 1 && nowMs() < wantUntil) {
       wantY = y;
+      wantAt = at;
       if (!wantTimer) {
         wantTimer = setTimeout(function () {
           wantTimer = 0;
@@ -901,6 +904,10 @@
       return;
     }
     if (scroller) {
+      // while a request waits for the window, the document is where it asked or where it left it;
+      // anywhere else the page moved it itself (its own navigation): said at once, the request dropped
+      var sy = window.scrollY || 0;
+      if (wantY !== null && Math.abs(sy - wantY) >= 1 && (wantAt === null || Math.abs(sy - wantAt) >= 1)) wantY = null;
       if (wantY === null) postPos(false); // the page's own navigation, a clamp; a request said it already
       return;
     }
@@ -1119,6 +1126,9 @@
     var zoom = e.ctrlKey || e.metaKey;
     if (!zoom && scrollsInside(e.target, e.deltaX, e.deltaY)) return;
     e.preventDefault();
+    // x, y: the pointer in document px (artifact px, the wrapper's world). With native scroll the
+    // document is scrolled, so that is the client point plus the scroll; with the transform the
+    // document never scrolls (the scroll is 0) and the client point is already the document's.
     post({ type: 'wheel', dx: e.deltaX, dy: e.deltaY, mode: e.deltaMode, zoom: zoom, shift: e.shiftKey, x: e.clientX + (window.scrollX || 0), y: e.clientY + (window.scrollY || 0) });
   }
 

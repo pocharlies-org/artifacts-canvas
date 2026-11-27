@@ -12,8 +12,10 @@ import { stepOf } from '../editor/slides';
  * the artifact's full content height; it never scrolls itself. The canvas camera pans and zooms
  * the iframe and the drawings together, so world coordinates ARE artifact CSS pixels and
  * annotations stay on the element they were drawn on. The content height comes from a tiny
- * reporter script (public/reporter.js) that the server injects into the artifact HTML; it only
- * posts {size, title, scroll} and, on request, a PNG snapshot for export.
+ * reporter script (public/reporter.js) that the server injects into the artifact HTML; it posts
+ * {size, title, scroll, bg, reading} and, with native scroll, `pos`, and answers what the wrapper
+ * asks (`slides`, `probe`, and a PNG snapshot for export); what the user does in the page (links,
+ * anchors, wheel, keys) is below. docs/protocol.md §3 lists every message.
  *
  * Native scroll (design §6.4): at the zoom the page is read at, the frame is instead a window as
  * tall as the view (`setScroller`), the wrapper asks the reporter to scroll the document
@@ -23,7 +25,8 @@ import { stepOf } from '../editor/slides';
  * Interacting with the artifact (docs/protocol.md §3 "Links"): with the interact tool the frame
  * takes the pointer, and the reporter turns a click on a link into a `link` message (the wrapper
  * decides what it opens, artifact/links.ts), a same-document anchor into an `anchor` position,
- * and a wheel that nothing inside the page scrolls into a `wheel` message (the camera pans).
+ * a wheel that nothing inside the page scrolls into a `wheel` message (the camera pans), and
+ * Escape or a step key the page left into a `key` message.
  * The select tool asks the reporter which element is under a point (`probe`) and to follow the
  * link there (`click`); a presentation asks where the page's slides are (`slides`), and a camera
  * move says so (`motion`: the page's animation frames wait until the camera stands still). Every message
@@ -72,6 +75,11 @@ export interface FrameEvents {
   background?: (c: Rgba) => void;
   /** Where the hidden page was being read, said once the canvas layout is back (FrameReading). */
   reading?: (r: FrameReading) => void;
+  /**
+   * A new document loaded in the frame (the page reloaded or navigated itself): its reporter starts
+   * over and knows no native scroll period. Called before the mode goes out to it.
+   */
+  reload?: () => void;
 }
 
 /**
@@ -165,7 +173,9 @@ export class ArtifactFrame {
     f.style.height = `${initialHeight}px`;
     f.src = src;
     f.addEventListener('load', () => {
+      const again = this.loaded;
       this.loaded = true;
+      if (again) this.ev.reload?.();
       this.sendMode();
       this.reporterTold = true;
     });
