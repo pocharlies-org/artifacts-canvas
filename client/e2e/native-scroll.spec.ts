@@ -6,7 +6,8 @@ import { newRoom, open } from './helpers';
  * a scroll moves the artifact's own document inside a frame that stays put on the screen, and the
  * camera follows where the reporter says the document is. Zooming, and panning past the page, still
  * move the frame with the camera (the transform), which is also the default without the option.
- * Fixture: dev/artifacts/sections.html (eight sections of 700 px and a CSS animation that never stops).
+ * Fixtures: dev/artifacts/sections.html (eight sections of 700 px and a CSS animation that never stops)
+ * and snap-scroll.html (the same sections on a page whose scroll lands on its own 4 px grid).
  */
 const NATIVE = { scroll: 'native' };
 
@@ -243,6 +244,144 @@ test('a deck steps in both modes, and its own navigation in native scroll moves 
   await P.close();
 });
 
+/** The last scroll request has been answered (none on its way). */
+const answered = (p: Page) => expect.poll(() => p.evaluate(() => (window as any).__canvas.editor.scrollWant === null)).toBe(true);
+/** The line the next move starts from (the intended camera's top, artifact px). */
+const intendedLine = (p: Page) => p.evaluate(() => {
+  const c = (window as any).__canvas.editor.intendedCamera();
+  return -c.ty / c.z;
+});
+
+test('a page that lands each scroll up to 2 px off (its own grid) does not drift: the steps add up to the line asked for', async ({ browser }) => {
+  // dev/artifacts/snap-scroll.html: every window.scrollTo lands on the page's 4 px grid
+  const A = await open(browser, 'Ana', newRoom('native-snap'), { artifact: 'snap-scroll.html', fit: true, query: NATIVE });
+  const p = A.page;
+  await expect.poll(async () => (await ed(p)).native).toBe(true);
+  // past the period's first second (a request that lands off waits for the window until then)
+  await p.waitForTimeout(1100);
+  await p.mouse.move(720, 450);
+  // each step answered before the next: it starts from the line last asked for, not from the grid's
+  for (let i = 0; i < 10; i++) {
+    await p.mouse.wheel(0, 80);
+    await answered(p);
+  }
+  await settle(p);
+  const e = await ed(p);
+  expect(e.native).toBe(true);
+  const want = 800 / e.cam.z;
+  const y = await docScroll(p);
+  expect(y % 4).toBe(0);
+  expect(Math.abs(y - want)).toBeLessThanOrEqual(2);
+  // the camera shows where the document is, and the next move starts from the line asked for
+  expect(Math.abs(e.vis.y - y)).toBeLessThan(0.5);
+  expect(Math.abs((await intendedLine(p)) - want)).toBeLessThan(0.01);
+  // a step back up adds up the same way
+  for (let i = 0; i < 4; i++) {
+    await p.mouse.wheel(0, -80);
+    await answered(p);
+  }
+  await settle(p);
+  expect(Math.abs((await intendedLine(p)) - 480 / e.cam.z)).toBeLessThan(0.01);
+  expect(Math.abs((await docScroll(p)) - 480 / e.cam.z)).toBeLessThanOrEqual(2);
+  expect((await ed(p)).native).toBe(true);
+  await A.close();
+});
+
+test('a page that scrolls itself in the first second of a period is followed at once', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('native-self'), { artifact: 'snap-scroll.html', fit: true, query: NATIVE });
+  const p = A.page;
+  await expect.poll(async () => (await ed(p)).native).toBe(true);
+  // zoomed in (the transform): the frame is as tall as the page, the document at its top
+  await p.evaluate(() => (window as any).__canvas.editor.zoomBy(1));
+  await settle(p);
+  expect((await ed(p)).native).toBe(false);
+  await p.waitForTimeout(300);
+  const s4 = await frameOf(p).locator('#s4').evaluate((el) => (el as HTMLElement).offsetTop);
+  // the page goes to its fourth section by itself 150 ms after its window next changes size (the
+  // window of a new period)
+  await frameOf(p).locator('html').evaluate(() => {
+    addEventListener('resize', () => setTimeout(() => document.getElementById('s4')!.scrollIntoView(), 150), { once: true });
+  });
+  // back to the reading zoom at line 102: the grid lands the request 2 px off, so the reporter waits
+  // for the window (up to 1 s); the page's own scroll meanwhile is said at once
+  const ms = await p.evaluate(async (s4) => {
+    const e = (window as any).__canvas.editor;
+    const z = e.fitZoom();
+    const t0 = performance.now();
+    e.setCamera({ z, tx: (e.viewW - e.pageWidth * z) / 2, ty: -102 * z });
+    while (performance.now() - t0 < 3000) {
+      await new Promise((r) => requestAnimationFrame(r));
+      if (Math.abs(e.visibleWorld().y - s4) < 2) return performance.now() - t0;
+    }
+    return -1;
+  }, s4);
+  console.log(`SELF-SCROLL followed after ${ms.toFixed(0)} ms`);
+  expect(ms).toBeGreaterThan(0);
+  expect(ms).toBeLessThan(800);
+  await settle(p);
+  expect((await ed(p)).native).toBe(true);
+  expect(Math.abs((await docScroll(p)) - s4)).toBeLessThan(2);
+  expect(Math.abs((await ed(p)).vis.y - s4)).toBeLessThan(2);
+  // the request it overtook is not applied after it: the document stays where the page put it
+  await p.waitForTimeout(1200);
+  expect(Math.abs((await docScroll(p)) - s4)).toBeLessThan(2);
+  expect(Math.abs((await ed(p)).vis.y - s4)).toBeLessThan(2);
+  await A.close();
+});
+
+// In the artifact's frame, before the reporter: a `scroll-to` is dropped while window.__dropScrollTo is set
+// (a document on its way out that never answers).
+const dropScrollTo = `(() => {
+  if (window === window.top) return;
+  addEventListener('message', (e) => {
+    if (window.__dropScrollTo && e.data && e.data.type === 'scroll-to') e.stopImmediatePropagation();
+  });
+})();`;
+
+test('the frame reloads with a scroll request on its way: the view stays where it was, and the next step starts from there', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('native-reload'), { artifact: 'sections.html', fit: true, query: NATIVE, initScript: dropScrollTo });
+  const p = A.page;
+  await expect.poll(async () => (await ed(p)).native).toBe(true);
+  await wheel(p, 80, 10);
+  await settle(p);
+  const line = (await ed(p)).vis.y;
+  expect(line).toBeGreaterThan(400);
+  // the document stops answering (it is on its way out) and a request goes out
+  await frameOf(p).locator('html').evaluate(() => {
+    (window as any).__dropScrollTo = true;
+    (window as any).__old = true;
+  });
+  expect(await p.evaluate(() => {
+    const e = (window as any).__canvas.editor;
+    e.panBy(0, -300);
+    return e.scrollWant;
+  })).not.toBeNull();
+  await p.waitForTimeout(200);
+  expect(await p.evaluate(() => (window as any).__canvas.editor.scrollWant)).not.toBeNull();
+  expect(Math.abs((await docScroll(p)) - line)).toBeLessThan(2);
+  // the page reloads itself
+  await frameOf(p).locator('html').evaluate(() => { setTimeout(() => location.reload(), 0); });
+  await expect.poll(async () => {
+    try {
+      return await frameOf(p).locator('html').evaluate(() => !(window as any).__old && document.readyState === 'complete');
+    } catch {
+      return false;
+    }
+  }).toBe(true);
+  await expect.poll(async () => Math.abs((await docScroll(p)) - line)).toBeLessThan(2);
+  await settle(p);
+  const e = await ed(p);
+  expect(e.native).toBe(true);
+  expect(Math.abs(e.vis.y - line)).toBeLessThan(1);
+  expect(await p.evaluate(() => (window as any).__canvas.editor.scrollWant)).toBeNull();
+  // the next step starts from the line on the screen, not from the request the old document lost
+  await wheel(p, 80, 1);
+  await settle(p);
+  expect(Math.abs((await ed(p)).vis.y - (line + 80 / e.cam.z))).toBeLessThan(2);
+  expect(Math.abs((await docScroll(p)) - (line + 80 / e.cam.z))).toBeLessThan(2);
+  await A.close();
+});
+
 test('per step: the zoom % is not written again, and no presence goes out while nobody follows', async ({ browser }) => {
   const room = newRoom('native-churn');
   const A = await open(browser, 'Ana', room, { artifact: 'sections.html', fit: true, query: NATIVE });
@@ -303,6 +442,36 @@ test('per step: the zoom % is not written again, and no presence goes out while 
   await settle(p);
   expect((await churn()).local).toBeGreaterThanOrEqual(8);
   await B.close();
+  await A.close();
+});
+
+test('a tab whose identity comes after the room\'s presence still knows that a peer follows it', async ({ browser }) => {
+  const room = newRoom('followed-late');
+  const A = await open(browser, 'Ana', room, { artifact: 'sections.html', fit: true });
+  const M = await open(browser, 'Marta', room, { artifact: 'sections.html', fit: true });
+  await M.page.evaluate(() => (window as any).__canvas.editor.follow('dev:Ana'));
+  await expect.poll(() => A.page.evaluate(() => (window as any).__canvas.editor.followed)).toBe(true);
+  await A.page.waitForTimeout(1000); // the follower's own viewport has gone out
+  // Ana's second tab: Marta's presence (following Ana) is in before its identity
+  const A2 = await open(browser, 'Ana', room, { artifact: 'sections.html', fit: true, holdIdentityMs: 800 });
+  await expect.poll(() => A2.page.evaluate(() => (window as any).__canvas.editor.followed)).toBe(true);
+  // so its viewport goes out at the send rate
+  await A2.page.evaluate(() => {
+    const w = window as any;
+    w.__local = 0;
+    w.__canvas.editor.conn.awareness.on('change', (_c: unknown, origin: unknown) => { if (origin === 'local') w.__local++; });
+  });
+  await A2.page.evaluate(async () => {
+    const e = (window as any).__canvas.editor;
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => requestAnimationFrame(r));
+      e.panBy(0, -5);
+    }
+  });
+  await settle(A2.page);
+  expect(await A2.page.evaluate(() => (window as any).__local)).toBeGreaterThanOrEqual(8);
+  await A2.close();
+  await M.close();
   await A.close();
 });
 

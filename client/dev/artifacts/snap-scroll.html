@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Snapping scroll test page</title>
+<style>
+  /* The sections of sections.html (700 px each, no vh, no animation) on a page whose scroll lands on
+     a grid of its own: native scroll is checked on it for drift. */
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#1d1d1f;background:#fff}
+  section{box-sizing:border-box;height:700px;padding:48px 64px;border-bottom:1px solid #e5e7eb}
+  section:nth-child(even){background:#f6f7f9}
+  h2{font-size:34px;margin:0 0 16px}
+  p{font-size:18px;line-height:1.6;max-width:720px;margin:0 0 12px}
+</style>
+<script>
+  // Every window.scrollTo lands on the page's 4 px grid, up to 2 px from the line asked for, as a
+  // page that rounds its scroll to pixels of its own does. scrollIntoView (the page's own
+  // navigation) is left alone.
+  (function () {
+    var to = window.scrollTo.bind(window);
+    var grid = function (v) { return Math.round(Number(v) / 4) * 4; };
+    window.scrollTo = function (a, b) {
+      if (a && typeof a === 'object') {
+        var o = {};
+        for (var k in a) o[k] = a[k];
+        if ('top' in o) o.top = grid(o.top);
+        return to(o);
+      }
+      return to(a, grid(b));
+    };
+  })();
+</script>
+</head>
+<body>
+<section id="s1"><h2>Section 1</h2><p>The first of eight sections, 700 px each. A scroll lands on the page's 4 px grid.</p></section>
+<section id="s2"><h2>Section 2</h2><p>Line one of the second section. Line two of the second section.</p></section>
+<section id="s3"><h2>Section 3</h2><p>Line one of the third section. Line two of the third section.</p></section>
+<section id="s4"><h2>Section 4</h2><p>Line one of the fourth section. Line two of the fourth section.</p></section>
+<section id="s5"><h2>Section 5</h2><p>Line one of the fifth section. Line two of the fifth section.</p></section>
+<section id="s6"><h2>Section 6</h2><p>Line one of the sixth section. Line two of the sixth section.</p></section>
+<section id="s7"><h2>Section 7</h2><p>Line one of the seventh section. Line two of the seventh section.</p></section>
+<section id="s8"><h2>Section 8</h2><p>The last section.</p></section>
+</body>
+</html>

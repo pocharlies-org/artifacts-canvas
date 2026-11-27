@@ -56,6 +56,12 @@ const PHONE_W = 760;
 export const VIEWPORT_IDLE_MS = 1000;
 /** Native scroll: after this many requests the page did not follow, it is off for the document (it scrolls itself back). */
 const SCROLL_REFUSALS = 3;
+/**
+ * Native scroll: a document may land a request up to this many artifact px from the line asked for
+ * (it snaps the scroll to pixels of its own). That still follows the request, and the next move
+ * starts from the line asked for, not from the snapped one, or every step would drift.
+ */
+const SCROLL_SNAP = 2;
 /** Page keys: an arrow scrolls this many screen px; a page, this share of the view. */
 const ARROW_SCROLL = 40;
 const PAGE_SCROLL = 0.9;
@@ -214,6 +220,7 @@ export class Editor {
       },
       background: (c) => this.applyBackground(c),
       reading: (r) => this.onReading(r),
+      reload: () => this.onFrameReload(),
     });
     const prefix = (() => {
       const base = (import.meta.env?.BASE_URL as string | undefined) ?? '/_canvas/_/';
@@ -325,6 +332,8 @@ export class Editor {
       viewport: this.visibleWorld(),
       presenting: this.presenting,
     });
+    // a peer may follow this user already (its presence came before this identity)
+    this.updateFollowed();
     this.emit('identity');
     this.emit('presence');
   }
@@ -381,15 +390,19 @@ export class Editor {
     this.viewportPace.schedule(() => this.publishPresence({ viewport: this.visibleWorld() }));
   }
 
+  /** Does a peer follow this user? Then this tab's viewport goes out at the send rate (publishViewport). */
+  private updateFollowed() {
+    if (!this.conn) return;
+    const me = this.me?.id;
+    const followed = !!me && peers(this.conn.awareness).some((p) => p.state.following === me);
+    if (followed && !this.followed && this.viewportPace.pending) this.viewportPace.flush();
+    this.followed = followed;
+  }
+
   private onAwareness(origin?: unknown) {
     if (!this.conn) return;
     if (origin === 'local' && this.quietPresence) return;
-    if (origin !== 'local') {
-      const me = this.me?.id;
-      const followed = !!me && peers(this.conn.awareness).some((p) => p.state.following === me);
-      if (followed && !this.followed && this.viewportPace.pending) this.viewportPace.flush();
-      this.followed = followed;
-    }
+    if (origin !== 'local') this.updateFollowed();
     const now = performance.now();
     for (const p of peers(this.conn.awareness)) {
       if (p.state.laser && p.state.laser.pts.length) this.laserSeen.set(p.clientId, { at: now, now: p.state.laser.now });
@@ -902,7 +915,7 @@ export class Editor {
   private intendedY(): number {
     if (this.scrollWant !== null) return this.scrollWant;
     const a = this.scrollAsked;
-    return a !== null && Math.abs(a - this.scrollAt) <= 1 ? a : this.scrollAt;
+    return a !== null && Math.abs(a - this.scrollAt) <= SCROLL_SNAP ? a : this.scrollAt;
   }
 
   /** Native scroll is on: the frame is a window of the view and the document scrolls in it. */
@@ -993,7 +1006,7 @@ export class Editor {
       this.scrollWant = null;
       const max = this.pageHeight - this.frame.windowH;
       // asked for a line the page has and it stayed elsewhere: the page scrolls itself back
-      if (Math.abs(y - want) > 2 && want > 2 && want < max - 2) {
+      if (Math.abs(y - want) > SCROLL_SNAP && want > SCROLL_SNAP && want < max - SCROLL_SNAP) {
         if (++this.scrollRefusals >= SCROLL_REFUSALS) {
           this.scrollRefused = true;
           const cam = { ...this.camera, ty: lineTy(want, this.camera.z) };
@@ -1010,6 +1023,19 @@ export class Editor {
     const z = this.camera.z;
     this.showCamera({ tx: this.camera.tx, ty: lineTy(y, z), z }, source);
     if (!pending && this.followingUserId) this.applyFollow();
+  }
+
+  /**
+   * A new document in the frame (the page reloaded or navigated itself). Its reporter starts over:
+   * it knows no native scroll period, and a request the old document never answered gets no `pos`
+   * (the new one counts from `seq` 0), so it would stay pending and the next move would start from
+   * it. The period ends here and a new one starts at the line on the screen.
+   */
+  private onFrameReload() {
+    if (this.hidden || !this.frame.scroller) return;
+    const cam = this.camera;
+    this.leaveScroller();
+    this.setCamera(cam, 'system');
   }
 
   private followSettle: ReturnType<typeof setTimeout> | null = null;
