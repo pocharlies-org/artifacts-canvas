@@ -25,7 +25,8 @@ import { stepOf } from '../editor/slides';
  * Interacting with the artifact (docs/protocol.md §3 "Links"): with the interact tool the frame
  * takes the pointer, and the reporter turns a click on a link into a `link` message (the wrapper
  * decides what it opens, artifact/links.ts), a same-document anchor into an `anchor` position,
- * and a wheel that nothing inside the page scrolls into a `wheel` message (the camera pans).
+ * a wheel that nothing inside the page scrolls into a `wheel` message (the camera pans), and
+ * Escape or a step key the page left into a `key` message.
  * The select tool asks the reporter which element is under a point (`probe`) and to follow the
  * link there (`click`); a presentation asks where the page's slides are (`slides`), and a camera
  * move says so (`motion`: the page's animation frames wait until the camera stands still). Every message

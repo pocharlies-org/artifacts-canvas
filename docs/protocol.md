@@ -238,7 +238,8 @@ the page again with the document at its top. A period starts with a `mode` messa
 `scroller: true`, its `epoch` and the line to start at; until the window has its size (the resize
 races the message) the reporter applies that line again on `resize`, and says nothing for up to
 1 s, unless the page scrolls itself meanwhile (the document is neither at the line asked for nor
-where the request left it): that is said at once and the request is dropped. Every `pos` carries
+where the request left it): that is said at once, with the request's `seq` (the wrapper takes it
+as the answer), and the reporter stops waiting. Every `pos` carries
 the epoch and the wrapper drops one of another. A document that lands a request within 2 px of the
 line (it snaps the scroll to pixels of its own) followed it, and the next move starts from the line
 asked for. A new document in the frame (the page reloads or navigates itself) has a reporter that
