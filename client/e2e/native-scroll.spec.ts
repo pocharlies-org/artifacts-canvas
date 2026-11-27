@@ -2,12 +2,13 @@ import { expect, test, type Page } from '@playwright/test';
 import { newRoom, open } from './helpers';
 
 /**
- * Native scroll (docs/design.md §6.4): at the zoom the page is read at, a scroll moves the artifact's
- * own document inside a frame that stays put on the screen, and the camera follows where the
- * reporter says the document is. Zooming, and panning past the page, still move the frame with
- * the camera (the transform). Fixture: dev/artifacts/sections.html (eight sections of 700 px and a
- * CSS animation that never stops).
+ * Native scroll (docs/design.md §6.4), opt-in with `?scroll=native`: at the zoom the page is read at,
+ * a scroll moves the artifact's own document inside a frame that stays put on the screen, and the
+ * camera follows where the reporter says the document is. Zooming, and panning past the page, still
+ * move the frame with the camera (the transform), which is also the default without the option.
+ * Fixture: dev/artifacts/sections.html (eight sections of 700 px and a CSS animation that never stops).
  */
+const NATIVE = { scroll: 'native' };
 
 const frameOf = (p: Page) => p.frameLocator('iframe.artifact-frame');
 const ed = (p: Page) => p.evaluate(() => {
@@ -51,7 +52,7 @@ async function settle(p: Page) {
 
 test('the default view scrolls the artifact natively: the frame stays put, the drawings stay on the page, a follower agrees', async ({ browser }) => {
   const room = newRoom('native');
-  const A = await open(browser, 'Ana', room, { artifact: 'sections.html', fit: true });
+  const A = await open(browser, 'Ana', room, { artifact: 'sections.html', fit: true, query: NATIVE });
   const p = A.page;
   await expect.poll(async () => (await ed(p)).native).toBe(true);
   const e0 = await ed(p);
@@ -78,7 +79,7 @@ test('the default view scrolls the artifact natively: the frame stays put, the d
   const o0 = await offset();
 
   // the follower, in a window of the same size: it shows what Ana shows
-  const B = await open(browser, 'Marta', room, { artifact: 'sections.html', fit: true });
+  const B = await open(browser, 'Marta', room, { artifact: 'sections.html', fit: true, query: NATIVE });
   await expect.poll(async () => (await ed(B.page)).native).toBe(true);
   await B.page.evaluate(() => (window as any).__canvas.editor.follow('dev:Ana'));
 
@@ -135,8 +136,24 @@ test('the default view scrolls the artifact natively: the frame stays put, the d
   await A.close();
 });
 
+test('without the option the reading zoom pans with the transform: the frame moves, the document never scrolls', async ({ browser }) => {
+  const A = await open(browser, 'Ana', newRoom('native-off'), { artifact: 'sections.html', fit: true });
+  const p = A.page;
+  await expect.poll(async () => (await ed(p)).pageHeight).toBeGreaterThan(5000);
+  const f0 = await frameBox(p);
+  expect(f0.height / (await ed(p)).cam.z).toBeGreaterThan((await ed(p)).pageHeight - 2);
+  await wheel(p, 80, 5);
+  await settle(p);
+  const e = await ed(p);
+  expect(e.native).toBe(false);
+  expect(Math.abs(e.vis.y - 400 / e.cam.z)).toBeLessThan(2);
+  expect(await docScroll(p)).toBe(0);
+  expect(Math.abs((await frameBox(p)).y - (f0.y - 400))).toBeLessThan(1);
+  await A.close();
+});
+
 test('a zoom still moves the frame with the camera; back at the reading zoom the page scrolls natively', async ({ browser }) => {
-  const A = await open(browser, 'Ana', newRoom('native-zoom'), { artifact: 'sections.html', fit: true });
+  const A = await open(browser, 'Ana', newRoom('native-zoom'), { artifact: 'sections.html', fit: true, query: NATIVE });
   const p = A.page;
   await expect.poll(async () => (await ed(p)).native).toBe(true);
   await wheel(p, 100, 6);
@@ -174,7 +191,7 @@ test('a zoom still moves the frame with the camera; back at the reading zoom the
 
 test('a deck steps in both modes, and its own navigation in native scroll moves the followers too', async ({ browser }) => {
   const room = newRoom('native-deck');
-  const A = await open(browser, 'Ana', room, { artifact: 'slide-deck.html', fit: true });
+  const A = await open(browser, 'Ana', room, { artifact: 'slide-deck.html', fit: true, query: NATIVE });
   const p = A.page;
   await expect.poll(async () => (await ed(p)).native).toBe(true);
   const tops = await frameOf(p).locator('.slide').evaluateAll((els) => els.map((el) => el.getBoundingClientRect().top + window.scrollY));
@@ -209,8 +226,8 @@ test('a deck steps in both modes, and its own navigation in native scroll moves 
 
   // a deck's own navigation (scroll-deck.html: its arrow keys call scrollIntoView) with native scroll:
   // the document scrolls, the camera follows it, and so does whoever follows
-  const P = await open(browser, 'Pablo', room + '-own', { artifact: 'scroll-deck.html', fit: true });
-  const F = await open(browser, 'Flor', room + '-own', { artifact: 'scroll-deck.html', fit: true });
+  const P = await open(browser, 'Pablo', room + '-own', { artifact: 'scroll-deck.html', fit: true, query: NATIVE });
+  const F = await open(browser, 'Flor', room + '-own', { artifact: 'scroll-deck.html', fit: true, query: NATIVE });
   await expect.poll(async () => (await ed(P.page)).native).toBe(true);
   await F.page.evaluate(() => (window as any).__canvas.editor.follow('dev:Pablo'));
   await P.page.keyboard.press('i');
@@ -228,7 +245,7 @@ test('a deck steps in both modes, and its own navigation in native scroll moves 
 
 test('per step: the zoom % is not written again, and no presence goes out while nobody follows', async ({ browser }) => {
   const room = newRoom('native-churn');
-  const A = await open(browser, 'Ana', room, { artifact: 'sections.html', fit: true });
+  const A = await open(browser, 'Ana', room, { artifact: 'sections.html', fit: true, query: NATIVE });
   const p = A.page;
   await expect.poll(async () => (await ed(p)).native).toBe(true);
   await p.evaluate(() => {
@@ -272,7 +289,7 @@ test('per step: the zoom % is not written again, and no presence goes out while 
   console.log(`CHURN zoom % writes ${c.pct}, presence renders ${c.presence}, own awareness changes ${c.local} in ${seconds.toFixed(1)} s`);
 
   // somebody follows: the viewport goes out at the send rate
-  const B = await open(browser, 'Marta', room, { artifact: 'sections.html', fit: true });
+  const B = await open(browser, 'Marta', room, { artifact: 'sections.html', fit: true, query: NATIVE });
   await B.page.evaluate(() => (window as any).__canvas.editor.follow('dev:Ana'));
   await expect.poll(() => p.evaluate(() => (window as any).__canvas.editor.followed)).toBe(true);
   await p.evaluate(() => Object.assign((window as any).__churn, { local: 0 }));
@@ -290,7 +307,7 @@ test('per step: the zoom % is not written again, and no presence goes out while 
 });
 
 test('the page\'s CSS animations pause while the camera moves or the page scrolls, and go on after', async ({ browser }) => {
-  const A = await open(browser, 'Ana', newRoom('native-anim'), { artifact: 'sections.html', fit: true });
+  const A = await open(browser, 'Ana', newRoom('native-anim'), { artifact: 'sections.html', fit: true, query: NATIVE });
   const p = A.page;
   await expect.poll(async () => (await ed(p)).native).toBe(true);
   const state = () => frameOf(p).locator('html').evaluate(() => document.getAnimations().map((a) => a.playState));

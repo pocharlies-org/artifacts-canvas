@@ -197,13 +197,13 @@ test('held animation frames run once the camera stands still, in order, and the 
   await A.close();
 });
 
-// Native scroll (docs/design.md §6.4, known issues L-13): at the zoom the page is read at, a wheel
+// Native scroll (docs/design.md §6.4, known issues L-13; opt-in, `?scroll=native`): at the zoom the page is read at, a wheel
 // scrolls the page's own document in a frame that stays put, so no step of the scroll waits for the
 // frame to be drawn again where the camera moved it. The gate is structural (headless frame timing
 // is noise, see above): the frame's box on the screen is the same on every frame of a wheel scroll
 // over the heavy page, the document scrolled, and the page's animation frames were held meanwhile.
 test('the default view scrolls the heavy page natively: the frame never moves during a wheel scroll', async ({ browser }) => {
-  const H = await open(browser, 'Ana', newRoom('perf-native'), { artifact: 'heavy-page.html', fit: true });
+  const H = await open(browser, 'Ana', newRoom('perf-native'), { artifact: 'heavy-page.html', fit: true, query: { scroll: 'native' } });
   const p = H.page;
   const f = p.frameLocator('iframe.artifact-frame').locator('html');
   await expect.poll(() => p.evaluate(() => (window as any).__canvas.editor.nativeScrolling)).toBe(true);

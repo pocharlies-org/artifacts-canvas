@@ -142,9 +142,9 @@ scope for v1; the service may wrap them in a minimal HTML page.
 the artifact's full content height. It never scrolls; the canvas camera pans and zooms the
 iframe and the drawings together, so world coordinates are artifact CSS pixels and
 annotations stay on the element they were drawn on. Wheel and touch go to the canvas, except
-with the interact tool (below), where the artifact takes the pointer. At the zoom the page is
-read at, the frame is instead a window as tall as the view and the document scrolls in it ("Native
-scroll" below); world coordinates are the same.
+with the interact tool (below), where the artifact takes the pointer. With native scroll on (opt-in),
+at the zoom the page is read at the frame is instead a window as tall as the view and the document
+scrolls in it ("Native scroll" below); world coordinates are the same.
 
 **Viewport units and reveal scripts.** A frame as tall as the page breaks two things that pages
 written as a "deck" of full-screen sections rely on, so the reporter, which runs before the page's
@@ -196,7 +196,7 @@ own scripts, changes them in canvas mode only:
   observer with an explicit root (an element, or the document) measures inside the page: the
   constructor returns the browser's own observer for it.
 - **The page's own navigation.** A deck moves between its screens with `scrollIntoView()` (arrow
-  keys, its slide links). With native scroll the document scrolls, and the camera, and the
+  keys, its slide links). With native scroll (opt-in) the document scrolls, and the camera, and the
   followers, follow it (`pos`, below). Otherwise the frame cannot scroll in canvas mode, so the browser scrolls the
   frame's ancestors instead: the wrapper's stage, a scroll container. The wrapper turns that into
   a camera move once the scroll has stopped (200 ms): the stage goes back to 0 and the camera
@@ -225,7 +225,8 @@ timers go on. Native mode never holds, and nor does a snapshot (an export
 taken while a follower's camera moves). A page that animates its own scrolling frame by frame
 (each step a camera move in canvas mode) advances about every 250 ms.
 
-**Native scroll** (`Editor.setCamera`, `camera.ts nativeScroll`, design §6.4). At the zoom the
+**Native scroll** (`Editor.setCamera`, `camera.ts nativeScroll`, design §6.4; opt-in, `?scroll=native`
+on the canvas URL, off by default). At the zoom the
 page is read at (as wide as the view, or the presentation's) with the view inside the page, the
 frame is a window as tall as the view (its height in artifact px, rounded up) and the wrapper moves
 the document instead of the frame: `scroll-to` with the line at the top of the view, and the
@@ -243,7 +244,7 @@ back) keeps the transform for the rest of the visit. The reporter says it can do
 `canScroll` in its `size` message; a wrapper never asks a reporter that has not said it.
 Page keys outside a presentation (on the board: Page Up/Down, Home, End, and ↑ ↓ with nothing
 selected; in the frame with the interact tool, the step keys the page left) scroll a little or a
-screen, natively or with the camera.
+screen, natively or with the camera, with or without the option.
 
 **Presenting a deck** (`client/src/editor/slides.ts`, `Editor.stepSlide`). In presentation mode
 → ↓ Page Down Space step forward and ← ↑ Page Up ⇧Space step back, whatever the tool (laser, pen,

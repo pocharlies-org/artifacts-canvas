@@ -836,8 +836,9 @@ export class Editor {
   /**
    * Move the camera; source 'user' stops following, 'follow' and 'system' do not.
    *
-   * Two ways to show it (docs/design.md §6.4). At the zoom the page is read at (homeZoom), with the
-   * view inside the page, the artifact's document scrolls itself (native scroll): the frame is a
+   * Two ways to show it (docs/design.md §6.4). By default the transform. With native scroll on
+   * (`?scroll=native`), at the zoom the page is read at (homeZoom), with the
+   * view inside the page, the artifact's document scrolls itself: the frame is a
    * window as tall as the view that stays put on the screen, the document is asked to scroll to
    * the line at the top of the view, and the camera follows once the reporter says where it is
    * (onScrolled), so the page moves without the frame moving and the drawings follow one frame
@@ -911,7 +912,7 @@ export class Editor {
 
   /** How `cam` shows natively, or null when the transform shows it (camera.ts nativeScroll). */
   private nativeOf(cam: Camera): NativeScroll | null {
-    if (this.hidden || this.scrollRefused || !this.frame.canScroll || !this.initialCameraSet) return null;
+    if (!this.cfg.nativeScroll || this.hidden || this.scrollRefused || !this.frame.canScroll || !this.initialCameraSet) return null;
     return nativeScroll(cam, this.homeZoom(), this.viewH, this.pageHeight);
   }
 

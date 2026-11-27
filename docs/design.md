@@ -236,13 +236,15 @@ as a direction, but a builder may change one with a stated reason.
 
 The camera maps world px (the artifact's CSS px at the room's `pageWidth`) to the screen: `screen =
 world * z + t`. Two ways show a camera, and every viewer may use either, so presenter and followers
-see the same part of the page and the drawings stay on it:
+see the same part of the page and the drawings stay on it. The transform is the default; native
+scroll is opt-in (`?scroll=native` on the canvas URL) because, measured, it reaches the screen later
+(below).
 
 - **Transform** (any camera): the frame is as tall as the page and never scrolls; the world layer,
   frame and drawings together, is translated and scaled. Every step of a pan moves the frame, and
   the browser shows the step only once the artifact's own process has drawn the frame again: a
   pan step waited for the page (7 to 10 ms more than the page scrolling itself, measured in Chrome).
-- **Native scroll** (at the zoom the page is read at: as wide as the view, or the presentation's,
+- **Native scroll** (opt-in; at the zoom the page is read at: as wide as the view, or the presentation's,
   with the view inside the page): the frame is a window as tall as the view that stays put on the
   screen, and the artifact's own document scrolls in it. The wrapper asks the reporter to scroll
   to the line at the top of the view; the reporter scrolls (instantly, whatever the page's
@@ -252,7 +254,7 @@ see the same part of the page and the drawings stay on it:
   snapping); only what depends on the frame's own height changes (a `position: fixed` element
   stays in the window, as on the page itself).
 
-What goes which way:
+What goes which way, with native scroll on:
 
 - A wheel or a trackpad, the page keys, a drag, the minimap, a slide step, a same-document anchor,
   following someone: whatever lands on a camera at the reading zoom inside the page scrolls
@@ -266,6 +268,15 @@ What goes which way:
   wheel adds up.
 - A page that scrolls itself back (three requests in a row not followed) keeps the transform for
   the rest of its visit.
+
+Why it is not the default (Chrome 158, macOS, 120 Hz, the repo's fixtures on the dev server, input to
+the page on the screen, p50): a trackpad-like scroll took 36 ms natively against 24 to 28 ms with the
+transform and 22 to 24 ms with the canvas hidden; a 60 Hz wheel, 40 to 44 ms against 21 to 23 and 22
+to 25. The frame no longer moves, so nothing waits for it, but the wheel goes to the wrapper's page
+(its listener must be able to cancel ctrl + wheel, the zoom), whose main thread takes it with the
+next frame, and the scroll it asks for is the artifact's main thread's, which shows with that page's
+next frame: two frames in a row instead of one. With the rest of this section's per-step work gone,
+the transform already lands within a few ms of the hidden page.
 
 The per-step work of the wrapper is kept to what changes: the zoom % is written only when its
 rounded value changes, this tab's own viewport changes nothing the chrome shows and goes out at

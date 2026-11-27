@@ -33,6 +33,13 @@ export interface CanvasConfig {
   maxDocBytes: number;
   /** Path of the plain artifact on this host (the server's ARTIFACT_BASE_URL path + key), for "Ver original". */
   artifactUrl?: string | null;
+  /**
+   * Native scroll (docs/design.md §6.4), opt-in with `?scroll=native`: at the reading zoom the
+   * artifact's own document scrolls instead of the camera moving the frame. Off by default: the
+   * input reaches the document through both pages' main threads, and measured in Chrome that came
+   * to the screen later than the transform.
+   */
+  nativeScroll: boolean;
 }
 
 export const DEFAULT_PREFIX = '/_canvas/';
@@ -74,6 +81,7 @@ export function resolveConfig(loc: Location, doc: Document, isDev: boolean): Can
     devUser: dev ? (q.get('as') ?? '') : '',
     maxImageBytes: 2 * 1024 * 1024,
     maxDocBytes: 5 * 1024 * 1024,
+    nativeScroll: q.get('scroll') === 'native',
     ...inline,
   };
   if (!inline.room) cfg.room = cfg.artifactPath;

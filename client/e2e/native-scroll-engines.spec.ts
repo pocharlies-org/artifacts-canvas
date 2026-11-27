@@ -2,7 +2,7 @@ import { expect, test, type Page } from '@playwright/test';
 import { newRoom, open } from './helpers';
 
 /**
- * Native scroll in every engine (it runs in Chromium, Firefox and WebKit: client/playwright.config.ts):
+ * Native scroll (`?scroll=native`) in every engine (it runs in Chromium, Firefox and WebKit: client/playwright.config.ts):
  * the reporter scrolls the artifact's document, whose root has no scrollbar and no overflow, in a
  * sandboxed frame; the frame stays put and a drawing stays on the page (e2e/native-scroll.spec.ts
  * has the rest, in Chromium).
@@ -10,7 +10,7 @@ import { newRoom, open } from './helpers';
 const frameOf = (p: Page) => p.frameLocator('iframe.artifact-frame');
 
 test('the default view scrolls the artifact\'s own document, and a drawing stays on the page', async ({ browser }) => {
-  const A = await open(browser, 'Ana', newRoom('native-engines'), { artifact: 'sections.html', fit: true });
+  const A = await open(browser, 'Ana', newRoom('native-engines'), { artifact: 'sections.html', fit: true, query: { scroll: 'native' } });
   const p = A.page;
   const native = () => p.evaluate(() => (window as any).__canvas.editor.nativeScrolling as boolean);
   await expect.poll(native).toBe(true);

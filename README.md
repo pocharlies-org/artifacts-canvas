@@ -92,9 +92,9 @@ npm run build          # shared/dist, client/dist (the bundle), server/dist
 
 On a desktop the canvas shows the page as wide as the window, as the page itself is shown: the
 camera fits the page to the view width (the layout stays the room's, 980 px by default, so drawings
-stay on their element for everyone; only the zoom differs per viewer). At that zoom a wheel, a
-trackpad or a page key scrolls the artifact's own document, as fast as the plain page scrolls, and the
-drawings follow it (design §6.4); a zoom moves the page with the drawings. Showing the canvas over the
+stay on their element for everyone; only the zoom differs per viewer). A wheel, a trackpad or a page
+key pans the page with the drawings; `?scroll=native` makes the artifact's own document scroll at that
+zoom instead (design §6.4, opt-in: measured, it shows later). Showing the canvas over the
 page keeps the part being read where it was and at the size it had: the reporter says which block
 of the page was at the top of the view (protocol §3 "Reading position"). The side panels (who is
 here, who drew and the history on the left; the style on the right) are hidden and overlay the page:
